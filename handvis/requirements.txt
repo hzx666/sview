@@ -1,0 +1,15 @@
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+numpy==2.2.6
+sqlalchemy==2.0.41
+asyncpg==0.30.0
+pydantic==2.11.7
+python-dotenv==1.1.1
+greenlet==3.2.4
+oss2==2.19.1
+torch==2.11.0
+smplx==0.1.28
+chumpy==0.70
+scipy==1.17.1
+dill==0.3.9
+redis==5.2.1

@@ -1,0 +1,40 @@
+# Scale workers from Redis queue depth via KEDA (preferred).
+# Requires KEDA installed in the cluster.
+# Fallback without KEDA: use hpa-worker-cpu.yaml (CPU-based only).
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: sview-worker-keda
+  namespace: mcap-extract
+spec:
+  scaleTargetRef:
+    name: sview-worker
+  minReplicaCount: 1
+  maxReplicaCount: 50
+  pollingInterval: 15
+  cooldownPeriod: 60
+  triggers:
+    - type: redis
+      metadata:
+        address: r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com:6379
+        listName: player:queue
+        listLength: "2"
+        databaseIndex: "0"
+        activationListLength: "1"
+      authenticationRef:
+        name: sview-redis-trigger-auth
+---
+# Optional: create TriggerAuthentication from redis-credentials secret.
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: sview-redis-trigger-auth
+  namespace: mcap-extract
+spec:
+  secretTargetRef:
+    - parameter: password
+      name: redis-credentials
+      key: password
+    - parameter: username
+      name: redis-credentials
+      key: username

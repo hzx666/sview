@@ -1,0 +1,144 @@
+# HandVis MANO worker（独立版）：只消费 handvis:jobs:queue，边算边推 OSS player-bin/{task_id}/。
+# 提交/状态/播放都走 sview-master（POST /api/jobs kind=handvis），不需要 handvis-api。
+# HANDVIS_DISABLE_PG=1：不连 PostgreSQL，只要 redis-credentials + oss-credentials。
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: handvis-worker
+  namespace: mcap-extract
+  labels:
+    app: handvis-worker
+    role: worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: handvis-worker
+  template:
+    metadata:
+      labels:
+        app: handvis-worker
+        role: worker
+    spec:
+      imagePullSecrets:
+        - name: acr-secret
+      containers:
+        - name: handvis-worker
+          image: ss-container-lib-registry.cn-shanghai.cr.aliyuncs.com/data-platform/handvis-worker:v0.1.0
+          imagePullPolicy: Always
+          command: ["python", "-m", "app.workers.build_worker"]
+          env:
+            - name: HANDVIS_SKIP_CREATE_ALL
+              value: "1"
+            - name: HANDVIS_DISABLE_PG
+              value: "1"
+            - name: BUILD_WORKER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TORCH_NUM_THREADS
+              value: "4"
+            - name: LOG_DIR
+              value: "/app/logs"
+            - name: LOG_FILE_NAME
+              value: "handvis-build-worker.log"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: STATISTICS_DIR
+              value: "/data/HandAssets"
+            - name: PLAYBACK_POSEHAND_DIR
+              value: "/data/HandAssets/posehand"
+            - name: TRANSCODE_VIDEO_DIR
+              value: "/data/HandAssets/video"
+            - name: BUILD_QUEUE_KEY
+              value: "handvis:jobs:queue"
+            - name: BUILD_RESULT_QUEUE_KEY
+              value: "handvis:jobs:result"
+            - name: BUILD_EVENT_CHANNEL
+              value: "handvis:jobs:events"
+            - name: REDIS_HOST
+              value: "r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: username
+                  optional: true
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+                  optional: true
+            - name: OSS_ENDPOINT
+              value: "oss-cn-shanghai-internal.aliyuncs.com"
+            - name: OSS_BUCKET
+              value: "ss-oss-data-platform"
+            - name: OSS_REGION
+              value: "cn-shanghai"
+            - name: OSS_CACHE
+              value: "1"
+            - name: OSS_CACHE_PREFIX
+              value: "player-bin"
+            - name: OSS_CACHE_BUCKET
+              value: "ss-oss-data-platform"
+            - name: OSS_CACHE_PUBLIC
+              value: "0"
+            - name: OSS_PUBLIC_ENDPOINT
+              value: "oss-cn-shanghai.aliyuncs.com"
+            - name: SVIEW_MASTER_BASE
+              value: ""
+            - name: PLAYABLE_MIN_FRAMES
+              value: "30"
+            - name: BALANCED_CHUNK_FRAMES
+              value: "30"
+            - name: REDIS_HOST
+              value: r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com
+            - name: REDIS_PORT
+              value: '6379'
+            - name: REDIS_DB
+              value: '0'
+            - name: REDIS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  key: username
+                  name: redis-secret
+                  optional: true
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  key: password
+                  name: redis-secret  
+            - name: OSS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akId
+            - name: OSS_ACCESS_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akSecret
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "8"
+              memory: 16Gi
+          volumeMounts:
+            - name: assets
+              mountPath: /data/HandAssets
+            - name: logs
+              mountPath: /app/logs
+      volumes:
+        - name: assets
+          emptyDir:
+            sizeLimit: 25Gi
+        - name: logs
+          emptyDir:
+            sizeLimit: 1Gi

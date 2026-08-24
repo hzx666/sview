@@ -1,0 +1,203 @@
+# Optional multi-replica deployment: Redis job locks + owner sticky proxy.
+# Cache remains per-Pod emptyDir (no NAS/OSS shared /cache).
+# Prefer deploy/deployment-cpu-redis.yaml (replicas:1) for single-instance.
+ apiVersion: apps/v1
+ kind: Deployment
+ metadata:
+   name: mcap-processor-cpu-redis-cluster
+   namespace: mcap-extract
+   labels:
+     app: mcap-processor-cpu-redis-cluster
+ spec:
+   # Multi-replica example (per-Pod emptyDir cache + owner proxy).
+   replicas: 3
+   selector:
+     matchLabels:
+       app: mcap-processor-cpu-redis-cluster
+   template:
+     metadata:
+       labels:
+         app: mcap-processor-cpu-redis-cluster
+     spec:
+       restartPolicy: Always
+       imagePullSecrets:
+         - name: acr-secret
+       containers:
+         - name: sview-worker
+           image: <YOUR_ACR_REGISTRY>/data-platform/mcap-processor-cpu:<YOUR_TAG>
+           imagePullPolicy: Always
+           # No --path arg -> Redis queue loop mode (sview_worker.py default)
+           env:
+             # ---------- Mode: local cache, no OSS upload ----------
+             - name: NO_UPLOAD
+               value: "1"
+             # ---------- Local mount paths ----------
+             - name: HEAD_CAM_MOUNT
+               value: "/head-data"
+             - name: ORIN_MOUNT
+               value: "/orin-data"
+             - name: LOCAL_MOUNT_PATH
+               value: "/head-data"
+             - name: LOCAL_OUTPUT_DIR
+               value: "/cache"
+             - name: TEMP_DIR
+               value: "/tmp"
+             # ---------- Redis ----------
+             - name: REDIS_HOST
+               valueFrom:
+                 secretKeyRef:
+                   name: redis-credentials
+                   key: host
+             - name: REDIS_PORT
+               valueFrom:
+                 secretKeyRef:
+                   name: redis-credentials
+                   key: port
+                   optional: true
+             - name: REDIS_USERNAME
+               valueFrom:
+                 secretKeyRef:
+                   name: redis-credentials
+                   key: username
+                   optional: true
+             - name: REDIS_PASSWORD
+               valueFrom:
+                 secretKeyRef:
+                   name: redis-credentials
+                   key: password
+             - name: REDIS_DB
+               value: "0"
+             - name: REDIS_QUEUE_KEY
+               value: "player:queue"
+             - name: REDIS_PATH_PREFIX
+               value: "/head-cam"
+             # ---------- Transcode resolution ----------
+             # SIZE>0 = square; or set WIDTH/HEIGHT (SIZE=0). All 0 = keep source.
+             - name: TRANSCODE_SIZE
+               value: "0"
+             - name: TRANSCODE_WIDTH
+               value: "0"
+             - name: TRANSCODE_HEIGHT
+               value: "0"
+             # ---------- Transcode quality ----------
+             - name: TRANSCODE_CRF
+               value: "35"
+             - name: TRANSCODE_BITRATE
+               value: "2M"
+             - name: TRANSCODE_MAXRATE
+               value: "3M"
+             - name: TRANSCODE_BUFSIZE
+               value: "4M"
+             - name: TRANSCODE_PRESET
+               value: "veryfast"
+             # 1 = force re-encode so quality applies even for H.264 + no resize
+             - name: TRANSCODE_FORCE_REENCODE
+               value: "0"
+             # ---------- Progressive publish (边转边播) ----------
+             - name: PROGRESSIVE_PUBLISH
+               value: "1"
+             - name: PARTIAL_MANIFEST_EVERY
+               value: "30"
+             - name: PLAYABLE_MIN_FRAMES
+               value: "30"
+             - name: CPU_CONCURRENCY
+               value: "2"
+             - name: CHUNK_FRAMES
+               value: "150"
+             # Start next job once an active job is playable (shared CPU_CONCURRENCY).
+             - name: MAX_INFLIGHT_JOBS
+               value: "2"
+             - name: OVERLAP_AFTER_PLAYABLE
+               value: "1"
+             # Orin: near-lossless H.264 (no CRF35/bitrate crush).
+             # CRF 0 + high profile is invalid; keep ORIN_CRF>=1 (default 12).
+             - name: ORIN_DIRECT
+               value: "1"
+             - name: ORIN_CRF
+               value: "12"
+             - name: LOG_LEVEL
+               value: "INFO"
+             # Write shared project log onto the cache volume (survives restarts).
+             - name: LOG_FILE
+               value: "/cache/sview.log"
+             - name: FFMPEG_PATH
+               value: "ffmpeg"
+             # ---------- HTTP cache server ----------
+             - name: HTTP_HOST
+               value: "0.0.0.0"
+             - name: HTTP_PORT
+               value: "8080"
+             - name: HTTP_ENABLED
+               value: "1"
+             # ---------- Cluster sticky (multi-replica) ----------
+             - name: SVIEW_CLUSTER
+               value: "1"
+             - name: SVIEW_LOCK_TTL_SEC
+               value: "120"
+             - name: POD_HTTP_PORT
+               value: "8080"
+             - name: POD_IP
+               valueFrom:
+                 fieldRef:
+                   fieldPath: status.podIP
+           ports:
+             - name: http
+               containerPort: 8080
+               protocol: TCP
+           resources:
+             requests:
+               cpu: "4"
+               memory: 8Gi
+             limits:
+               cpu: "8"
+               memory: 16Gi
+           volumeMounts:
+             - name: head-data
+               mountPath: /head-data
+               readOnly: true
+             - name: orin-data
+               mountPath: /orin-data
+               readOnly: true
+             - name: cache
+               mountPath: /cache
+           livenessProbe:
+             httpGet:
+               path: /healthz
+               port: 8080
+             initialDelaySeconds: 30
+             periodSeconds: 30
+           readinessProbe:
+             httpGet:
+               path: /healthz
+               port: 8080
+             initialDelaySeconds: 10
+             periodSeconds: 10
+       volumes:
+         - name: head-data
+           persistentVolumeClaim:
+             claimName: mcap-input-teleoperation-260701-pvc
+         - name: orin-data
+           persistentVolumeClaim:
+             claimName: <ORIN_DATA_PVC_NAME>
+        - name: cache
+          emptyDir:
+            sizeLimit: 25Gi
+ ---
+ apiVersion: v1
+ kind: Service
+ metadata:
+   name: mcap-processor-cpu-redis-cluster-svc
+   namespace: mcap-extract
+ spec:
+   sessionAffinity: ClientIP
+   sessionAffinityConfig:
+     clientIP:
+       timeoutSeconds: 10800
+   selector:
+     app: mcap-processor-cpu-redis-cluster
+   ports:
+     - name: http
+       port: 8080
+       targetPort: 8080
+       protocol: TCP
+   type: ClusterIP

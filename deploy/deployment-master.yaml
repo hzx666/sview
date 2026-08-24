@@ -1,0 +1,168 @@
+# Master: HTTP API + enqueue + metrics + OSS cache GC (no encode)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sview-master
+  namespace: mcap-extract
+  labels:
+    app: sview-master
+    role: master
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sview-master
+  template:
+    metadata:
+      labels:
+        app: sview-master
+        role: master
+    spec:
+      imagePullSecrets:
+        - name: acr-secret
+      containers:
+        - name: sview-master
+          image: ss-container-lib-registry.cn-shanghai.cr.aliyuncs.com/data-platform/playertrans-backend:v0.3.3
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: SVIEW_ROLE
+              value: "master"
+            - name: NO_UPLOAD
+              value: "1"
+            - name: OSS_CACHE
+              value: "1"
+            - name: OSS_CACHE_PREFIX
+              value: "player-bin"
+            - name: OSS_PUBLIC_ENDPOINT
+              value: "oss-cn-shanghai.aliyuncs.com"
+            - name: OSS_CACHE_PUBLIC
+              value: "0"
+            - name: CACHE_MAX_BYTES
+              value: "536870912000"
+            - name: CACHE_IDLE_TTL_SEC
+              value: "14400"
+            - name: CACHE_GC_INTERVAL_SEC
+              value: "300"
+            - name: CACHE_PIN_SEC
+              value: "600"
+            - name: SVIEW_CLUSTER
+              value: "0"
+            - name: HEAD_CAM_MOUNT
+              value: "/head-data"
+            - name: ORIN_MOUNT
+              value: "/orin-data"
+            - name: LOCAL_OUTPUT_DIR
+              value: "/cache"
+            - name: TEMP_DIR
+              value: "/tmp"
+            - name: REDIS_HOST
+              value: "r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_QUEUE_KEY
+              value: "player:queue"
+            - name: REDIS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: username
+                  optional: true
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+            - name: OSS_ENDPOINT
+              value: "oss-cn-shanghai-internal.aliyuncs.com"
+            - name: OSS_BUCKET
+              value: "ss-oss-data-platform"
+            - name: OSS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akId
+                  optional: true
+            - name: OSS_ACCESS_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akSecret
+                  optional: true
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FILE
+              value: "/cache/sview.log"
+            - name: HTTP_HOST
+              value: "0.0.0.0"
+            - name: HTTP_PORT
+              value: "8080"
+            - name: HTTP_ENABLED
+              value: "1"
+            # Upload/proxy use OSS_ENDPOINT (internal). Browser 302 uses public sign
+            # (OSS_PUBLIC_ENDPOINT). Verify: curl /api/debug/oss → sample_sign_host
+            # must be *.oss-cn-shanghai.aliyuncs.com without -internal.
+            - name: OSS_MEDIA_LOCAL_FIRST
+              value: "1"
+            - name: OSS_MEDIA_REDIRECT
+              value: "1"
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          volumeMounts:
+            - name: head-cam-data
+              mountPath: /head-data
+              readOnly: true
+            - name: orin-data
+              mountPath: /orin-data
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: head-cam-data
+          persistentVolumeClaim:
+            claimName: mcap-input-head-oss-pvc
+        - name: orin-data
+          persistentVolumeClaim:
+            claimName: mcap-input-teleoperation-oss-pvc
+        - name: cache
+          emptyDir:
+            sizeLimit: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sview-master-svc
+  namespace: mcap-extract
+  labels:
+    app: sview-master
+spec:
+  type: ClusterIP
+  selector:
+    app: sview-master
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

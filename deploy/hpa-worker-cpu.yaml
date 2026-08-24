@@ -1,0 +1,27 @@
+# Fallback HPA when KEDA is unavailable (CPU only — not ideal for queue lag).
+# Prefer deploy/keda-worker.yaml (Redis list length).
+# Master exposes Prometheus metrics at GET /metrics for a future custom-metrics path.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: sview-worker-hpa-cpu
+  namespace: mcap-extract
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: sview-worker
+  minReplicas: 1
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 30
+    scaleDown:
+      stabilizationWindowSeconds: 120

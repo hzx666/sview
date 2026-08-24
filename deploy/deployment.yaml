@@ -1,0 +1,189 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sview-bin
+  namespace: mcap-extract
+spec:
+  # Multi-replica requires SVIEW_CLUSTER=1 + POD_IP (owner sticky proxy).
+  # Single-instance rollback: replicas=1, SVIEW_CLUSTER=0, remove POD_IP.
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sview-bin
+  template:
+    metadata:
+      labels:
+        app: sview-bin
+    spec:
+      imagePullSecrets:
+        - name: acr-secret
+      containers:
+        - name: sview-worker
+          image: ss-container-lib-registry.cn-shanghai.cr.aliyuncs.com/data-platform/playertrans-backend:v0.2.5
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: NO_UPLOAD
+              value: "1"
+            - name: OSS_CACHE
+              value: "0"
+            - name: OSS_CACHE_PREFIX
+              value: "player-bin"
+            - name: OSS_PUBLIC_ENDPOINT
+              value: "oss-cn-shanghai.aliyuncs.com"
+            - name: SVIEW_ROLE
+              value: "all"
+            - name: SVIEW_CLUSTER
+              value: "1"
+            - name: SVIEW_LOCK_TTL_SEC
+              value: "120"
+            - name: POD_HTTP_PORT
+              value: "8080"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: POLL_INTERVAL
+              value: "10"
+            - name: HEAD_CAM_MOUNT
+              value: "/head-data"
+            - name: ORIN_MOUNT
+              value: "/orin-data"
+            - name: LOCAL_MOUNT_PATH
+              value: "/head-data"
+            - name: LOCAL_OUTPUT_DIR
+              value: "/cache"
+            - name: TEMP_DIR
+              value: "/tmp"
+            - name: REDIS_HOST
+              value: "r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_QUEUE_KEY
+              value: "player:queue"
+            - name: REDIS_PATH_PREFIX
+              value: "/head-cam"
+            - name: REDIS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: username
+                  optional: true
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+            - name: OSS_ENDPOINT
+              value: "oss-cn-shanghai-internal.aliyuncs.com"
+            - name: OSS_BUCKET
+              value: "ss-oss-data-platform"
+            - name: OSS_OUTPUT_PREFIX
+              value: "processed_data/"
+            - name: OSS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akId
+                  optional: true
+            - name: OSS_ACCESS_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akSecret
+                  optional: true
+            - name: TRANSCODE_SIZE
+              value: "0"
+            - name: TRANSCODE_WIDTH
+              value: "0"
+            - name: TRANSCODE_HEIGHT
+              value: "0"
+            - name: TRANSCODE_CRF
+              value: "35"
+            - name: TRANSCODE_BITRATE
+              value: "2M"
+            - name: TRANSCODE_MAXRATE
+              value: "3M"
+            - name: TRANSCODE_BUFSIZE
+              value: "4M"
+            - name: TRANSCODE_PRESET
+              value: "veryfast"
+            - name: TRANSCODE_FORCE_REENCODE
+              value: "0"
+            - name: PROGRESSIVE_PUBLISH
+              value: "1"
+            - name: PARTIAL_MANIFEST_EVERY
+              value: "30"
+            - name: PLAYABLE_MIN_FRAMES
+              value: "30"
+            - name: CPU_CONCURRENCY
+              value: "2"
+            - name: CHUNK_FRAMES
+              value: "150"
+            - name: MAX_INFLIGHT_JOBS
+              value: "2"
+            - name: OVERLAP_AFTER_PLAYABLE
+              value: "1"
+            - name: ORIN_DIRECT
+              value: "1"
+            - name: ORIN_CRF
+              value: "12"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FILE
+              value: "/cache/sview.log"
+            - name: FFMPEG_PATH
+              value: "ffmpeg"
+            - name: HTTP_HOST
+              value: "0.0.0.0"
+            - name: HTTP_PORT
+              value: "8080"
+            - name: HTTP_ENABLED
+              value: "1"
+          resources:
+            requests:
+              cpu: "8"
+              memory: 16Gi
+            limits:
+              cpu: "16"
+              memory: 32Gi
+          volumeMounts:
+            - name: head-cam-data
+              mountPath: /head-data
+              readOnly: true
+            - name: orin-data
+              mountPath: /orin-data
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+      volumes:
+        - name: head-cam-data
+          persistentVolumeClaim:
+            claimName: mcap-input-head-oss-pvc
+        - name: orin-data
+          persistentVolumeClaim:
+            claimName: mcap-input-teleoperation-oss-pvc
+        - name: cache
+          emptyDir:
+            sizeLimit: 25Gi

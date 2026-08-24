@@ -1,0 +1,181 @@
+# Worker: Redis consumer + encode + progressive OSS player-bin upload (no public API)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sview-worker
+  namespace: mcap-extract
+  labels:
+    app: sview-worker
+    role: worker
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sview-worker
+  template:
+    metadata:
+      labels:
+        app: sview-worker
+        role: worker
+    spec:
+      imagePullSecrets:
+        - name: acr-secret
+      containers:
+        - name: sview-worker
+          image: ss-container-lib-registry.cn-shanghai.cr.aliyuncs.com/data-platform/playertrans-backend:v0.3.3
+          imagePullPolicy: Always
+          env:
+            - name: SVIEW_ROLE
+              value: "worker"
+            - name: NO_UPLOAD
+              value: "1"
+            - name: OSS_CACHE
+              value: "1"
+            - name: OSS_CACHE_PREFIX
+              value: "player-bin"
+            - name: OSS_PUBLIC_ENDPOINT
+              value: "oss-cn-shanghai.aliyuncs.com"
+            # Bucket Block Public Access: upload private; play via Master.
+            - name: OSS_CACHE_PUBLIC
+              value: "0"
+            - name: SEGMENT_FRAMES
+              value: "30"
+            - name: SVIEW_CLUSTER
+              value: "1"
+            - name: SVIEW_LOCK_TTL_SEC
+              value: "120"
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: HEAD_CAM_MOUNT
+              value: "/head-data"
+            - name: ORIN_MOUNT
+              value: "/orin-data"
+            - name: LOCAL_OUTPUT_DIR
+              value: "/cache"
+            - name: TEMP_DIR
+              value: "/tmp"
+            - name: REDIS_HOST
+              value: "r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_QUEUE_KEY
+              value: "player:queue"
+            - name: REDIS_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: username
+                  optional: true
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-credentials
+                  key: password
+            - name: OSS_ENDPOINT
+              value: "oss-cn-shanghai-internal.aliyuncs.com"
+            - name: OSS_BUCKET
+              value: "ss-oss-data-platform"
+            - name: OSS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akId
+                  optional: true
+            - name: OSS_ACCESS_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: oss-credentials
+                  key: akSecret
+                  optional: true
+            - name: PROGRESSIVE_PUBLISH
+              value: "1"
+            - name: PARTIAL_MANIFEST_EVERY
+              value: "30"
+            - name: PLAYABLE_MIN_FRAMES
+              value: "30"
+            # 12 ffmpeg slots; each job hard-capped at 4 → 3 jobs can saturate the pod.
+            - name: CPU_CONCURRENCY
+              value: "12"
+            - name: ENCODE_JOB_MAX_CONCURRENT
+              value: "4"
+            # After playable: keep 4 ffmpeg so quad-cam stays realtime. 1 serializes
+            # cameras and publish rate drops below ~30fps (playhead catches frontier).
+            - name: ENCODE_PLAYABLE_MAX_CONCURRENT
+              value: "4"
+            # Slots reserved for not-yet-playable jobs; 0 = auto (~25% of CPU_CONCURRENCY).
+            - name: ENCODE_FOREGROUND_RESERVE
+              value: "0"
+            # 30 = 1 GOP / 1s @ 30fps so frames drip out with the playhead.
+            - name: CHUNK_FRAMES
+              value: "30"
+            - name: LIVE_ENCODE
+              value: "1"
+            - name: MAX_INFLIGHT_JOBS
+              value: "3"
+            - name: OVERLAP_AFTER_PLAYABLE
+              value: "1"
+            - name: ORIN_DIRECT
+              value: "1"
+            - name: ORIN_CRF
+              value: "23"
+            # HD compress: 1080 square + CRF28 + force re-encode (no H.264 passthrough).
+            # Expected ~0.5–1.5MB / 30-frame segment (was ~3MB with source passthrough).
+            - name: TRANSCODE_SIZE
+              value: "1080"
+            - name: TRANSCODE_FORCE_REENCODE
+              value: "1"
+            - name: TRANSCODE_CRF
+              value: "28"
+            # 0 = CRF+VBV mode (do not set ABR -b:v; it overrides CRF and keeps bins large).
+            - name: TRANSCODE_BITRATE
+              value: "0"
+            - name: TRANSCODE_MAXRATE
+              value: "1.5M"
+            - name: TRANSCODE_BUFSIZE
+              value: "3M"
+            - name: TRANSCODE_PRESET
+              value: "ultrafast"
+            # Floor per ffmpeg. Live 4-cam shares X264_THREAD_BUDGET across 4 slots
+            # (16/4=4 threads each) so a lone 边转边播 job can use the 16-CPU limit.
+            - name: X264_THREADS
+              value: "2"
+            - name: X264_THREAD_BUDGET
+              value: "16"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FILE
+              value: "/cache/sview.log"
+            - name: FFMPEG_PATH
+              value: "ffmpeg"
+            - name: HTTP_ENABLED
+              value: "0"
+          resources:
+            requests:
+              cpu: "8"
+              memory: 16Gi
+            limits:
+              cpu: "16"
+              memory: 32Gi
+          volumeMounts:
+            - name: head-cam-data
+              mountPath: /head-data
+              readOnly: true
+            - name: orin-data
+              mountPath: /orin-data
+              readOnly: true
+            - name: cache
+              mountPath: /cache
+      volumes:
+        - name: head-cam-data
+          persistentVolumeClaim:
+            claimName: mcap-input-head-oss-pvc
+        - name: orin-data
+          persistentVolumeClaim:
+            claimName: mcap-input-teleoperation-oss-pvc
+        - name: cache
+          emptyDir:
+            sizeLimit: 25Gi

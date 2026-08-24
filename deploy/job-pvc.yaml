@@ -1,0 +1,98 @@
+ apiVersion: batch/v1
+ kind: Job
+ metadata:
+   name: mcap-process-pvc-260701
+   namespace: mcap-extract
+ spec:
+   ttlSecondsAfterFinished: 86400
+   backoffLimit: 1
+   template:
+     metadata:
+       labels:
+         app: mcap-process-pvc-260701
+     spec:
+       restartPolicy: Never
+       imagePullSecrets:
+         - name: acr-secret
+       containers:
+         - name: sview-worker
+           image: <YOUR_ACR_REGISTRY>/data-platform/mcap-processor-cpu:<YOUR_TAG>
+           imagePullPolicy: Always
+           command:
+             - "python"
+             - "sview_worker.py"
+             - "--path"
+             - "/head-data/<RELATIVE_MCAP_PATH>"
+           env:
+             # ---------- Mode: local cache, no OSS upload ----------
+             - name: NO_UPLOAD
+               value: "1"
+             # ---------- Local mount paths (must match volumeMounts) ----------
+             - name: HEAD_CAM_MOUNT
+               value: "/head-data"
+             - name: ORIN_MOUNT
+               value: "/orin-data"
+             - name: LOCAL_MOUNT_PATH
+               value: "/head-data"
+             - name: LOCAL_OUTPUT_DIR
+               value: "/cache"
+             - name: TEMP_DIR
+               value: "/tmp"
+             # ---------- Transcode quality ----------
+             - name: TRANSCODE_SIZE
+               value: "0"
+             - name: TRANSCODE_CRF
+               value: "35"
+             - name: TRANSCODE_BITRATE
+               value: "2M"
+             - name: TRANSCODE_MAXRATE
+               value: "3M"
+             - name: TRANSCODE_BUFSIZE
+               value: "4M"
+             - name: TRANSCODE_PRESET
+               value: "veryfast"
+             - name: CPU_CONCURRENCY
+               value: "2"
+             - name: CHUNK_FRAMES
+               value: "150"
+             - name: LOG_LEVEL
+               value: "INFO"
+             - name: FFMPEG_PATH
+               value: "ffmpeg"
+             # ---------- Redis (not used in single-file mode, defaults prevent import errors) ----------
+             - name: REDIS_HOST
+               value: "localhost"
+             - name: REDIS_PORT
+               value: "6379"
+             - name: REDIS_DB
+               value: "0"
+             - name: REDIS_QUEUE_KEY
+               value: "player:queue"
+             # ---------- HTTP (disabled for single-file Job) ----------
+             - name: HTTP_PORT
+               value: "0"
+           resources:
+             requests:
+               cpu: "4"
+               memory: 8Gi
+             limits:
+               cpu: "8"
+               memory: 16Gi
+           volumeMounts:
+             - name: head-data
+               mountPath: /head-data
+               readOnly: true
+             - name: orin-data
+               mountPath: /orin-data
+               readOnly: true
+             - name: cache
+               mountPath: /cache
+       volumes:
+         - name: head-data
+           persistentVolumeClaim:
+             claimName: mcap-input-teleoperation-260701-pvc
+         - name: orin-data
+           persistentVolumeClaim:
+             claimName: <ORIN_DATA_PVC_NAME>
+         - name: cache
+           emptyDir: {}

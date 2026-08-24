@@ -1,0 +1,16 @@
+# 排除本地环境、运行产物和敏感配置，避免进入镜像构建上下文。
+.git
+.gitignore
+.dockerignore
+.drone.yml
+.env
+.venv
+__pycache__
+*.py[cod]
+logs
+posthands
+posthand
+HandAssets
+docs
+.idea
+.DS_Store

@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HandVis EP Scanner</title>
+  <link rel="stylesheet" href="/static/css/index.css?v=__ASSET_VERSION__" />
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>EP 目录扫描</h1>
+      <p>输入 OSS 目录或文件名前缀路径，查询只做预览；点击构建或播放后才会写入播放数据。</p>
+      <input id="epDir" placeholder="oss://bucket/path/to/dir/ 或 oss://bucket/path/to/dir/file_prefix" />
+      <button id="directPairToggle" class="direct-pair-toggle" type="button" aria-expanded="false" aria-controls="directPairPanel">
+        <span class="direct-pair-arrow">▾</span>
+        <span>手动输入视频/posehand3D路径前缀</span>
+      </button>
+      <div id="directPairPanel" class="direct-pair-panel" hidden>
+        <label>posehand3D 路径前缀<input id="directPosehandPath" placeholder="oss://bucket/path/to/prefix" /></label>
+        <label>视频路径前缀<input id="directVideoPath" placeholder="oss://bucket/path/to/prefix" /></label>
+      </div>
+      <div class="actions">
+        <button class="primary" onclick="submitQuery()">查询</button>
+        <button class="secondary" onclick="submitRefresh()">重新预览</button>
+        <button class="secondary" onclick="copyLastResult()">一键复制结果</button>
+        <button class="secondary" onclick="openPlayback()">联合播放页</button>
+      </div>
+      <div id="result" class="result">
+        <span id="resultText" class="err">等待输入...</span>
+        <button id="backParentBtn" class="secondary result-back-btn" type="button" hidden>返回父目录</button>
+      </div>
+      <div id="playerWrap" class="player-wrap" hidden>
+        <div class="preview-split">
+          <section class="preview-pane video-pane">
+            <div class="pane-bar">视频</div>
+            <video id="videoPlayer" controls playsinline preload="metadata"></video>
+          </section>
+          <section class="preview-pane reserve-pane">
+            <div class="pane-bar">3D 预留区域</div>
+            <div id="threeReserve" class="reserve-box">后续在这里加载 3D 手模型</div>
+          </section>
+        </div>
+      </div>
+      <div id="parentEpWrap" class="parent-ep-wrap" hidden>
+        <div class="parent-ep-head">
+          <span id="parentEpTitle">父目录子目录列表</span>
+          <span id="parentEpHint" class="hint"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>ep_dir</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="parentEpBody">
+            <tr><td colspan="3">暂无数据</td></tr>
+          </tbody>
+        </table>
+        <div class="preview-pager">
+          <button class="pager-btn" id="parentPrevPageBtn" type="button">上一页</button>
+          <span id="parentPageInfo" class="pager-info">第 1 页</span>
+          <button class="pager-btn" id="parentNextPageBtn" type="button">下一页</button>
+          <select id="parentPageSize" class="pager-size">
+            <option value="20">20条 / 页</option>
+            <option value="50" selected>50条 / 页</option>
+            <option value="100">100条 / 页</option>
+          </select>
+        </div>
+      </div>
+      <div id="pairWrap" class="pair-wrap" hidden>
+        <div class="pair-head">
+          <span id="pairTitle">当前 EP 配对列表</span>
+          <span id="pairHint" class="hint"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>序号</th>
+              <th>item_name</th>
+              <th>video_path</th>
+              <th>posehand_path</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="pairBody">
+            <tr><td colspan="5">暂无数据</td></tr>
+          </tbody>
+        </table>
+        <div class="preview-pager">
+          <button class="pager-btn" id="pairPrevPageBtn" type="button">上一页</button>
+          <span id="pairPageInfo" class="pager-info">第 1 页</span>
+          <button class="pager-btn" id="pairNextPageBtn" type="button">下一页</button>
+          <select id="pairPageSize" class="pager-size">
+            <option value="20">20条 / 页</option>
+            <option value="50" selected>50条 / 页</option>
+            <option value="100">100条 / 页</option>
+          </select>
+        </div>
+      </div>
+      <div class="board-panel" hidden style="display:none">
+        <div class="board-title">白板参数表</div>
+        <table class="board-table">
+          <thead>
+            <tr><th>参数</th><th>值</th><th>调整</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Y偏移(向下+)</td>
+              <td><span id="boardYOffsetVal">1.500</span></td>
+              <td><input id="boardYOffset" type="range" min="-1.5" max="1.5" step="0.01" value="1.5" /></td>
+            </tr>
+            <tr>
+              <td>X偏移</td>
+              <td><span id="boardXOffsetVal">0.060</span></td>
+              <td><input id="boardXOffset" type="range" min="-1.5" max="1.5" step="0.01" value="0.06" /></td>
+            </tr>
+            <tr>
+              <td>Z偏移</td>
+              <td><span id="boardZOffsetVal">0.720</span></td>
+              <td><input id="boardZOffset" type="range" min="-1.5" max="1.5" step="0.01" value="0.72" /></td>
+            </tr>
+            <tr>
+              <td>旋转X(°)</td>
+              <td><span id="boardRotXVal">-39</span></td>
+              <td><input id="boardRotX" type="range" min="-180" max="180" step="1" value="-39" /></td>
+            </tr>
+            <tr>
+              <td>旋转Y(°)</td>
+              <td><span id="boardRotYVal">4</span></td>
+              <td><input id="boardRotY" type="range" min="-180" max="180" step="1" value="4" /></td>
+            </tr>
+            <tr>
+              <td>旋转Z(°)</td>
+              <td><span id="boardRotZVal">0</span></td>
+              <td><input id="boardRotZ" type="range" min="-180" max="180" step="1" value="0" /></td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="actions">
+          <button class="secondary" id="boardResetBtn" type="button">重置白板参数</button>
+        </div>
+      </div>
+      <!-- list section removed -->
+
+    </div>
+  </div>
+
+  <dialog id="scoreDialog" class="score-dialog">
+    <form id="scoreForm" method="dialog">
+      <div class="score-dialog-head">
+        <div>
+          <h2>素材评分</h2>
+          <p>保存后会在 PostgreSQL 中新增一条记录。</p>
+        </div>
+        <button id="scoreCloseBtn" class="score-close" type="button" aria-label="关闭">×</button>
+      </div>
+      <div class="score-fields">
+        <label>OSS 素材路径<input id="scoreOssPath" type="text" readonly /></label>
+        <div class="score-field">
+          <span>是否为 ego 数据</span>
+          <div id="scoreEgoChoice" class="ego-choice" role="group" aria-label="是否为 ego 数据">
+            <button type="button" data-value="true">是</button>
+            <button type="button" data-value="false">否</button>
+          </div>
+        </div>
+        <div class="score-field">
+          <span>评分</span>
+          <div class="rating-line">
+            <button id="scoreZeroButton" class="score-zero-button" type="button">0分</button>
+            <div id="scoreRating" class="star-rating" role="slider" tabindex="0" aria-label="评分" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0">
+              <span class="star-rating-empty">★★★★★</span>
+              <span class="star-rating-fill">★★★★★</span>
+            </div>
+            <span id="scoreValueLabel" class="score-value-label">未评分</span>
+          </div>
+        </div>
+        <label>备注<textarea id="scoreComment" rows="4" maxlength="4000" placeholder="可选"></textarea></label>
+      </div>
+      <div id="scoreMessage" class="score-message"></div>
+      <div class="score-actions">
+        <button id="scoreCancelBtn" class="secondary" type="button">取消</button>
+        <button id="scoreSaveBtn" class="primary" type="submit">保存评分</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.164.1/build/three.module.js",
+        "three/examples/jsm/": "https://unpkg.com/three@0.164.1/examples/jsm/"
+      }
+    }
+  </script>
+  <script type="module" src="/static/js/index.js?v=__ASSET_VERSION__"></script>
+</body>
+</html>

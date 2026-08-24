@@ -1,0 +1,23 @@
+# 按 handvis:jobs:queue 深度扩缩 worker。不要接到 player:queue。
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: handvis-worker-keda
+  namespace: mcap-extract
+spec:
+  scaleTargetRef:
+    name: handvis-worker
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  pollingInterval: 15
+  cooldownPeriod: 120
+  triggers:
+    - type: redis
+      metadata:
+        address: r-uf69x5dm1c44yn6t53pd.redis.rds.aliyuncs.com:6379
+        listName: handvis:jobs:queue
+        listLength: "1"
+        databaseIndex: "0"
+        activationListLength: "1"
+      authenticationRef:
+        name: sview-redis-trigger-auth

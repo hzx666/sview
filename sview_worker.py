@@ -854,6 +854,19 @@ def _ffmpeg_fast_input_flags() -> list[str]:
     ]
 
 
+def _ffmpeg_annexb_input_flags() -> list[str]:
+    """Probe enough of a raw Annex-B pipe to see SPS/PPS.
+
+    ``_ffmpeg_fast_input_flags`` uses probesize=32. An H.264 SPS NAL is often
+    already >32 bytes, so ffmpeg starts the decoder before PPS and fails with
+    ``non-existing PPS 0 referenced``. The whole chunk is already in stdin.
+    """
+    return [
+        "-probesize", "1048576",
+        "-analyzeduration", "2000000",
+    ]
+
+
 def _x264_encode_flags(*, threads: int | None = None) -> list[str]:
     """libx264 flags for live progressive encode (single-slice, no B-frames)."""
     n = int(threads) if threads is not None else _x264_threads_now()
@@ -922,7 +935,7 @@ def cpu_transcode_chunk(raw_data: bytes, output_path: Path,
         n_threads = _x264_threads_now()
         cmd = [
             FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-            *_ffmpeg_fast_input_flags(),
+            *_ffmpeg_annexb_input_flags(),
             # Decoder threads (HEVC decode is often the live-path bottleneck).
             "-threads", str(n_threads),
             "-f", in_format, "-r", "30", "-i", "pipe:0",
@@ -1187,21 +1200,33 @@ class LiveX264Encoder:
         if self._sniffed:
             return
         self._sniffed = True
+        # Explicit H.264 must not be reclassified: NAL header 0x41 is a
+        # non-IDR slice, but (0x41 >> 1) & 0x3F == 32 looks like HEVC VPS.
+        if not self._hevc and self._codec in ("h264", "avc"):
+            return
         for nal in _iter_annexb_nals(raw):
             hdr = _annexb_nal_header_byte(nal)
             if hdr is None:
                 continue
-            hevc_t = (hdr >> 1) & 0x3F
             h264_t = hdr & 0x1F
-            if hevc_t in (32, 33, 34):
+            if h264_t in (5, 7, 8):
+                self._hevc = False
+                self._codec = "h264"
+                return
+            hevc_t = (hdr >> 1) & 0x3F
+            if hevc_t in (32, 33, 34) and hdr not in (0x41, 0x21):
                 self._hevc = True
                 self._codec = "hevc"
                 return
-            if h264_t in (7, 8, 5):
+            if h264_t in (1, 9):
                 self._hevc = False
                 self._codec = "h264"
                 return
             return
+
+    def seed_param_sets(self, ps: dict) -> None:
+        if ps:
+            self._ps.update(ps)
 
     def _with_param_sets(self, raw: bytes) -> bytes:
         found = _collect_annexb_param_sets(raw, hevc=self._hevc)
@@ -1913,6 +1938,14 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                     )
             for ch in channels:
                 h264_ps_cache.setdefault(ch, {})
+                if orin_kind == "h264":
+                    for blob in jpeg_frames[ch]:
+                        found = _collect_annexb_param_sets(blob, hevc=False)
+                        if found:
+                            h264_ps_cache[ch].update(found)
+                    enc = live_encoders.get(ch) if live_encoders else None
+                    if enc is not None:
+                        enc.seed_param_sets(h264_ps_cache[ch])
 
             def _enc_one(ch: str, cidx: int, start: int, end: int):
                 frames_seg = jpeg_frames[ch][start:end]
@@ -2003,7 +2036,12 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                     PLAYABLE_MIN_FRAMES if cidx == 0
                     else max(1, ORIN_CHUNK_FRAMES)
                 )
-                end = min(start + step, n)
+                if orin_kind == "h264":
+                    end = _idr_aligned_chunk_end(
+                        jpeg_frames, channels, start, n, step
+                    )
+                else:
+                    end = min(start + step, n)
                 t_chunk = time.time()
                 _ovr = getattr(_tls, "override", None)
                 with ThreadPoolExecutor(max_workers=min(4, len(channels))) as pool:
@@ -2593,6 +2631,25 @@ def _h264_payload_has_idr(data: bytes) -> bool:
         else:
             pos += 1
     return False
+
+
+def _idr_aligned_chunk_end(
+    frames_by_ch: dict, channels: list, start: int, n: int, step: int
+) -> int:
+    """End index for a fresh-ffmpeg H.264 chunk: next shared IDR (or n).
+
+    Each live chunk is a new ffmpeg process. Cutting on a P-frame makes the
+    next chunk fail (no reference pictures) even if SPS/PPS are prefixed.
+    """
+    end = min(start + max(1, step), n)
+    if end >= n:
+        return n
+    j = end
+    while j < n:
+        if all(_h264_payload_has_idr(frames_by_ch[ch][j]) for ch in channels):
+            return j
+        j += 1
+    return n
 
 def _write_bytes_atomic(target_path: Path, payload: bytes):
     """Write bytes atomically: write to .tmp first, then rename to target."""

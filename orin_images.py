@@ -215,21 +215,161 @@ def parse_orin_jpeg_streams(
     return dict(frames), dict(timestamps), metas
 
 
-def _looks_like_annexb_h264(data: bytes) -> bool:
-    """payload 以 Annex-B start code 开头且首个 NAL 类型合理。"""
-    head = data[:4096]
+def _annexb_start(data: bytes) -> Tuple[int, int]:
+    """Return (offset, start_code_len) of the first Annex-B start code, or (-1, 0)."""
+    head = data[:4096] if len(data) > 4096 else data
     i4 = head.find(b"\x00\x00\x00\x01")
     i3 = head.find(b"\x00\x00\x01")
     if i4 < 0 and i3 < 0:
-        return False
+        return -1, 0
     if i4 >= 0 and (i3 < 0 or i4 <= i3):
-        i, sc = i4, 4
-    else:
-        i, sc = i3, 3
-    if i + sc >= len(data):
+        return i4, 4
+    return i3, 3
+
+
+def _looks_like_annexb_h264(data: bytes) -> bool:
+    """payload 以 Annex-B start code 开头且首个 NAL 类型合理。"""
+    i, sc = _annexb_start(data)
+    if i < 0 or i + sc >= len(data):
         return False
     nal = data[i + sc] & 0x1F
     return nal in (1, 5, 6, 7, 8, 9)
+
+
+def _iter_h264_nals(data: bytes):
+    """Yield Annex-B NAL units including their start codes."""
+    if not data:
+        return
+    starts = []
+    pos = 0
+    n = len(data)
+    while pos < n - 3:
+        p4 = data.find(b"\x00\x00\x00\x01", pos)
+        p3 = data.find(b"\x00\x00\x01", pos)
+        if p4 < 0 and p3 < 0:
+            break
+        if p4 < 0:
+            np, sc = p3, 3
+        elif p3 < 0:
+            np, sc = p4, 4
+        else:
+            np, sc = (p4, 4) if p4 <= p3 else (p3, 3)
+        if np + sc >= n:
+            break
+        starts.append(np)
+        pos = np + sc + 1
+    if not starts:
+        return
+    for i, start in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else n
+        yield data[start:end]
+
+
+def _h264_nal_type(nal: bytes) -> int:
+    if len(nal) >= 5 and nal.startswith(b"\x00\x00\x00\x01"):
+        return nal[4] & 0x1F
+    if len(nal) >= 4 and nal.startswith(b"\x00\x00\x01"):
+        return nal[3] & 0x1F
+    return 0
+
+
+def _collect_h264_param_sets(data: bytes) -> dict:
+    found = {}
+    for nal in _iter_h264_nals(data):
+        ntype = _h264_nal_type(nal)
+        if ntype in (7, 8):
+            found[ntype] = nal
+    return found
+
+
+def _h264_has_idr(data: bytes) -> bool:
+    return any(_h264_nal_type(nal) == 5 for nal in _iter_h264_nals(data))
+
+
+def _avcc_to_annexb(data: bytes) -> Optional[bytes]:
+    """4-byte length-prefixed (AVCC) NALs → Annex-B. None if not AVCC."""
+    i, n = 0, len(data)
+    out = bytearray()
+    nals = 0
+    while i + 4 <= n:
+        ln = int.from_bytes(data[i : i + 4], "big")
+        if ln < 1 or i + 4 + ln > n:
+            return None
+        nal = data[i + 4 : i + 4 + ln]
+        ntype = nal[0] & 0x1F
+        if ntype == 0 or ntype > 13:
+            return None
+        out += b"\x00\x00\x00\x01"
+        out += nal
+        i += 4 + ln
+        nals += 1
+    if i != n or nals < 1:
+        return None
+    return bytes(out)
+
+
+def _to_annexb_h264(data: bytes) -> Optional[bytes]:
+    """Normalize one CompressedImage payload to Annex-B, or None if unusable."""
+    if not data:
+        return None
+    if _looks_like_annexb_h264(data):
+        i, _sc = _annexb_start(data)
+        return data[i:] if i > 0 else data
+    avcc = _avcc_to_annexb(data)
+    if avcc:
+        return avcc
+    # Raw NAL without start code (forbidden_zero_bit must be 0).
+    if (data[0] & 0x80) == 0 and (data[0] & 0x1F) in (1, 5, 6, 7, 8, 9):
+        return b"\x00\x00\x00\x01" + data
+    return None
+
+
+def _prepare_h264_decode_start(
+    frames: Dict[str, List[bytes]],
+    timestamps: Dict[str, List[int]],
+    metas: Dict[str, dict],
+) -> None:
+    """Drop leading P-frames and prefix SPS/PPS so ffmpeg can open the first chunk.
+
+    Live encode starts a *new* ffmpeg per chunk. A chunk that begins on a
+    P-slice (no PPS, no reference pictures) fails with
+    ``non-existing PPS 0 referenced`` / ``no frame!``.
+    """
+    for ch in list(frames.keys()):
+        blobs = frames[ch]
+        ts = timestamps.get(ch) or []
+        ps: dict = {}
+        idr_idx = None
+        for i, blob in enumerate(blobs):
+            ps.update(_collect_h264_param_sets(blob))
+            if idr_idx is None and _h264_has_idr(blob):
+                idr_idx = i
+        if 7 not in ps or 8 not in ps:
+            raise ValueError(
+                f"Orin {ch}: H.264 stream has no in-band SPS/PPS "
+                f"({len(blobs)} frames). Cannot decode."
+            )
+        if idr_idx is None:
+            raise ValueError(
+                f"Orin {ch}: H.264 stream has no IDR in {len(blobs)} frames "
+                "(recording started mid-GOP with no keyframe)."
+            )
+        if idr_idx:
+            log.info("Orin %s: drop %d leading P-frames before first IDR", ch, idr_idx)
+            blobs = blobs[idr_idx:]
+            ts = ts[idr_idx:]
+        have = _collect_h264_param_sets(blobs[0])
+        if 7 not in have or 8 not in have:
+            prefix = b"".join(ps[t] for t in (7, 8) if t in ps)
+            blobs[0] = prefix + blobs[0]
+        w, h = _h264_sps_size(blobs[0])
+        if ch in metas:
+            if w:
+                metas[ch]["width"] = w
+            if h:
+                metas[ch]["height"] = h
+        frames[ch] = blobs
+        timestamps[ch] = ts
 
 
 class _BitReader:
@@ -391,11 +531,9 @@ def parse_orin_h264_streams(
         ch = _topic_to_channel(topic, cam_map)
         if not ch:
             continue
-        data = bytes(getattr(msg.ros_msg, "data", b"") or b"")
+        data = _to_annexb_h264(bytes(getattr(msg.ros_msg, "data", b"") or b""))
         if not data:
-            continue
-        if not _looks_like_annexb_h264(data):
-            log.warning("Skip non-Annex-B H.264 payload on %s", topic)
+            log.warning("Skip non-H.264 payload on %s", topic)
             continue
         frames[ch].append(data)
         timestamps[ch].append(int(msg.log_time_ns))
@@ -410,13 +548,13 @@ def parse_orin_h264_streams(
                 "source_topic": topic,
             }
 
-    _estimate_fps_into_metas(timestamps, metas)
-
     if not frames:
         raise ValueError(
             f"No Orin H.264 streams (/streamer/*/h264) found in {path} "
             f"(camera map={cam_map})"
         )
+    _prepare_h264_decode_start(frames, timestamps, metas)
+    _estimate_fps_into_metas(timestamps, metas)
     for ch in sorted(frames.keys()):
         log.info(
             "Orin %s: %d H.264 frames  %dx%d @ ~%d fps",

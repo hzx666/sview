@@ -10,6 +10,9 @@ const defaultSource =
   params.get("source") ??
   "oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/SSIEGO_Cam_001V_20260805_132726_367_fixed.mcap";
 const defaultJob = params.get("job") ?? "";
+const defaultForce = ["1", "true", "yes"].includes(
+  (params.get("force") ?? "").toLowerCase(),
+);
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -34,6 +37,10 @@ app.innerHTML = `
       <label class="grow">
         OSS source
         <input id="source" spellcheck="false" value="${defaultSource}" />
+      </label>
+      <label class="check" title="取消进行中的任务、清 play 缓存后重新入队">
+        <input id="force" type="checkbox"${defaultForce ? " checked" : ""} />
+        强制重跑
       </label>
       <button class="btn" id="submit" type="button">提交并播放</button>
     </div>
@@ -77,6 +84,7 @@ app.innerHTML = `
 const el = {
   base: app.querySelector<HTMLInputElement>("#base")!,
   source: app.querySelector<HTMLInputElement>("#source")!,
+  force: app.querySelector<HTMLInputElement>("#force")!,
   job: app.querySelector<HTMLInputElement>("#job")!,
   submit: app.querySelector<HTMLButtonElement>("#submit")!,
   load: app.querySelector<HTMLButtonElement>("#load")!,
@@ -239,6 +247,8 @@ function syncUrl(base: string, job: string, source: string) {
   if (job) url.searchParams.set("job", job);
   else url.searchParams.delete("job");
   if (source) url.searchParams.set("source", source);
+  if (el.force.checked) url.searchParams.set("force", "1");
+  else url.searchParams.delete("force");
   history.replaceState(null, "", url);
 }
 
@@ -311,6 +321,18 @@ function startTouchLoop(api: SviewApi, jobId: string) {
   });
 }
 
+el.force.addEventListener("change", () => {
+  try {
+    syncUrl(
+      el.base.value.trim().replace(/\/+$/, ""),
+      el.job.value.trim(),
+      el.source.value.trim(),
+    );
+  } catch {
+    /* ignore */
+  }
+});
+
 el.refreshStats.addEventListener("click", () => {
   void refreshQueueStats();
 });
@@ -352,8 +374,9 @@ el.submit.addEventListener("click", async () => {
     if (!source) throw new Error("请填写 OSS source");
 
     const api = new SviewApi(base);
-    el.status.textContent = "提交任务…";
-    const created = await api.submitJob(source);
+    const force = el.force.checked;
+    el.status.textContent = force ? "强制提交任务…" : "提交任务…";
+    const created = await api.submitJob(source, force);
     el.job.value = created.job_id;
     syncUrl(base, created.job_id, source);
     void refreshQueueStats();
@@ -375,7 +398,7 @@ el.submit.addEventListener("click", async () => {
       // Start only after ~5s of published frames so playhead is not glued to the frontier.
       minFrames: 150,
       preferSse: true,
-      allowPollFallback: false, // 限死 SSE，失败直接报错（排查用）
+      allowPollFallback: true,
       onTick: (s) => {
         const done = s.frames_done;
         const total = s.frame_count;

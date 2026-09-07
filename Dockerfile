@@ -7,14 +7,18 @@ FROM python:3.11-slim-bookworm
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/ \
+    PIP_TRUSTED_HOST=mirrors.aliyun.com \
     # Redis
     REDIS_HOST=localhost \
     REDIS_PORT=6379 \
     REDIS_DB=0 \
     REDIS_QUEUE_KEY=player:queue \
     # Local mounts (override in K8s)
+    # /head-data       <= OSS original_data/ego_human_data/head_cam/
+    # /teleoperation   <= OSS original_data/teleoperation/{Orin,Agilex,Astribot,Franka,Unitree}/
     HEAD_CAM_MOUNT=/head-data \
-    ORIN_MOUNT=/orin-data \
+    ORIN_MOUNT=/teleoperation \
     LOCAL_OUTPUT_DIR=/cache \
     TEMP_DIR=/tmp \
     # HTTP
@@ -46,10 +50,16 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     BENCH_H264_SOURCE= \
     BENCH_H265_SOURCE=
 
-RUN apt-get update \
+# FFmpeg: H.264 transcode. libhdf5: Astribot .hdf5 (h5py). jpeg/png: Pillow.
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
+        libhdf5-103-1 \
+        libjpeg62-turbo \
+        libpng16-16 \
+        zlib1g \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -59,10 +69,15 @@ RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
 # Runtime modules only (bench clients live in scripts/, not in the image)
+# path_map.py: head_cam + teleoperation Orin/Agilex/Astribot/Franka/Unitree
+# hdf5_images.py: Astribot DAgger .hdf5 camera streams (images_dict/*/color)
+# mcap_protobuf_compat.py: SSIEGO protobuf mixed-encoding bags
 COPY path_map.py \
      job_status.py \
      bench_types.py \
      orin_images.py \
+     hdf5_images.py \
+     mcap_protobuf_compat.py \
      sview_logging.py \
      sview_http.py \
      sview_worker.py \
@@ -70,8 +85,8 @@ COPY path_map.py \
      oss_cache_gc.py \
      ./
 
-# Data / cache mount points (K8s will bind real volumes)
-RUN mkdir -p /head-data /orin-data /cache /tmp/sview_worker
+# Data / cache mount points (K8s binds OSS PVCs here)
+RUN mkdir -p /head-data /teleoperation /orin-data /cache /tmp/sview_worker
 
 EXPOSE 8080
 

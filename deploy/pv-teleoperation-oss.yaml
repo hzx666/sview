@@ -1,0 +1,52 @@
+# Teleoperation OSS volume: parent prefix (Orin / Agilex / Astribot / Franka / Unitree).
+#
+# PV spec.csi is immutable. Recreate:
+#   1. scale Master/Worker to 0
+#   2. delete PVC then PV (Retain does not delete the OSS bucket)
+#   3. kubectl apply -f deploy/pv-teleoperation-oss.yaml
+#   4. wait Bound, then scale Deployments back
+#
+# Pod mount: /teleoperation  (ORIN_MOUNT)
+# OSS: oss://ss-oss-data-platform/original_data/teleoperation/{Orin,Agilex,...}/
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mcap-input-teleoperation-oss-pv
+  labels:
+    alicloud-pvname: mcap-input-teleoperation-oss-pv
+spec:
+  accessModes:
+    - ReadOnlyMany
+  capacity:
+    storage: 10Gi
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  csi:
+    driver: ossplugin.csi.alibabacloud.com
+    volumeHandle: mcap-input-teleoperation-oss-pv
+    nodePublishSecretRef:
+      name: oss-credentials
+      namespace: mcap-extract
+    volumeAttributes:
+      bucket: ss-oss-data-platform
+      fuseType: ossfs2
+      otherOpts: "-o allow_other"
+      path: /original_data/teleoperation
+      url: oss-cn-shanghai-internal.aliyuncs.com
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mcap-input-teleoperation-oss-pvc
+  namespace: mcap-extract
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 10Gi
+  volumeMode: Filesystem
+  selector:
+    matchLabels:
+      alicloud-pvname: mcap-input-teleoperation-oss-pv

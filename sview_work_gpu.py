@@ -21,7 +21,7 @@ from pathlib import Path
 from collections import defaultdict
 
 import redis
-from mcap_protobuf.reader import read_protobuf_messages
+from mcap_protobuf_compat import read_protobuf_messages_compat as read_protobuf_messages
 import json
 
 from sview_logging import setup_logging

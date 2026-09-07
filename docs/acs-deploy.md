@@ -33,7 +33,7 @@ Frontend ──API/SSE──► Master Service :8080
 1. ACS/ACK 集群，命名空间建议：`mcap-extract`（与现 YAML 一致）。
 2. 已有（或新建）PVC，挂载原始 mcap：
    - `mcap-input-head-oss-pvc` → Pod 内 `/head-data`
-   - `mcap-input-teleoperation-oss-pvc` → Pod 内 `/orin-data`
+   - `mcap-input-teleoperation-oss-pvc` → Pod 内 `/teleoperation`（OSS `original_data/teleoperation/`，其下 Orin/Agilex/Astribot/Franka/Unitree）
 3. 阿里云 Redis（与清单中 `REDIS_HOST` 一致，或改 YAML）。
 4. OSS Bucket（默认 `ss-oss-data-platform`），内网 endpoint 给 Pod 用。
 5. ACR 镜像仓库 + 集群内 `acr-secret`（imagePullSecrets）。

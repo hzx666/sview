@@ -8,8 +8,8 @@ Pairs with sview_http.py. Splits H.264 into per-frame AUs via Annex-B NAL scan
 Input formats (auto-detected):
   - Head-cam / SSIEGO: protobuf ``/camera/*/video`` (H.264/HEVC AUs)
   - Orin teleop: ROS2 ``sensor_msgs/CompressedImage`` JPEG，或
-    ``/streamer/realsense_*/h264`` Annex-B H.264
-    (see ``orin_images.py``; mapped to FR/FL/RR/RL)
+    ``/streamer/realsense_*/h264`` / ``/camera/{f_l,f_r,left_wrist,right_wrist}/h264``
+    Annex-B H.264（见 ``orin_images.py``；映射到 FR/FL/RR/RL）
 
 Two modes:
 --path <file>         Process a single mcap file.
@@ -39,8 +39,8 @@ Resolution / quality (env or CLI):
   ENCODE_PLAYABLE_MAX_CONCURRENT=4   after playable, keep 4-cam parallel (1 = serializes, <realtime)
   ENCODE_FOREGROUND_RESERVE=0        slots kept for not-yet-playable jobs (0=auto ~25%)
   LIVE_ENCODE=1                      hold 4 encode slots for the job so cameras stay parallel
-  ORIN_DIRECT=1                      Orin CRF-only (no ABR); still scales if SIZE set
-  ORIN_CRF=23                        Orin CRF (HD compress; raise toward 12 for near-lossless)
+  ORIN_DIRECT=1                      Orin JPEG CRF-only (no ABR); H.264 uses TRANSCODE_*
+  ORIN_CRF=23                        Orin JPEG→H.264 CRF (HD compress; raise toward 12 for near-lossless)
   LOG_FILE=sview.log                 project log under cwd (shared by all modules)
   LOG_PROGRESS_EVERY_PCT=5           job progress log step (percent); 0=every callback
   SVIEW_ROLE=all|master|worker       master=HTTP only; worker=encode; all=both
@@ -66,7 +66,10 @@ from pathlib import Path
 from collections import defaultdict
 
 import redis
-from mcap_protobuf.reader import read_protobuf_messages
+from mcap_protobuf_compat import (
+    read_headcam_video_frame_count,
+    read_protobuf_messages_compat as read_protobuf_messages,
+)
 import json
 
 from sview_logging import setup_logging
@@ -377,8 +380,8 @@ def _env_int(name: str, default: str = "0") -> int:
         return int(default)
 
 
-# Orin JPEG→H.264: default is HD-compressed (not near-lossless).
-# ORIN_DIRECT=1 still skips bitrate crush; scale applies when TRANSCODE_SIZE/W/H set.
+# Orin JPEG→H.264 only. Orin H.264 uses the same TRANSCODE_* knobs as head-cam.
+# ORIN_DIRECT=1 still skips bitrate crush on JPEG; scale applies when SIZE/W/H set.
 ORIN_DIRECT = _env_bool("ORIN_DIRECT", "1")
 ORIN_CRF = max(1, min(51, _env_int("ORIN_CRF", "23")))
 
@@ -862,6 +865,7 @@ def _ffmpeg_annexb_input_flags() -> list[str]:
     ``non-existing PPS 0 referenced``. The whole chunk is already in stdin.
     """
     return [
+        "-fflags", "+genpts+discardcorrupt",
         "-probesize", "1048576",
         "-analyzeduration", "2000000",
     ]
@@ -1103,6 +1107,28 @@ def _has_required_param_sets(ps: dict, *, hevc: bool) -> bool:
     return 7 in ps and 8 in ps
 
 
+def _annexb_has_leading_ps(data: bytes, *, hevc: bool) -> bool:
+    """True if SPS+PPS appear before the first VCL NAL."""
+    skip = {35, 39, 6} if hevc else {6, 9}
+    vcl = {0, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 21} if hevc else {1, 5}
+    seen: list[int] = []
+    for nal in _iter_annexb_nals(data):
+        hdr = _annexb_nal_header_byte(nal)
+        if hdr is None:
+            continue
+        ntype = ((hdr >> 1) & 0x3F) if hevc else (hdr & 0x1F)
+        if ntype in skip:
+            continue
+        seen.append(ntype)
+        if ntype in vcl:
+            break
+        if len(seen) >= 8:
+            break
+    if hevc:
+        return 33 in seen and 34 in seen
+    return 7 in seen and 8 in seen
+
+
 class LiveX264Encoder:
     """Holds one encode-gate slot for the whole job; each chunk is a fresh ffmpeg.
 
@@ -1137,6 +1163,17 @@ class LiveX264Encoder:
         self._acquired = False
         encode_gate.acquire(self._job_id)
         self._acquired = True
+
+    def seed_param_sets(self, ps: dict | bytes | None) -> None:
+        """Prime SPS/PPS (and HEVC VPS) from a later keyframe / full-bag scan."""
+        if not ps:
+            return
+        if isinstance(ps, (bytes, bytearray)):
+            found = _collect_annexb_param_sets(bytes(ps), hevc=self._hevc)
+            if found:
+                self._ps.update(found)
+            return
+        self._ps.update(ps)
 
     @classmethod
     def annexb(cls, *, codec: str, scale_w, scale_h, job_id: str | None, fps: float = 30.0):
@@ -1222,7 +1259,9 @@ class LiveX264Encoder:
                 self._hevc = False
                 self._codec = "h264"
                 return
-            return
+            if h264_t in (1, 6, 9) or hevc_t in (1, 6, 9, 35, 39):
+                continue
+            continue
 
     def seed_param_sets(self, ps: dict) -> None:
         if ps:
@@ -1232,7 +1271,7 @@ class LiveX264Encoder:
         found = _collect_annexb_param_sets(raw, hevc=self._hevc)
         if found:
             self._ps.update(found)
-        if _has_required_param_sets(found, hevc=self._hevc):
+        if _annexb_has_leading_ps(raw, hevc=self._hevc):
             return raw
         prefix = _param_sets_bytes(self._ps, hevc=self._hevc)
         if not prefix:
@@ -1811,7 +1850,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
         found = _collect_annexb_param_sets(raw, hevc=False)
         if found:
             cache.update(found)
-        if _has_required_param_sets(found, hevc=False):
+        if _annexb_has_leading_ps(raw, hevc=False):
             return raw
         prefix = _param_sets_bytes(cache, hevc=False)
         if not prefix:
@@ -1827,32 +1866,393 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
     try:
         from orin_images import (
             jpeg_sequence_to_h264,
+            orin_h264_channels_from_summary,
             orin_stream_kind,
-            parse_orin_h264_streams,
             parse_orin_jpeg_streams,
+            iter_orin_h264_annexb,
+            sview_channel_for_topic,
+            _h264_sps_size,
         )
+        from hdf5_images import is_hdf5_file, parse_hdf5_image_streams
 
-        # Orin teleop bags: ROS2 CompressedImage JPEG 或 /streamer/*/h264 Annex-B。
-        orin_kind = orin_stream_kind(local_path)
-        if orin_kind:
-            if orin_kind == "h264":
+        # Orin teleop bags: ROS2 CompressedImage JPEG 或 H.264 Annex-B。
+        # SSIEGO / head-cam protobuf 必须走 else；误判成 Orin 时官方
+        # read_ros2_messages 会在 protobuf 通道上抛 DecoderNotFoundError。
+        # Astribot 等 HDF5 不是 MCAP，不能走 protobuf reader。
+        orin_kind = None
+        orin_ok = False
+        if is_hdf5_file(local_path):
+            log.info(
+                "[%s]  Format=HDF5 camera images (JPEG→H.264 progressive, chunk=%d)",
+                fname, ORIN_CHUNK_FRAMES,
+            )
+            frame_blobs, video_timestamps, camera_metas = parse_hdf5_image_streams(
+                local_path,
+            )
+            orin_kind = "jpeg"
+            orin_ok = True
+        else:
+            orin_kind = orin_stream_kind(local_path)
+            if orin_kind:
+                try:
+                    if orin_kind == "h264":
+                        log.info(
+                            "[%s]  Format=Orin ROS2 H.264 streams "
+                            "(stream, same TRANSCODE_* as head-cam, chunk=%d)",
+                            fname, ORIN_CHUNK_FRAMES,
+                        )
+                        # Parsed incrementally in the encode loop so the first
+                        # GOP is published without waiting to scan the whole bag.
+                    else:
+                        log.info(
+                            "[%s]  Format=Orin ROS2 CompressedImage (JPEG→H.264 progressive, chunk=%d)",
+                            fname, ORIN_CHUNK_FRAMES,
+                        )
+                        try:
+                            frame_blobs, video_timestamps, camera_metas = parse_orin_jpeg_streams(
+                                local_path,
+                            )
+                        except ValueError as e:
+                            # ACS 旧镜像会把 format=h264 的 CompressedImage 当 JPEG。
+                            # 新代码 peek 后应走 h264；这里再兜底一次，避免误分类。
+                            log.warning(
+                                "[%s]  JPEG parse failed (%s); retry as Orin H.264",
+                                fname, e,
+                            )
+                            orin_kind = "h264"
+                    orin_ok = True
+                except Exception as exc:
+                    log.warning(
+                        "[%s]  Orin parse failed (%s); falling back to head-cam protobuf",
+                        fname, exc,
+                    )
+                    orin_kind = None
+        if orin_ok and orin_kind == "h264":
+            try:
+                jpeg_frames = defaultdict(list)
+                idr_seen: dict = {}
+                expected_ch = sorted(orin_h264_channels_from_summary(local_path))
+                summary_n = read_headcam_video_frame_count(local_path)
+                job_id = out_job_id
+                progressive = bool(no_upload and PROGRESSIVE_PUBLISH)
+                if progressive:
+                    publish_dir = _prepare_publish_dir(job_id)
+                    output_frame_dir = publish_dir / "frames"
+                    log.info("[%s]  Progressive publish -> %s", fname, publish_dir)
+                else:
+                    publish_dir = None
+                    output_frame_dir = work_dir / "frames"
+                    output_frame_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = (
+                    (publish_dir / "manifest.json") if publish_dir else (work_dir / "manifest.json")
+                )
+                key_frame_indices = []
+                channels: list = []
+                channel_aus: dict = {}
+                live_encoders = {}
+                min_frames = summary_n or 0
+                start = 0
+                cidx = 0
+                sw = sh = None
+                passthrough = False
+                if summary_n:
+                    log.info(
+                        "[%s]  Orin H.264 frame_count from mcap summary: %d (channels=%s)",
+                        fname, summary_n, ",".join(expected_ch) or "?",
+                    )
+                if progress_cb:
+                    try:
+                        progress_cb(0, min_frames or 0)
+                    except Exception:
+                        log.exception("progress_cb failed at start")
+
+                def _aligned_n() -> int:
+                    if not channels:
+                        return 0
+                    return min(len(jpeg_frames.get(ch, [])) for ch in channels)
+
+                def _lock_channels(final: bool = False) -> bool:
+                    nonlocal channels, channel_aus, live_encoders, passthrough, sw, sh
+                    if channels:
+                        return True
+                    have = [ch for ch, rows in jpeg_frames.items() if rows]
+                    if expected_ch:
+                        ready = [ch for ch in expected_ch if jpeg_frames.get(ch)]
+                        if not ready:
+                            return False
+                        if len(ready) < len(expected_ch) and not final:
+                            return False
+                        channels = ready
+                    elif final:
+                        if not have:
+                            return False
+                        channels = sorted(have)
+                    elif len(have) >= 4:
+                        channels = sorted(have)
+                    else:
+                        return False
+                    # Same knobs as head-cam: TRANSCODE_SIZE/CRF/BITRATE/FORCE_REENCODE.
+                    passthrough = _is_h264_passthrough(camera_metas, channels)
+                    sw = _scale_dim(camera_metas, "w")
+                    sh = _scale_dim(camera_metas, "h")
+                    if _resize_requested():
+                        for ch in camera_metas:
+                            camera_metas[ch]["width"] = sw
+                            camera_metas[ch]["height"] = sh
+                    channel_aus = {ch: [] for ch in channels}
+                    log.info(
+                        "[%s]  Orin H.264 progressive (%s), cams=%s "
+                        "size=%s crf=%s bitrate=%s maxrate=%s force_reencode=%s",
+                        fname,
+                        "h264 passthrough" if passthrough else "libx264",
+                        ",".join(channels),
+                        _transcode_size_desc(),
+                        _tc_crf(),
+                        TRANSCODE_BITRATE,
+                        TRANSCODE_MAXRATE,
+                        int(_tc_force_reencode()),
+                    )
+                    if (not passthrough) and LIVE_ENCODE:
+                        live_encoders = _start_live_annexb_encoders(
+                            channels, camera_metas, job_id, sw, sh,
+                        )
+                        log.info(
+                            "[%s]  Live libx264 sessions x%d (hold encode slots for job)",
+                            fname, len(live_encoders),
+                        )
+                        for ch, enc in live_encoders.items():
+                            enc.seed_param_sets(h264_ps_cache.get(ch) or {})
+                    return True
+
+                def _enc_one(ch: str, cidx_i: int, f0: int, f1: int):
+                    want = f1 - f0
+                    if passthrough:
+                        aus = _trim_pad_aus(
+                            [bytes(x) for x in jpeg_frames[ch][f0:f1]], want,
+                        )
+                        return ch, aus, 0.0, sum(len(a) for a in aus)
+                    enc = live_encoders.get(ch) if live_encoders else None
+                    origin, extra, lead = f0, 0, 0
+                    last_idr = _h264_last_idr_index(jpeg_frames[ch], f0)
+                    if last_idr < 0:
+                        rel = _h264_first_idr_index(jpeg_frames[ch][f0:f1])
+                        last_idr = (f0 + rel) if rel >= 0 else -1
+                    if last_idr >= 0:
+                        if last_idr < f0:
+                            origin, extra = last_idr, f0 - last_idr
+                        elif last_idr > f0:
+                            origin, lead = last_idr, last_idr - f0
+                    if extra and any(not b for b in jpeg_frames[ch][origin:f0]):
+                        origin, extra, lead = f0, 0, 0
+                    frames_seg = jpeg_frames[ch][origin:f1]
+
+                    def _fit_aus(aus_all: list) -> list:
+                        aus = list(aus_all[extra:] if extra else aus_all)
+                        if lead:
+                            aus = [b""] * lead + aus
+                        if len(aus) > want:
+                            aus = aus[:want]
+                        while len(aus) < want:
+                            aus.append(b"")
+                        return aus
+
+                    if enc is not None:
+                        t0 = time.time()
+                        aus = _fit_aus(enc.encode_frames(frames_seg))
+                        elapsed = time.time() - t0
+                        nbytes = sum(len(a) for a in aus)
+                        return ch, aus, elapsed, nbytes
+                    out_p = work_dir / f"{ch}_orin_c{cidx_i:04d}.h264"
+                    lock = cpu_encode_lock
+                    gate = lock.slot(job_id) if hasattr(lock, "slot") else lock
+                    with gate:
+                        raw_in = _h264_prefix_cached_ps(
+                            b"".join(frames_seg), h264_ps_cache[ch],
+                        )
+                        elapsed = cpu_transcode_chunk(
+                            raw_in, out_p, sw, sh, codec="h264",
+                            job_id=job_id, acquire_gate=False,
+                        )
+                    raw = out_p.read_bytes()
+                    aus = _split_h264_access_units(raw, work_dir)
+                    try:
+                        out_p.unlink()
+                    except OSError:
+                        pass
+                    return ch, _fit_aus(aus), elapsed, len(raw)
+
+                def _emit_chunks(final: bool = False) -> None:
+                    nonlocal start, cidx, min_frames
+                    if not _lock_channels(final=final):
+                        return
+                    n = _aligned_n()
+                    if summary_n:
+                        min_frames = summary_n
+                    else:
+                        min_frames = max(min_frames, n)
+                    while start < n:
+                        step = (
+                            PLAYABLE_MIN_FRAMES if cidx == 0
+                            else max(1, ORIN_CHUNK_FRAMES)
+                        )
+                        if not final and n < start + step:
+                            return
+                        end = min(start + step, n)
+                        t_chunk = time.time()
+                        _ovr = getattr(_tls, "override", None)
+                        with ThreadPoolExecutor(max_workers=min(4, len(channels))) as pool:
+                            futs = [
+                                pool.submit(_tls_call, _ovr, _enc_one, ch, cidx, start, end)
+                                for ch in channels
+                            ]
+                            for fut in as_completed(futs):
+                                ch, aus, elapsed, nbytes = fut.result()
+                                channel_aus[ch].extend(aus)
+                        chunk_len = end - start
+                        for ch in channels:
+                            have = len(channel_aus[ch])
+                            expect = start + chunk_len
+                            if have > expect:
+                                channel_aus[ch] = channel_aus[ch][:expect]
+                            while len(channel_aus[ch]) < expect:
+                                channel_aus[ch].append(b"")
+                            origin = _h264_last_idr_index(jpeg_frames[ch], start)
+                            if passthrough or origin < 0:
+                                origin = start
+                            for i in range(0, origin):
+                                jpeg_frames[ch][i] = b""
+                        _write_bundle_range(
+                            start,
+                            end,
+                            channel_aus=channel_aus,
+                            video_timestamps=video_timestamps,
+                            imu_sorted=[],
+                            imu_idx=0,
+                            output_frame_dir=output_frame_dir,
+                            manifest_path=manifest_path,
+                            job_id=job_id,
+                            camera_metas=camera_metas,
+                            min_frames=max(min_frames, end),
+                            key_frame_indices=key_frame_indices,
+                            progressive=progressive,
+                            progress_cb=progress_cb,
+                        )
+                        elapsed = time.time() - t_chunk
+                        log.info(
+                            "[%s]  Orin chunk %d frames [%d:%d) %.1f%% published in %.2fs%s%s",
+                            fname,
+                            cidx,
+                            start,
+                            end,
+                            _progress_pct(end, max(min_frames, end)),
+                            elapsed,
+                            _encode_rate_suffix(end - start, elapsed),
+                            " [passthrough]" if passthrough else (
+                                " [live]" if live_encoders else ""
+                            ),
+                        )
+                        cidx += 1
+                        start = end
+
+                for ch, data, ts_ns, meta in iter_orin_h264_annexb(local_path):
+                    if not idr_seen.get(ch):
+                        if not _h264_payload_has_idr(data):
+                            continue
+                        idr_seen[ch] = True
+                    jpeg_frames[ch].append(data)
+                    video_timestamps[ch].append(ts_ns)
+                    if ch not in camera_metas:
+                        camera_metas[ch] = dict(meta)
+                    elif meta.get("width") and meta.get("height"):
+                        camera_metas[ch]["width"] = meta["width"]
+                        camera_metas[ch]["height"] = meta["height"]
+                    ps = h264_ps_cache.setdefault(ch, {})
+                    if not _has_required_param_sets(ps, hevc=False):
+                        found = _collect_annexb_param_sets(data, hevc=False)
+                        if found:
+                            ps.update(found)
+                    if not channels:
+                        _emit_chunks(final=False)
+                    else:
+                        need = (
+                            PLAYABLE_MIN_FRAMES if cidx == 0
+                            else max(1, ORIN_CHUNK_FRAMES)
+                        )
+                        if _aligned_n() >= start + need:
+                            _emit_chunks(final=False)
+                _emit_chunks(final=True)
+                if start < 1:
+                    raise ValueError(f"Orin MCAP has no h264 frames: {local_path}")
+                min_frames = start
+                for ch in channels:
+                    video_frames[ch] = jpeg_frames.get(ch, [])
                 log.info(
-                    "[%s]  Format=Orin ROS2 H.264 streams (re-encode progressive, chunk=%d)",
-                    fname, ORIN_CHUNK_FRAMES,
+                    "[%s]  Built %d frame bundles (%d keyframes)%s [orin h264 stream]",
+                    fname, min_frames, len(key_frame_indices),
+                    " [progressive]" if progressive else "",
                 )
-                # frame_blobs: 每条消息一帧 Annex-B；走 annexb 重编码归一化。
-                frame_blobs, video_timestamps, camera_metas = parse_orin_h264_streams(
-                    local_path,
+                tl_start, tl_end = _estimate_timeline(
+                    video_timestamps, channel_aus, min_frames,
                 )
-            else:
-                log.info(
-                    "[%s]  Format=Orin ROS2 CompressedImage (JPEG→H.264 progressive, chunk=%d)",
-                    fname, ORIN_CHUNK_FRAMES,
+                _publish_manifest(
+                    manifest_path,
+                    _build_manifest_dict(
+                        job_id=job_id,
+                        camera_metas=camera_metas,
+                        frame_count=min_frames,
+                        frames_available=min_frames,
+                        key_frame_indices=key_frame_indices,
+                        timeline_start_ns=tl_start,
+                        timeline_end_ns=tl_end,
+                        status="done",
+                    ),
                 )
-                frame_blobs, video_timestamps, camera_metas = parse_orin_jpeg_streams(
-                    local_path,
+                if progress_cb:
+                    try:
+                        progress_cb(min_frames, min_frames)
+                    except Exception:
+                        log.exception("progress_cb failed at end")
+                orin_published = True
+            except Exception as exc:
+                log.warning(
+                    "[%s]  Orin H.264 stream encode failed (%s); "
+                    "falling back to head-cam protobuf",
+                    fname, exc,
                 )
+                orin_kind = None
+                orin_ok = False
+        elif orin_ok:
             jpeg_frames = frame_blobs
+            if orin_kind == "h264":
+                for ch in list(jpeg_frames.keys()):
+                    idx = _h264_first_idr_index(jpeg_frames[ch])
+                    if idx > 0:
+                        log.info(
+                            "[%s]  %s drop %d leading P-frames before first IDR",
+                            fname, ch, idx,
+                        )
+                        jpeg_frames[ch] = jpeg_frames[ch][idx:]
+                        video_timestamps[ch] = list(video_timestamps[ch][idx:])
+                    elif idx < 0:
+                        log.warning(
+                            "[%s]  %s has no IDR NAL; decode may fail",
+                            fname, ch,
+                        )
+                    ps: dict = {}
+                    for blob in jpeg_frames[ch]:
+                        found = _collect_annexb_param_sets(blob, hevc=False)
+                        if found:
+                            ps.update(found)
+                        if _has_required_param_sets(ps, hevc=False):
+                            break
+                    h264_ps_cache[ch] = ps
+                    if not _has_required_param_sets(ps, hevc=False):
+                        log.warning("[%s]  %s missing in-band SPS/PPS", fname, ch)
+                    elif 7 in ps:
+                        w, h = _h264_sps_size(ps[7])
+                        if w > 0 and h > 0 and ch in camera_metas:
+                            camera_metas[ch]["width"] = w
+                            camera_metas[ch]["height"] = h
             n = min(len(v) for v in jpeg_frames.values())
             if n < 1:
                 raise ValueError(f"Orin MCAP has no {orin_kind} frames: {local_path}")
@@ -1922,6 +2322,8 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         "[%s]  Live H.264→H.264 sessions x%d (re-encode, hold encode slots for job)",
                         fname, len(live_encoders),
                     )
+                    for ch, enc in live_encoders.items():
+                        enc.seed_param_sets(h264_ps_cache.get(ch) or {})
                 else:
                     live_encoders = _start_live_jpeg_encoders(
                         channels,
@@ -1948,16 +2350,39 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         enc.seed_param_sets(h264_ps_cache[ch])
 
             def _enc_one(ch: str, cidx: int, start: int, end: int):
-                frames_seg = jpeg_frames[ch][start:end]
+                want = end - start
                 enc = live_encoders.get(ch) if live_encoders else None
+                origin = start
+                extra = 0
+                lead = 0
+                if orin_kind == "h264":
+                    last_idr = _h264_last_idr_index(jpeg_frames[ch], start)
+                    if last_idr < 0:
+                        rel = _h264_first_idr_index(jpeg_frames[ch][start:end])
+                        last_idr = (start + rel) if rel >= 0 else -1
+                    if last_idr >= 0:
+                        if last_idr < start:
+                            origin, extra = last_idr, start - last_idr
+                        elif last_idr > start:
+                            origin, lead = last_idr, last_idr - start
+                    if extra and any(not b for b in jpeg_frames[ch][origin:start]):
+                        origin, extra, lead = start, 0, 0
+                frames_seg = jpeg_frames[ch][origin:end]
+
+                def _fit_aus(aus_all: list) -> list:
+                    aus = list(aus_all[extra:] if extra else aus_all)
+                    if lead:
+                        aus = [b""] * lead + aus
+                    if len(aus) > want:
+                        aus = aus[:want]
+                    while len(aus) < want:
+                        aus.append(b"")
+                    return aus
+
                 if enc is not None:
                     t0 = time.time()
-                    aus = enc.encode_frames(frames_seg)
+                    aus = _fit_aus(enc.encode_frames(frames_seg))
                     elapsed = time.time() - t0
-                    if len(aus) > len(frames_seg):
-                        aus = aus[: len(frames_seg)]
-                    while len(aus) < len(frames_seg):
-                        aus.append(b"")
                     nbytes = sum(len(a) for a in aus)
                     return ch, aus, elapsed, nbytes
                 fps = float(camera_metas.get(ch, {}).get("fps") or 30)
@@ -1980,7 +2405,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         )
                     elif ORIN_DIRECT:
                         elapsed = jpeg_sequence_to_h264(
-                            frames_seg,
+                            jpeg_frames[ch][start:end],
                             out_p,
                             fps=fps,
                             scale_w=sw,
@@ -1991,7 +2416,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                             bitrate=None,
                             maxrate=None,
                             bufsize=None,
-                            gop=len(frames_seg),
+                            gop=len(jpeg_frames[ch][start:end]),
                             direct=True,
                             threads=_x264_threads_now(),
                         )
@@ -2000,7 +2425,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         mr = None if _rate_control_empty(TRANSCODE_MAXRATE) else TRANSCODE_MAXRATE
                         bs = None if _rate_control_empty(TRANSCODE_BUFSIZE) else TRANSCODE_BUFSIZE
                         elapsed = jpeg_sequence_to_h264(
-                            frames_seg,
+                            jpeg_frames[ch][start:end],
                             out_p,
                             fps=fps,
                             scale_w=sw,
@@ -2011,7 +2436,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                             bitrate=br,
                             maxrate=mr,
                             bufsize=bs,
-                            gop=len(frames_seg),
+                            gop=len(jpeg_frames[ch][start:end]),
                             direct=False,
                             threads=_x264_threads_now(),
                         )
@@ -2021,11 +2446,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                     out_p.unlink()
                 except OSError:
                     pass
-                # 一帧输入 → 一个输出 AU; trim/pad defensively.
-                if len(aus) > len(frames_seg):
-                    aus = aus[: len(frames_seg)]
-                while len(aus) < len(frames_seg):
-                    aus.append(b"")
+                aus = _fit_aus(aus)
                 return ch, aus, elapsed, len(raw)
 
             cidx = 0
@@ -2065,9 +2486,16 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         channel_aus[ch] = channel_aus[ch][:expect]
                     while len(channel_aus[ch]) < expect:
                         channel_aus[ch].append(b"")
-                    # Free JPEG bytes already encoded.
-                    for i in range(start, end):
-                        jpeg_frames[ch][i] = b""
+                    if orin_kind == "h264":
+                        # Keep the current GOP (from last IDR) for the next fresh-ffmpeg chunk.
+                        origin = _h264_last_idr_index(jpeg_frames[ch], start)
+                        if origin < 0:
+                            origin = start
+                        for i in range(0, origin):
+                            jpeg_frames[ch][i] = b""
+                    else:
+                        for i in range(start, end):
+                            jpeg_frames[ch][i] = b""
 
                 _write_bundle_range(
                     start,
@@ -2123,7 +2551,8 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
         else:
             # Head-cam: stream-read → per-chunk encode/passthrough → publish immediately
             # (same progressive model as Orin; first chunk = PLAYABLE_MIN_FRAMES).
-            estimated_frames_per_ch = max(1, int(total_size * 0.60 / (4 * 30000)))
+            size_guess = max(1, int(total_size * 0.60 / (4 * 30000)))
+            summary_frames = read_headcam_video_frame_count(local_path)
             job_id = out_job_id
             progressive = bool(no_upload and PROGRESSIVE_PUBLISH)
             publish_dir = None
@@ -2145,7 +2574,20 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
             ts_wall_offset = 0
             passthrough = None  # decided once metas+channels are ready
             channels = []
-            declared_total = estimated_frames_per_ch
+            if summary_frames and summary_frames > 0:
+                declared_total = summary_frames
+                total_from_summary = True
+                log.info(
+                    "[%s]  frame_count from mcap summary: %d",
+                    fname, summary_frames,
+                )
+            else:
+                declared_total = size_guess
+                total_from_summary = False
+                log.info(
+                    "[%s]  frame_count estimated from file size: %d (no mcap summary)",
+                    fname, declared_total,
+                )
 
             if progress_cb:
                 try:
@@ -2277,7 +2719,12 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         if min_count < next_end:
                             break
                     _try_rebase_timeline()
-                    declared_total = max(declared_total, next_end, estimated_frames_per_ch)
+                    # Summary count is the full-job total; only grow if we publish past it.
+                    # Size guess is a floor when Summary is missing.
+                    if total_from_summary:
+                        declared_total = max(declared_total, next_end)
+                    else:
+                        declared_total = max(declared_total, next_end, size_guess)
                     imu_sorted = sorted(imu_rows, key=lambda r: r["log_time_ns"])
                     imu_idx = _publish_headcam_chunk(
                         fname=fname,
@@ -2311,24 +2758,24 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 topic = msg.topic
 
                 if "/meta" in topic and "camera" in topic.lower():
-                    parts = topic.split("/")
-                    if len(parts) >= 3:
-                        ch = parts[2]
-                        if ch not in camera_metas:
-                            try:
-                                p = msg.proto_msg
-                                camera_metas[ch] = {
-                                    "width": int(p.width),
-                                    "height": int(p.height),
-                                    "fps": int(getattr(p, "fps", 30)),
-                                    "position": str(getattr(p, "position", ch)),
-                                    "codec": str(getattr(p, "codec", "") or "").lower(),
-                                }
-                            except Exception:
-                                pass
+                    ch = sview_channel_for_topic(topic)
+                    if ch and ch not in camera_metas:
+                        try:
+                            p = msg.proto_msg
+                            camera_metas[ch] = {
+                                "width": int(p.width),
+                                "height": int(p.height),
+                                "fps": int(getattr(p, "fps", 30)),
+                                "position": str(getattr(p, "position", ch)),
+                                "codec": str(getattr(p, "codec", "") or "").lower(),
+                            }
+                        except Exception:
+                            pass
 
-                elif "/video" in topic:
-                    ch_name = topic.split("/")[2]
+                elif "/video" in topic or "/h264" in topic.lower():
+                    ch_name = sview_channel_for_topic(topic)
+                    if not ch_name:
+                        continue
                     channel_found.add(ch_name)
                     video_frames[ch_name].append(msg.proto_msg.data)
                     _append_video_ts(ch_name, msg.log_time_ns)
@@ -2651,6 +3098,25 @@ def _idr_aligned_chunk_end(
         j += 1
     return n
 
+
+def _h264_first_idr_index(frames: list) -> int:
+    for i, blob in enumerate(frames):
+        if blob and _h264_payload_has_idr(blob):
+            return i
+    return -1
+
+
+def _h264_last_idr_index(frames: list, at_or_before: int) -> int:
+    if not frames:
+        return -1
+    i = min(int(at_or_before), len(frames) - 1)
+    while i >= 0:
+        blob = frames[i]
+        if blob and _h264_payload_has_idr(blob):
+            return i
+        i -= 1
+    return -1
+
 def _write_bytes_atomic(target_path: Path, payload: bytes):
     """Write bytes atomically: write to .tmp first, then rename to target."""
     tmp_path = target_path.with_suffix(target_path.suffix + '.tmp')
@@ -2663,7 +3129,9 @@ def _estimate_timeline(video_timestamps: dict, channel_aus: dict, upto_frame: in
     """Timeline start/end for `upto_frame` frames (1-based count).
 
     Prefer full timestamp span when enough samples exist; otherwise fall back to
-    last-interval extrapolation (spec 4.1).
+    last-interval extrapolation (spec 4.1). If ``upto_frame`` is the full-job
+    count but only a prefix of timestamps is in memory, extrapolate end_ns so
+    duration_sec stays stable during progressive publish.
     """
     if upto_frame <= 0 or not channel_aus or not video_timestamps:
         return 0, 0
@@ -2672,8 +3140,13 @@ def _estimate_timeline(video_timestamps: dict, channel_aus: dict, upto_frame: in
     if len(ts_list) >= 2:
         start_ns = ts_list[0]
         last_start_ns = ts_list[-1]
-        previous_start_ns = ts_list[-2]
-        end_ns = last_start_ns + (last_start_ns - previous_start_ns)
+        have = len(ts_list)
+        avg = (last_start_ns - start_ns) / (have - 1)
+        if avg > 0 and upto_frame > have:
+            end_ns = start_ns + int(avg * (upto_frame - 1))
+        else:
+            previous_start_ns = ts_list[-2]
+            end_ns = last_start_ns + (last_start_ns - previous_start_ns)
         return start_ns, end_ns
     if len(ts_list) == 1:
         return ts_list[0], ts_list[0] + 33_333_333

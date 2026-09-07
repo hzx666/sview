@@ -51,7 +51,7 @@ spec:
             - name: HEAD_CAM_MOUNT
               value: "/head-data"
             - name: ORIN_MOUNT
-              value: "/orin-data"
+              value: "/teleoperation"
             - name: LOCAL_OUTPUT_DIR
               value: "/cache"
             - name: TEMP_DIR
@@ -165,7 +165,7 @@ spec:
               mountPath: /head-data
               readOnly: true
             - name: orin-data
-              mountPath: /orin-data
+              mountPath: /teleoperation
               readOnly: true
             - name: cache
               mountPath: /cache

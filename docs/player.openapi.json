@@ -1,0 +1,2959 @@
+{
+  "openapi": "3.0.1",
+  "info": {
+    "title": "player-bin Master API",
+    "description": "SView Master（`sview_http.py` :8080）对外 HTTP 合同，可直接导入 Apifox。\n\n系统两条链路共用同一套任务模型（`sview:job:{id}`）与 OSS `player-bin/{job_id}/` 播放缓存：\n- **SView**：`oss://…/*.mcap` → CPU Worker 转码拆帧 → 四路 WebCodecs。源可以是头显 protobuf，或 **Orin** ROS2 CompressedImage（JPEG 或 `format=h264` Annex-B），合同相同。\n- **HandVis**：`kind=handvis` → HandVis Worker MANO/mesh → 3D 手模\n\n前端 Base URL 只指向 Master，不要打 Worker。媒体优先 `signed-media` 直连公网 OSS，失败再用 `?proxy=1`。\n\n约定：\n- CORS：`Access-Control-Allow-Origin: *`；任意路径 `OPTIONS` → 204；所有 GET 同时支持 `HEAD`。\n- `job_id` 正则 `^[A-Za-z0-9._-]{1,200}$`。\n- 多数路径参数错误 / 媒体 404 / 425 是 **text/plain**（`_send_err` / `_send_retry`）；提交任务、查状态、运维 JSON 接口的业务错误才是 `{\"error\":...}`。\n- 集群 `SVIEW_CLUSTER=1` 时，媒体请求可能反向代理到持锁 Pod（`X-Sview-Proxy`）。\n\n可选 HandVis 独立 FastAPI（`:8000` 的 `/api/ep-assets`、`/api/playback/build-chunks`、`/api/oss-file-info`）不在本文件范围内；ACS 推荐全部走 Master `/api/jobs`。\n",
+    "version": "1.2.0"
+  },
+  "servers": [
+    {
+      "url": "https://dev.simplesilicon-data.com/sview",
+      "description": "ACS 对外（Ingress 前缀 /sview）"
+    },
+    {
+      "url": "http://127.0.0.1:8080",
+      "description": "本地直连 Master"
+    },
+    {
+      "url": "http://127.0.0.1:5173/sview",
+      "description": "Vite 联调反代"
+    }
+  ],
+  "tags": [
+    {
+      "name": "health",
+      "description": "健康检查"
+    },
+    {
+      "name": "jobs",
+      "description": "正式任务：提交 / 状态 / SSE / 取消 / touch"
+    },
+    {
+      "name": "media",
+      "description": "播放数据面：manifest / segments / signed-media"
+    },
+    {
+      "name": "handvis",
+      "description": "HandVis mesh 侧车：index.json / faces.u32 / video_projection.bin"
+    },
+    {
+      "name": "ops",
+      "description": "运维：队列、Worker、metrics、缓存 GC"
+    },
+    {
+      "name": "test",
+      "description": "压测旁路 /api/test/*，不影响正式 /api/jobs 合同"
+    },
+    {
+      "name": "legacy",
+      "description": "旧媒体路径，推荐改走 /api/jobs/..."
+    },
+    {
+      "name": "pages",
+      "description": "Master 托管的 HandVis 播放页（可选）"
+    }
+  ],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "summary": "健康检查",
+        "operationId": "healthz",
+        "tags": [
+          "health"
+        ],
+        "deprecated": false,
+        "description": "Master 存活探测。别名：`GET /health`、`GET /`。",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "description": "正常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "健康检查（别名）",
+        "operationId": "healthAlias",
+        "tags": [
+          "health"
+        ],
+        "deprecated": false,
+        "description": "`/healthz` 别名。",
+        "responses": {
+          "200": {
+            "description": "正常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/": {
+      "get": {
+        "summary": "健康检查（根路径别名）",
+        "operationId": "healthRoot",
+        "tags": [
+          "health"
+        ],
+        "deprecated": false,
+        "description": "`/healthz` 别名。Master 对 `/`、`/health`、`/healthz` 返回同一 JSON。",
+        "responses": {
+          "200": {
+            "description": "正常",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "status"
+                  ],
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "example": "ok"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus 指标（HPA/KEDA）",
+        "operationId": "getMetrics",
+        "tags": [
+          "ops"
+        ],
+        "deprecated": false,
+        "description": "Prometheus text exposition（`Content-Type: text/plain; version=0.0.4`）。含 `sview_queue_depth`、`sview_jobs_processing`、`sview_jobs_inflight`、`sview_workers_alive`、`sview_cache_bytes`。别名互指 `/metrics` 与 `/api/metrics`。",
+        "responses": {
+          "200": {
+            "description": "Prometheus 文本",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "sview_queue_depth 0\n"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/metrics": {
+      "get": {
+        "summary": "Prometheus 指标（别名）",
+        "operationId": "getMetricsAlias",
+        "tags": [
+          "ops"
+        ],
+        "deprecated": false,
+        "description": "Prometheus text exposition（`Content-Type: text/plain; version=0.0.4`）。含 `sview_queue_depth`、`sview_jobs_processing`、`sview_jobs_inflight`、`sview_workers_alive`、`sview_cache_bytes`。别名互指 `/metrics` 与 `/api/metrics`。",
+        "responses": {
+          "200": {
+            "description": "Prometheus 文本",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "sview_queue_depth 0\n"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs": {
+      "post": {
+        "summary": "提交任务（SView mcap 或 HandVis mesh）",
+        "operationId": "submitJob",
+        "tags": [
+          "jobs"
+        ],
+        "deprecated": false,
+        "description": "同一入口两条链路：\n\n**SView（默认）**：`{ \"source\": \"oss://.../*.mcap\" }`。`job_id` = 文件名去掉 `.mcap`。已有完整缓存返回 200，否则入 `player:queue` 返回 202。\n头显 protobuf 与 **Orin**（JPEG 或 H.264 CompressedImage，含 `.../image_raw/compressed` 且 `format=h264`）走同一合同，不要传 `.mp4`。\n\n**HandVis**：`kind` 为 `handvis`/`mesh`/`hand`/`hand_mesh`，或带 `posehand_path`。需要 `posehand_path`，或 `ep_dir` + `item_name`。入 `handvis:jobs:queue`。`task_id` 默认取 posehand 文件名；也可用 `task_id` / `job_id` 覆盖。HandVis 已 ready 且未 `force` 时直接 200，不重复入队。\n\n`force=true` 会先 cancel / purge 再重跑。\n",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/JobRequest"
+              },
+              "examples": {
+                "sview": {
+                  "summary": "SView 头显/Orin mcap",
+                  "value": {
+                    "source": "oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/260706/001U_device/SSIEGO_Cam_001U_20260706_101930_342.mcap"
+                  }
+                },
+                "handvis_ep": {
+                  "summary": "HandVis：EP 目录 + clip",
+                  "value": {
+                    "kind": "handvis",
+                    "ep_dir": "oss://bucket/path/ep1/",
+                    "item_name": "clip_001"
+                  }
+                },
+                "handvis_pair": {
+                  "summary": "HandVis：video + posehand",
+                  "value": {
+                    "kind": "handvis",
+                    "video_path": "oss://bucket/path/clip.mp4",
+                    "posehand_path": "oss://bucket/path/clip.posehand"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "已可播（本地或共享缓存命中）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "已入队",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "SView：本地挂载找不到源文件",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "source": {
+                      "type": "string"
+                    },
+                    "local_path": {
+                      "type": "string"
+                    },
+                    "hint": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/stats": {
+      "get": {
+        "summary": "队列深度与处理中任务",
+        "operationId": "getJobStats",
+        "tags": [
+          "ops",
+          "jobs"
+        ],
+        "deprecated": false,
+        "description": "SView `player:queue` 深度 + 持锁处理中任务。`workers_alive` / `cache_bytes` 在 Redis 可用时附带。",
+        "responses": {
+          "200": {
+            "description": "统计信息",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}": {
+      "get": {
+        "summary": "查任务状态（会 touch）",
+        "operationId": "getJob",
+        "tags": [
+          "jobs"
+        ],
+        "deprecated": false,
+        "description": "查 SView / HandVis 任务进度。成功时会 touch（刷新 `last_access_at` / pin，减缓 GC）。\n\n`playable=true` 约在 `frames_done ≥ 30` 时亮；SView 播放页建议等到约 150 帧再起播。\n\n不存在时 **404 JSON**：`{\"job_id\",\"status\":\"not_found\"}`（不是 `error` 字段）。\n`kind` / `video_url` 在 HandVis **提交**与 **SSE** 中返回；本 GET 当前主要透出进度字段（`_public_job_payload` 白名单含这两项，但本 handler 未从 Redis 拷贝）。\n非法 `job_id` 为 400 text/plain。\n",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "任务状态与进度",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "任务不存在（status=not_found）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/cancel": {
+      "post": {
+        "summary": "取消任务",
+        "operationId": "cancelJob",
+        "tags": [
+          "jobs"
+        ],
+        "deprecated": false,
+        "description": "取消排队或处理中的任务。持锁 Worker 在 chunk 边界停转；会 purge OSS `player-bin/{job_id}/`。`force` 重提也会先 cancel 再入队。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "已取消（status=cancelled）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "任务不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/events": {
+      "get": {
+        "summary": "SSE 进度（推荐替代密轮询）",
+        "operationId": "getJobEvents",
+        "tags": [
+          "jobs"
+        ],
+        "deprecated": false,
+        "description": "Master 读 Redis 推事件，连接期间会 touch。单次最长约 300s，未完成应重连。\n\n`Content-Type: text/event-stream`。事件名：\n- `progress`：字段变化时\n- `done`：`status` 为 ready/failed/cancelled 后结束流\n- `error`：流内错误（如 Redis），`data` 为 `{\"error\": \"...\"}`\n\n`data` 为 JSON，见 `JobEvent`（含 `video_url`，HandVis 视频地址）。\n非法 job_id / Redis 不可用为 400/503 **text/plain**。\n",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE 事件流",
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "type": "string"
+                },
+                "examples": {
+                  "progress": {
+                    "summary": "progress 事件",
+                    "value": "event: progress\ndata: {\"job_id\":\"SSIEGO_Cam_001U_20260706_101930_342\",\"status\":\"processing\",\"frames_done\":90,\"frame_count\":919,\"percent\":9.8,\"playable\":true,\"play_base\":\"https://...\",\"video_url\":null,\"error\":null}\n\n"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/touch": {
+      "post": {
+        "summary": "刷新访问时间（防 GC）",
+        "operationId": "touchJob",
+        "tags": [
+          "jobs"
+        ],
+        "deprecated": false,
+        "description": "显式刷新 `last_access_at` 与 pin。查状态与 SSE 已会 touch；长播/暂停建议按分钟级调用。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "任务状态",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Job"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/signed-media": {
+      "get": {
+        "summary": "批量签发公网 OSS 播放 URL",
+        "operationId": "getSignedMedia",
+        "tags": [
+          "media"
+        ],
+        "deprecated": false,
+        "description": "批量为 `player-bin/{job_id}/segments|frames/*.bin` 签发公网 GET URL，供浏览器直连 OSS。单次最多 32 条。会 touch。Bucket 需 CORS 放行前端 Origin 的 GET/HEAD。`expires_in` 来自 `OSS_SIGN_EXPIRES`（默认 7200）。参数非法为 400 text/plain；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "starts",
+            "in": "query",
+            "required": false,
+            "description": "逗号分隔索引，如 0,30,60（优先于 start/count/step）",
+            "schema": {
+              "type": "string"
+            },
+            "example": "0,30,60"
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "description": "区间起始索引",
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          },
+          {
+            "name": "count",
+            "in": "query",
+            "required": false,
+            "description": "区间数量，默认 8，上限 32",
+            "schema": {
+              "type": "integer",
+              "default": 8,
+              "maximum": 32
+            }
+          },
+          {
+            "name": "step",
+            "in": "query",
+            "required": false,
+            "description": "步长，默认 SEGMENT_FRAMES（约 30）",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "name": "kind",
+            "in": "query",
+            "required": false,
+            "description": "segments（默认）或 frames",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "segments",
+                "frames"
+              ],
+              "default": "segments"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "签名 URL 列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SignedMedia"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "签名落到了内网 endpoint（需设 OSS_PUBLIC_ENDPOINT）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    },
+                    "sample": {
+                      "type": "string",
+                      "description": "去掉 query 的签名 URL 前缀"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "OSS_CACHE 未开启，或签名失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/manifest.json": {
+      "get": {
+        "summary": "播放清单（Master 返回 JSON，不 302）",
+        "operationId": "getManifest",
+        "tags": [
+          "media"
+        ],
+        "deprecated": false,
+        "description": "SView 四路播放清单。Master 直接返回 JSON（本地优先，缺则回源 OSS 后仍以 JSON 响应，避免跨域 302）。\n`status=partial` 仍在写帧；`done` 且 `frames_available === frame_count` 后可停刷。\n`format` 当前 Worker 固定写 `head_cam`（头显与 Orin 相同）。\nOSS 对齐后可能带 `cache_aligned`；从 0 起无连续段时 404 text/plain。\n非法 job_id / 清单不存在为 400/404 **text/plain**。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "播放清单",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Manifest"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "清单不存在，或对齐后无从 0 连续的可播段",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/index.json": {
+      "get": {
+        "summary": "HandVis mesh 目录",
+        "operationId": "getHandvisIndex",
+        "tags": [
+          "handvis",
+          "media"
+        ],
+        "deprecated": false,
+        "description": "HandVis 播放目录（与 segments 同一 job_id）。含 `still_building` / `ready_chunks` / `presets.balanced`。边构建边播时定期刷新。Master 对 JSON 不 302（本地或内网 OSS 回源后仍返回 JSON）。错误为 text/plain；资产未就绪 425。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "mesh catalog",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HandvisIndex"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/faces.u32": {
+      "get": {
+        "summary": "HandVis 面片索引",
+        "operationId": "getHandvisFaces",
+        "tags": [
+          "handvis",
+          "media"
+        ],
+        "deprecated": false,
+        "description": "uint32 面片二进制。未带 proxy=1 且开启媒体重定向时可 302 公网签名 URL。错误为 text/plain。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "proxy",
+            "in": "query",
+            "required": false,
+            "description": "proxy=1 时禁止 302，由 Master 从本地或内网 OSS 读出后流式返回。",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ],
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "application/octet-stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "Location 为公网签名 URL",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/video_projection.bin": {
+      "get": {
+        "summary": "HandVis 视频投影二进制",
+        "operationId": "getHandvisVideoProjection",
+        "tags": [
+          "handvis",
+          "media"
+        ],
+        "deprecated": false,
+        "description": "投影矩阵/内参二进制侧车（magic `VP01`）；内参摘要在 index.json 的 `video_projection`。布局：magic(4)+version(u32 LE)+frame_count(u32 LE)+positions(N×3 f32)+quaternions(N×4 f32)+valid_mask(N u8)。支持 `?proxy=1`。错误为 text/plain。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "proxy",
+            "in": "query",
+            "required": false,
+            "description": "proxy=1 时禁止 302，由 Master 从本地或内网 OSS 读出后流式返回。",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ],
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "application/octet-stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "Location 为公网签名 URL",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/segments/{name}": {
+      "get": {
+        "summary": "拉约 30 帧打包段（推荐）",
+        "operationId": "getSegment",
+        "tags": [
+          "media"
+        ],
+        "deprecated": false,
+        "description": "SView：约 `SEGMENT_FRAMES`（默认 30）帧打包段。整段齐了才返回；任务完成后最后一段可不足 30 帧。\nHandVis：同路径拉 mesh segment。\n\n二进制：`header_len(uint32 LE) + header_json + payload_len(uint32 LE) + payload`；`packet_schema=playertrans.bundle_segment.v1`。\n成功时可含响应头 `X-Sview-Segment-Start` / `X-Sview-Segment-Count`。\n\n未带 `proxy=1` 且 `OSS_MEDIA_REDIRECT=1` 时，本地未命中可 **302** 公网签名 URL（`OSS_MEDIA_LOCAL_FIRST=1` 时优先组本地段）。\n参数/缺失为 400/404 **text/plain**；段未凑满 425 text/plain。\n",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "000000.bin / 000030.bin / …（起始索引为段长倍数）",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{6}\\.bin$"
+            },
+            "example": "000000.bin"
+          },
+          {
+            "name": "proxy",
+            "in": "query",
+            "required": false,
+            "description": "proxy=1 时禁止 302，由 Master 从本地或内网 OSS 读出后流式返回。",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ],
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "application/octet-stream；可含 X-Sview-Segment-Start / X-Sview-Segment-Count",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            },
+            "headers": {
+              "X-Sview-Segment-Start": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "段起始帧索引"
+              },
+              "X-Sview-Segment-Count": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "本段实际帧数"
+              }
+            }
+          },
+          "302": {
+            "description": "未带 proxy=1 且开启媒体重定向时，Location 为公网签名 URL",
+            "headers": {
+              "Location": {
+                "description": "公网签名 URL",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/frames/{name}": {
+      "get": {
+        "summary": "拉单帧 bin（兼容）",
+        "operationId": "getFrame",
+        "tags": [
+          "media"
+        ],
+        "deprecated": false,
+        "description": "四路 H.264 + IMU 单帧。新播放器用 segments。`packet_schema=playertrans.bundle_frame.v1`。\n\n与 segments 不同：**当前只读 Master 本地** `frames/{name}`，不做 OSS 302 / `?proxy=1` 回源。本地没有时处理中 425、否则 404（皆 text/plain）。\n",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "description": "必须为 000000.bin 这种 6 位序号",
+            "schema": {
+              "type": "string",
+              "pattern": "^[0-9]{6}\\.bin$"
+            },
+            "example": "000000.bin"
+          },
+          {
+            "name": "proxy",
+            "in": "query",
+            "required": false,
+            "description": "proxy=1 时禁止 302，由 Master 从本地或内网 OSS 读出后流式返回。",
+            "schema": {
+              "type": "integer",
+              "enum": [
+                0,
+                1
+              ],
+              "default": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "application/octet-stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/{job_id}/manifest.json": {
+      "get": {
+        "summary": "兼容旧路径：播放清单",
+        "operationId": "getManifestLegacy",
+        "tags": [
+          "legacy"
+        ],
+        "deprecated": true,
+        "description": "请改用 `GET /api/jobs/{job_id}/manifest.json`。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "播放清单",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Manifest"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/{job_id}/segments/{name}": {
+      "get": {
+        "summary": "兼容旧路径：拉打包段",
+        "operationId": "getSegmentLegacy",
+        "tags": [
+          "legacy"
+        ],
+        "deprecated": true,
+        "description": "请改用 `GET /api/jobs/{job_id}/segments/{name}`。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "application/octet-stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "302": {
+            "description": "Location 为公网签名 URL"
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/{job_id}/frames/{name}": {
+      "get": {
+        "summary": "兼容旧路径：拉单帧 bin",
+        "operationId": "getFrameLegacy",
+        "tags": [
+          "legacy"
+        ],
+        "deprecated": true,
+        "description": "请改用 `GET /api/jobs/{job_id}/frames/{name}`。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "任务 ID。SView：源文件名去掉 .mcap；HandVis：默认 posehand 文件名（去后缀），或 {ep 目录名}__{item_name}。",
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342"
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "application/octet-stream",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "425": {
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "建议重试秒数，通常为 1"
+              }
+            },
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "segment not ready yet\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/workers": {
+      "get": {
+        "summary": "在线 Worker 心跳",
+        "operationId": "listWorkers",
+        "tags": [
+          "ops"
+        ],
+        "deprecated": false,
+        "description": "近期有心跳的 SView Worker（`sview:worker:{id}`）。",
+        "responses": {
+          "200": {
+            "description": "Worker 列表",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkerList"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/debug/oss": {
+      "get": {
+        "summary": "OSS 签名主机检查（无密钥）",
+        "operationId": "debugOss",
+        "tags": [
+          "ops"
+        ],
+        "deprecated": false,
+        "description": "核对 Master 签名用的公网/内网 endpoint。`sample_sign_is_internal=true` 时浏览器无法直连 302 Location。别名：`GET /debug/oss`。",
+        "responses": {
+          "200": {
+            "description": "OSS 配置摘要（不含密钥）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OssDebug"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/debug/oss": {
+      "get": {
+        "summary": "OSS 签名主机检查（别名）",
+        "operationId": "debugOssAlias",
+        "tags": [
+          "ops"
+        ],
+        "deprecated": true,
+        "description": "请改用 `GET /api/debug/oss`。",
+        "responses": {
+          "200": {
+            "description": "OSS 配置摘要（不含密钥）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OssDebug"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/cache/gc": {
+      "post": {
+        "summary": "手动触发播放缓存 GC",
+        "operationId": "runCacheGc",
+        "tags": [
+          "ops"
+        ],
+        "deprecated": false,
+        "description": "驱逐空闲超时任务，再按 LRU 压到 `CACHE_MAX_BYTES`。生产上 Master 也会周期性自动跑。",
+        "responses": {
+          "200": {
+            "description": "GC 摘要",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CacheGcResult"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "GC 失败",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/test/types": {
+      "get": {
+        "summary": "测试场景列表（压测用）",
+        "operationId": "getTestTypes",
+        "tags": [
+          "test"
+        ],
+        "deprecated": false,
+        "description": "type 1–8 场景定义及服务端默认源（`BENCH_H264_SOURCE` / `BENCH_H265_SOURCE`）。",
+        "responses": {
+          "200": {
+            "description": "type 1-8 场景定义",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestTypes"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "缺少 bench_types 模块",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/test/jobs": {
+      "post": {
+        "summary": "按 type 提交测试任务",
+        "operationId": "submitTestJob",
+        "tags": [
+          "test"
+        ],
+        "deprecated": false,
+        "description": "与正式 `/api/jobs` 独立。`job_id` 形如 `{文件名}__t{type}`。`force` 默认 `true`（重复跑测会清缓存）。队列项是 JSON，Worker 需同版本。",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TestJobRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "命中缓存（仅 force=false）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestJob"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "已入队",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "参数错误",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "源文件本地映射不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Redis 不可用或缺少 bench_types",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/test/jobs/{job_id}": {
+      "get": {
+        "summary": "查测试任务（含首帧/全帧耗时）",
+        "operationId": "getTestJob",
+        "tags": [
+          "test"
+        ],
+        "deprecated": false,
+        "description": "queued/processing/failed 以 Redis 为准，不被磁盘旧 ready 缓存盖掉。完成后含 `first_frame_sec` / `full_sec`。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "description": "形如 {文件名}__t{type}",
+            "schema": {
+              "type": "string"
+            },
+            "example": "SSIEGO_Cam_001U_20260706_101930_342__t3"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "测试任务信息",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TestJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "任务不存在",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/handvis": {
+      "get": {
+        "summary": "HandVis 首页 → 播放页",
+        "operationId": "handvisHomeRedirect",
+        "tags": [
+          "pages"
+        ],
+        "deprecated": false,
+        "description": "Master 无 PG 资产列表，`/handvis`、`/handvis/`、`/handvis/index.html` 一律 302 到 `/handvis/playback`。",
+        "responses": {
+          "302": {
+            "description": "Location: /handvis/playback",
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string",
+                  "example": "/handvis/playback"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "未打包 HandVis 静态资源时走后续 404"
+          }
+        },
+        "security": []
+      }
+    },
+    "/handvis/playback": {
+      "get": {
+        "summary": "HandVis 3D 播放页（Master 托管）",
+        "operationId": "handvisPlaybackPage",
+        "tags": [
+          "pages"
+        ],
+        "deprecated": false,
+        "description": "Master 可选托管 `handvis/app/web/playback.html`。注入 `window.HANDVIS_MASTER=1`（及可选 `HANDVIS_MASTER_BASE`），页面 JS 走本文件的 `/api/jobs` 链路。别名：`/handvis/playback.html`。首页 `/handvis` 会 302 到本路径。",
+        "responses": {
+          "200": {
+            "description": "HTML",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "未打包 HandVis 静态资源"
+          }
+        },
+        "security": []
+      }
+    },
+    "/handvis/playback.html": {
+      "get": {
+        "summary": "HandVis 3D 播放页（.html 别名）",
+        "operationId": "handvisPlaybackPageHtml",
+        "tags": [
+          "pages"
+        ],
+        "deprecated": false,
+        "description": "`/handvis/playback` 别名。",
+        "responses": {
+          "200": {
+            "description": "HTML",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "未打包 HandVis 静态资源"
+          }
+        },
+        "security": []
+      }
+    },
+    "/handvis/assets/{path}": {
+      "get": {
+        "summary": "HandVis 静态资源（assets）",
+        "operationId": "handvisAssets",
+        "tags": [
+          "pages"
+        ],
+        "description": "映射到镜像内 `handvis/app/web/assets/{path}`。长缓存。",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "静态文件",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/static/{path}": {
+      "get": {
+        "summary": "HandVis 静态资源（/static 别名）",
+        "operationId": "handvisStatic",
+        "tags": [
+          "pages"
+        ],
+        "description": "播放页 HTML 使用绝对路径 `/static/...`，Master 映射到同一套 assets。",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "静态文件",
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "example": "invalid job_id\n"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "hint": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "local_path": {
+            "type": "string"
+          },
+          "sample": {
+            "type": "string",
+            "description": "signed-media 内网签名时的 URL 前缀"
+          },
+          "type": {
+            "type": "integer",
+            "description": "压测任务 type（404 源文件时可能带）"
+          }
+        }
+      },
+      "JobRequest": {
+        "type": "object",
+        "description": "SView：必填 `source`（oss://…/*.mcap，头显或 Orin JPEG/H.264）。HandVis：`kind=handvis`（或 mesh/hand/hand_mesh），并提供 `posehand_path` 或 `ep_dir`+`item_name`。",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "省略或非 handvis 走 SView。HandVis 可用 handvis / mesh / hand / hand_mesh。",
+            "enum": [
+              "handvis",
+              "mesh",
+              "hand",
+              "hand_mesh"
+            ]
+          },
+          "source": {
+            "type": "string",
+            "description": "SView：完整 oss://.../*.mcap（不要传 .mp4）。头显 protobuf 与 Orin CompressedImage（JPEG 或 format=h264）均可。",
+            "example": "oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/260706/001U_device/SSIEGO_Cam_001U_20260706_101930_342.mcap"
+          },
+          "force": {
+            "type": "boolean",
+            "default": false,
+            "description": "true 强制重跑（先 cancel/purge）"
+          },
+          "ep_dir": {
+            "type": "string",
+            "description": "HandVis：EP 目录 oss://…/ep1/"
+          },
+          "item_name": {
+            "type": "string",
+            "description": "HandVis：clip / item 名",
+            "example": "clip_001"
+          },
+          "video_path": {
+            "type": "string",
+            "description": "HandVis：视频 oss 路径（可与 posehand_path 成对）"
+          },
+          "posehand_path": {
+            "type": "string",
+            "description": "HandVis：posehand 路径；也可不传 kind，只要带此字段即走 HandVis"
+          },
+          "task_id": {
+            "type": "string",
+            "description": "HandVis 任务 ID 覆盖；默认 posehand 文件名或 {ep}__{item_name}"
+          },
+          "job_id": {
+            "type": "string",
+            "description": "HandVis：task_id 别名"
+          },
+          "force_rebuild": {
+            "type": "boolean",
+            "description": "HandVis：force 别名"
+          },
+          "path": {
+            "type": "string",
+            "description": "SView：source 别名"
+          },
+          "type": {
+            "type": "string",
+            "description": "kind 别名（勿与压测 type 1–8 混淆；压测走 /api/test/jobs）"
+          }
+        }
+      },
+      "JobStatus": {
+        "type": "string",
+        "enum": [
+          "queued",
+          "processing",
+          "ready",
+          "failed",
+          "cancelled",
+          "not_found",
+          "unknown"
+        ]
+      },
+      "Job": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "kind": {
+            "type": "string",
+            "description": "handvis 为 mesh 任务；SView 通常省略。提交 HandVis 与 SSE 会返回。",
+            "nullable": true
+          },
+          "source": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          },
+          "frames_done": {
+            "type": "number",
+            "nullable": true
+          },
+          "frame_count": {
+            "type": "number",
+            "nullable": true
+          },
+          "percent": {
+            "type": "number",
+            "description": "0-100",
+            "nullable": true
+          },
+          "playable": {
+            "type": "boolean",
+            "description": "约 frames_done >= 30 即为 true，SView 起播建议等约 150 帧"
+          },
+          "cached": {
+            "type": "boolean"
+          },
+          "duration_sec": {
+            "type": "number",
+            "nullable": true
+          },
+          "play_base": {
+            "type": "string",
+            "nullable": true,
+            "description": "OSS 播放前缀；私有桶勿匿名 GET"
+          },
+          "video_url": {
+            "type": "string",
+            "nullable": true,
+            "description": "HandVis 视频地址。提交（若 Redis 已有）与 SSE 可能返回；GET 状态当前可能省略。"
+          },
+          "local_path": {
+            "type": "string",
+            "description": "SView 本地映射路径（可选）"
+          },
+          "cache_bytes": {
+            "type": "number",
+            "nullable": true
+          },
+          "updated_at": {
+            "type": "string",
+            "nullable": true
+          },
+          "last_access_at": {
+            "type": "number",
+            "nullable": true,
+            "description": "Unix 秒。touch / GET status / SSE / signed-media 会刷新。`_public_job_payload` 会原样带出（可能是字符串）。"
+          },
+          "cache_status": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "description": "公开任务字段（`_public_job_payload` 白名单）。空字符串会被丢掉。`kind`/`video_url`：HandVis 提交响应与 SSE 会带；GET /api/jobs/{id} 当前可能省略。"
+      },
+      "Stats": {
+        "type": "object",
+        "properties": {
+          "queued": {
+            "type": "number",
+            "description": "Redis player:queue 长度"
+          },
+          "processing": {
+            "type": "number",
+            "description": "持锁处理中的任务数"
+          },
+          "inflight": {
+            "type": "number",
+            "description": "queued + processing"
+          },
+          "workers_alive": {
+            "type": "number",
+            "description": "近期有心跳的 Worker"
+          },
+          "cache_bytes": {
+            "type": "number",
+            "description": "播放缓存计量"
+          },
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProcessingJob"
+            }
+          }
+        }
+      },
+      "ProcessingJob": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "owner_pod": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "playable": {
+            "type": "boolean"
+          },
+          "frames_done": {
+            "type": "number"
+          }
+        }
+      },
+      "WorkerList": {
+        "type": "object",
+        "properties": {
+          "count": {
+            "type": "integer"
+          },
+          "workers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkerHeartbeat"
+            }
+          }
+        }
+      },
+      "WorkerHeartbeat": {
+        "type": "object",
+        "properties": {
+          "worker_id": {
+            "type": "string"
+          },
+          "pod_ip": {
+            "type": "string"
+          },
+          "processing": {
+            "type": "integer"
+          },
+          "max_inflight": {
+            "type": "integer"
+          },
+          "jobs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "updated_at": {
+            "type": "integer",
+            "description": "Unix 秒"
+          },
+          "role": {
+            "type": "string",
+            "description": "Worker `SVIEW_ROLE`，心跳 extra"
+          },
+          "oss_cache": {
+            "type": "integer",
+            "description": "1 表示 Worker 开了 OSS_CACHE"
+          }
+        }
+      },
+      "OssDebug": {
+        "type": "object",
+        "properties": {
+          "oss_endpoint": {
+            "type": "string",
+            "description": "Pod 内网上传/回源"
+          },
+          "oss_public_endpoint": {
+            "type": "string",
+            "description": "浏览器签名 / play_base"
+          },
+          "oss_bucket": {
+            "type": "string"
+          },
+          "oss_cache": {
+            "type": "boolean"
+          },
+          "oss_media_redirect": {
+            "type": "string"
+          },
+          "oss_media_local_first": {
+            "type": "string"
+          },
+          "sample_sign_host": {
+            "type": "string"
+          },
+          "sample_sign_is_internal": {
+            "type": "boolean"
+          },
+          "sign_error": {
+            "type": "string",
+            "nullable": true
+          },
+          "hint": {
+            "type": "string"
+          }
+        }
+      },
+      "CacheGcResult": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "removed_idle": {
+            "type": "integer"
+          },
+          "removed_lru": {
+            "type": "integer"
+          },
+          "freed_bytes": {
+            "type": "integer"
+          },
+          "total_bytes": {
+            "type": "integer"
+          }
+        }
+      },
+      "SignedMedia": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "segments",
+              "frames"
+            ]
+          },
+          "expires_in": {
+            "type": "number"
+          },
+          "items": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SignedMediaItem"
+            }
+          }
+        }
+      },
+      "SignedMediaItem": {
+        "type": "object",
+        "properties": {
+          "start": {
+            "type": "number"
+          },
+          "name": {
+            "type": "string",
+            "example": "000000.bin"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
+      "Manifest": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "description": "Worker 当前固定 `head_cam`（头显与 Orin 共用）",
+            "example": "head_cam"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "partial",
+              "done"
+            ],
+            "description": "partial 仍在写帧；done 全部完成"
+          },
+          "play_base": {
+            "type": "string",
+            "nullable": true
+          },
+          "bundle": {
+            "type": "object",
+            "properties": {
+              "frame_count": {
+                "type": "number"
+              },
+              "frames_available": {
+                "type": "number"
+              },
+              "gop_size": {
+                "type": "number",
+                "description": "约 30"
+              },
+              "key_frame_indices": {
+                "type": "array",
+                "items": {
+                  "type": "number"
+                }
+              },
+              "timeline": {
+                "type": "object",
+                "properties": {
+                  "start_ns": {
+                    "type": "number"
+                  },
+                  "end_ns": {
+                    "type": "number"
+                  },
+                  "duration_sec": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          },
+          "streams": {
+            "type": "object",
+            "description": "四路相机参数",
+            "properties": {
+              "camera_rr": {
+                "$ref": "#/components/schemas/StreamCamera"
+              },
+              "camera_fr": {
+                "$ref": "#/components/schemas/StreamCamera"
+              },
+              "camera_rl": {
+                "$ref": "#/components/schemas/StreamCamera"
+              },
+              "camera_fl": {
+                "$ref": "#/components/schemas/StreamCamera"
+              }
+            }
+          },
+          "cache_aligned": {
+            "type": "boolean",
+            "description": "Master 按 OSS 连续 segment 夹紧 frames_available 后为 true；从 0 无连续段时接口 404"
+          }
+        }
+      },
+      "StreamCamera": {
+        "type": "object",
+        "properties": {
+          "position": {
+            "type": "number"
+          },
+          "width": {
+            "type": "number"
+          },
+          "height": {
+            "type": "number"
+          },
+          "fps": {
+            "type": "number"
+          }
+        }
+      },
+      "HandvisIndex": {
+        "type": "object",
+        "description": "HandVis Worker 写出的 mesh catalog（version 7）",
+        "properties": {
+          "version": {
+            "type": "integer",
+            "example": 7
+          },
+          "default_quality": {
+            "type": "string",
+            "example": "balanced"
+          },
+          "faces_bin": {
+            "type": "string",
+            "example": "faces.u32"
+          },
+          "face_count": {
+            "type": "integer"
+          },
+          "video_projection": {
+            "$ref": "#/components/schemas/VideoProjection"
+          },
+          "still_building": {
+            "type": "boolean"
+          },
+          "ready_chunks": {
+            "type": "integer"
+          },
+          "total_chunks": {
+            "type": "integer"
+          },
+          "presets": {
+            "type": "object",
+            "properties": {
+              "balanced": {
+                "$ref": "#/components/schemas/HandvisPreset"
+              }
+            }
+          }
+        }
+      },
+      "HandvisPreset": {
+        "type": "object",
+        "properties": {
+          "fps": {
+            "type": "number"
+          },
+          "total_duration": {
+            "type": "number"
+          },
+          "chunk_duration": {
+            "type": "number"
+          },
+          "stride": {
+            "type": "integer"
+          },
+          "frame_count": {
+            "type": "integer"
+          },
+          "vertex_count": {
+            "type": "integer"
+          },
+          "still_building": {
+            "type": "boolean"
+          },
+          "ready_chunks": {
+            "type": "integer"
+          },
+          "total_chunks": {
+            "type": "integer"
+          },
+          "chunks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/HandvisChunk"
+            }
+          },
+          "invalid_mask": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "invalid_left_mask": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          },
+          "invalid_right_mask": {
+            "type": "array",
+            "items": {
+              "type": "integer"
+            }
+          }
+        }
+      },
+      "TestJobRequest": {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8,
+            "description": "type 1-8；也可用 bench_type"
+          },
+          "bench_type": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 8
+          },
+          "source": {
+            "type": "string",
+            "description": "oss:// 或挂载路径；不传则用 BENCH_H264_SOURCE / BENCH_H265_SOURCE"
+          },
+          "path": {
+            "type": "string",
+            "description": "source 别名"
+          },
+          "force": {
+            "type": "boolean",
+            "default": true,
+            "description": "默认 true。false 且已 ready 则直接 200 返回缓存"
+          }
+        }
+      },
+      "TestTypes": {
+        "type": "object",
+        "properties": {
+          "types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TestTypeItem"
+            }
+          },
+          "defaults": {
+            "type": "object",
+            "properties": {
+              "BENCH_H264_SOURCE": {
+                "type": "string",
+                "nullable": true
+              },
+              "BENCH_H265_SOURCE": {
+                "type": "string",
+                "nullable": true
+              }
+            }
+          }
+        }
+      },
+      "TestTypeItem": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source_kind": {
+            "type": "string",
+            "enum": [
+              "h264",
+              "h265"
+            ]
+          },
+          "transcode_size": {
+            "type": "integer"
+          },
+          "transcode_crf": {
+            "type": "integer"
+          },
+          "force_reencode": {
+            "type": "integer"
+          },
+          "notes": {
+            "type": "string"
+          }
+        }
+      },
+      "TestJob": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Job"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "type": "integer"
+              },
+              "type_name": {
+                "type": "string"
+              },
+              "bench_type": {
+                "type": "integer"
+              },
+              "bench_name": {
+                "type": "string"
+              },
+              "transcode": {
+                "type": "object",
+                "properties": {
+                  "size": {
+                    "type": "integer",
+                    "nullable": true
+                  },
+                  "crf": {
+                    "type": "integer",
+                    "nullable": true
+                  },
+                  "force_reencode": {
+                    "type": "integer",
+                    "nullable": true
+                  }
+                }
+              },
+              "transcode_size": {
+                "type": "integer"
+              },
+              "transcode_crf": {
+                "type": "integer"
+              },
+              "force_reencode": {
+                "type": "integer"
+              },
+              "first_frame_sec": {
+                "type": "number",
+                "nullable": true
+              },
+              "full_sec": {
+                "type": "number",
+                "nullable": true
+              },
+              "started_at": {
+                "type": "number",
+                "nullable": true
+              },
+              "first_frame_at": {
+                "type": "number",
+                "nullable": true
+              },
+              "finished_at": {
+                "type": "number",
+                "nullable": true
+              },
+              "notes": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "JobEvent": {
+        "type": "object",
+        "description": "SSE `progress`/`done` 的 data JSON",
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/JobStatus"
+          },
+          "frames_done": {
+            "type": "integer"
+          },
+          "frame_count": {
+            "type": "integer",
+            "nullable": true
+          },
+          "percent": {
+            "type": "number",
+            "nullable": true
+          },
+          "playable": {
+            "type": "boolean"
+          },
+          "play_base": {
+            "type": "string",
+            "nullable": true
+          },
+          "video_url": {
+            "type": "string",
+            "nullable": true
+          },
+          "error": {
+            "type": "string",
+            "nullable": true
+          }
+        }
+      },
+      "VideoProjection": {
+        "type": "object",
+        "description": "index.json 内联的投影内参；大数组在 video_projection.bin",
+        "properties": {
+          "frame_count": {
+            "type": "integer"
+          },
+          "stride": {
+            "type": "integer"
+          },
+          "img_focal": {
+            "type": "number"
+          },
+          "img_center": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            },
+            "minItems": 2,
+            "maxItems": 2
+          },
+          "scale": {
+            "type": "number"
+          },
+          "base_width": {
+            "type": "number"
+          },
+          "base_height": {
+            "type": "number"
+          },
+          "binary_url": {
+            "type": "string",
+            "example": "video_projection.bin"
+          },
+          "binary_bytes": {
+            "type": "integer"
+          }
+        }
+      },
+      "HandvisChunk": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string",
+            "example": "000000"
+          },
+          "start_time": {
+            "type": "number"
+          },
+          "end_time": {
+            "type": "number"
+          },
+          "frame_start": {
+            "type": "integer"
+          },
+          "frame_count": {
+            "type": "integer"
+          },
+          "bin": {
+            "type": "string",
+            "description": "相对 segments/ 的文件名",
+            "example": "000000.bin"
+          },
+          "ready": {
+            "type": "boolean"
+          }
+        }
+      },
+      "SegmentHeader": {
+        "type": "object",
+        "description": "打包段 header_json（二进制前缀之后）",
+        "properties": {
+          "packet_schema": {
+            "type": "string",
+            "example": "playertrans.bundle_segment.v1"
+          },
+          "start_index": {
+            "type": "integer"
+          },
+          "count": {
+            "type": "integer"
+          },
+          "segment_frames": {
+            "type": "integer",
+            "description": "标称段长，默认 30"
+          }
+        }
+      },
+      "FrameHeader": {
+        "type": "object",
+        "description": "单帧 bundle header_json",
+        "properties": {
+          "packet_schema": {
+            "type": "string",
+            "example": "playertrans.bundle_frame.v1"
+          },
+          "frame_index": {
+            "type": "integer"
+          },
+          "timestamp_ns": {
+            "type": "number"
+          },
+          "time_window_ns": {
+            "type": "array",
+            "items": {
+              "type": "number"
+            }
+          },
+          "key_frame": {
+            "type": "boolean"
+          },
+          "streams": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "imu": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "events": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "responses": {
+      "PlainError": {
+        "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string",
+              "example": "invalid job_id\n"
+            }
+          }
+        }
+      },
+      "RetryLater": {
+        "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+        "headers": {
+          "Retry-After": {
+            "schema": {
+              "type": "string"
+            },
+            "description": "建议重试秒数，通常为 1"
+          }
+        },
+        "content": {
+          "text/plain": {
+            "schema": {
+              "type": "string",
+              "example": "segment not ready yet\n"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {}
+  },
+  "security": []
+}

@@ -31,7 +31,7 @@
              - name: HEAD_CAM_MOUNT
                value: "/head-data"
              - name: ORIN_MOUNT
-               value: "/orin-data"
+               value: "/teleoperation"
              - name: LOCAL_MOUNT_PATH
                value: "/head-data"
              - name: LOCAL_OUTPUT_DIR
@@ -83,7 +83,7 @@
                mountPath: /head-data
                readOnly: true
              - name: orin-data
-               mountPath: /orin-data
+               mountPath: /teleoperation
                readOnly: true
              - name: cache
                mountPath: /cache

@@ -41,8 +41,10 @@ def ensure_cluster_identity(*, fatal: bool = True) -> None:
 
 def job_id_from_source(source: str) -> str:
     name = source.strip().replace("\\", "/").rstrip("/").split("/")[-1]
-    if name.lower().endswith(".mcap"):
-        name = name[:-5]
+    low = name.lower()
+    for ext in (".mcap", ".hdf5", ".h5", ".hdf"):
+        if low.endswith(ext):
+            return name[: -len(ext)]
     return name
 
 

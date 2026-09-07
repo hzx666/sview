@@ -353,9 +353,8 @@ export class SviewApi {
   }
 
   /**
-   * Wait until playable via SSE (default). Polling only if allowPollFallback=true.
-   * Locked to SSE for diagnosing EventSource / proxy issues — set allowPollFallback
-   * to re-enable the old backoff poll path.
+   * Wait until playable via SSE, then poll if SSE cannot connect (ACS Ingress
+   * often buffers EventSource until the stream ends).
    */
   async waitUntilPlayable(
     jobId: string,
@@ -365,14 +364,14 @@ export class SviewApi {
       minFrames?: number;
       onTick?: (s: JobStatus) => void;
       preferSse?: boolean;
-      /** Default false: SSE failure surfaces; no silent poll fallback. */
+      /** Default true: EventSource 失败后改轮询 GET /api/jobs/{id}。 */
       allowPollFallback?: boolean;
     } = {},
   ): Promise<JobStatus> {
     const timeoutMs = opts.timeoutMs ?? 15 * 60 * 1000;
     const minFrames = opts.minFrames ?? 30;
     const preferSse = opts.preferSse !== false;
-    const allowPollFallback = opts.allowPollFallback === true;
+    const allowPollFallback = opts.allowPollFallback !== false;
 
     const isDone = (s: JobStatus) => {
       if (s.status === "failed") throw new Error(s.error || "job failed");

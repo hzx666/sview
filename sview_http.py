@@ -1201,12 +1201,23 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
-        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Cache-Control", "no-cache, no-transform")
         self.send_header("Connection", "keep-alive")
+        self.send_header("X-Accel-Buffering", "no")
         self._cors()
         self.end_headers()
+        # Comment frame so proxies flush headers immediately (Ingress often buffers
+        # until the first body bytes; EventSource then dies with readyState=2).
+        try:
+            self.wfile.write(b": connected\n\n")
+            self.wfile.flush()
+        except Exception as exc:
+            if _is_client_disconnect(exc):
+                return
+            raise
 
         last_payload = ""
+        last_ping = time.time()
         deadline = time.time() + 300
         try:
             while time.time() < deadline:
@@ -1245,9 +1256,14 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                 payload = json.dumps(event, ensure_ascii=False)
                 if payload != last_payload:
                     last_payload = payload
+                    last_ping = time.time()
                     chunk = f"event: progress\ndata: {payload}\n\n"
                     self.wfile.write(chunk.encode("utf-8"))
                     self.wfile.flush()
+                elif time.time() - last_ping >= 15:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    last_ping = time.time()
                 if status in ("ready", "failed", "cancelled"):
                     done_ev = f"event: done\ndata: {payload}\n\n"
                     self.wfile.write(done_ev.encode("utf-8"))

@@ -7,10 +7,18 @@ Orin teleop MCAP: ROS2 image/video streams → H.264 Annex-B.
     /left_camera/.../color/image_raw/compressed   CompressedImage (jpeg)
     ...                                            → libx264 编码
 
+    同一套 compressed topic，format=h264（Annex-B）时走 H.264 重编码，
+    不要当 JPEG 解析。
+
     /streamer/realsense_right/h264               CompressedImage (h264 Annex-B)
     /streamer/realsense_torso/h264
     /streamer/realsense_head/h264
     /streamer/realsense_left/h264                → 复用头显 annexb 管线重编码归一化
+
+    /camera/f_l/h264
+    /camera/f_r/h264
+    /camera/left_wrist/h264
+    /camera/right_wrist/h264                     → 遥操四路，映射到 FL/FR/RL/RR
 
 Maps the four cameras onto SView channels FR/FL/RR/RL and returns data ready
 for AU splitting + bundle publish.
@@ -39,6 +47,11 @@ DEFAULT_CAMERA_MAP = {
     "realsense_right": "FR",
     "realsense_head": "RR",
     "realsense_torso": "RL",
+    # 遥操四路：/camera/{f_l,f_r,left_wrist,right_wrist}/h264
+    "f_l": "FL",
+    "f_r": "FR",
+    "left_wrist": "RL",
+    "right_wrist": "RR",
 }
 
 _COMPRESSED_TOPIC_RE = re.compile(
@@ -46,7 +59,80 @@ _COMPRESSED_TOPIC_RE = re.compile(
     re.IGNORECASE,
 )
 # /streamer/realsense_right/h264 这种：相机名是 h264 前一段。
-_H264_TOPIC_RE = re.compile(r"^(?:/[a-z0-9_]+)+/h264$", re.IGNORECASE)
+# 也兼容 /xxx/h264/compressed。
+_H264_TOPIC_RE = re.compile(
+    r"^(?:/[a-z0-9_]+)+/h264(?:/compressed)?$",
+    re.IGNORECASE,
+)
+_HEADCAM_VIDEO_RE = re.compile(r"^/camera/(?P<ch>RR|FR|RL|FL)/video/?$", re.IGNORECASE)
+_HEADCAM_META_RE = re.compile(r"^/camera/(?P<ch>RR|FR|RL|FL)/meta/?$", re.IGNORECASE)
+_TELEOP_H264_RE = re.compile(
+    r"^/camera/(f_l|f_r|left_wrist|right_wrist)/h264(?:/compressed)?/?$",
+    re.IGNORECASE,
+)
+
+
+def _topic_has_h264_segment(topic: str) -> bool:
+    return any(p.lower() == "h264" for p in (topic or "").split("/"))
+
+
+def _looks_like_headcam(topics: List[str], names: List[str]) -> bool:
+    """SSIEGO / head-cam protobuf bags must not go through the Orin ROS2 reader."""
+    if any(_TELEOP_H264_RE.match((t or "").strip()) for t in topics):
+        return False
+    for n in names:
+        low = (n or "").strip().lower()
+        if low.startswith("headcam.") or "headcam_record.proto" in low:
+            return True
+    for t in topics:
+        ts = (t or "").strip()
+        if ts == "/imu/sample" or _HEADCAM_VIDEO_RE.match(ts) or _HEADCAM_META_RE.match(ts):
+            return True
+    return False
+
+
+def _looks_like_orin_topic(topic: str) -> bool:
+    t = (topic or "").strip()
+    if not t:
+        return False
+    if _H264_TOPIC_RE.match(t) or _topic_has_h264_segment(t):
+        return True
+    if "image_raw/compressed" in t:
+        return True
+    return bool(_COMPRESSED_TOPIC_RE.match(t))
+
+
+def _iter_ros2_messages_tolerant(path: str, topic_ok=None):
+    """Yield ROS2 messages; skip protobuf/other encodings instead of aborting the bag.
+
+    ``topic_ok``: optional ``topic -> bool``. When set, CDR decode is skipped for
+    other topics (teleop bags spend most of the scan on joints/IMU/TF otherwise).
+    """
+    from mcap.reader import make_reader
+    from mcap_ros2.decoder import DecoderFactory
+    from mcap_ros2.reader import McapROS2Message
+
+    factory = DecoderFactory()
+    with open(path, "rb") as fh:
+        reader = make_reader(fh)
+        for schema, channel, message in reader.iter_messages():
+            topic = getattr(channel, "topic", "") or ""
+            if topic_ok is not None and not topic_ok(topic):
+                continue
+            enc = getattr(channel, "message_encoding", "") or ""
+            decoder = factory.decoder_for(enc, schema)
+            if decoder is None or schema is None or channel is None:
+                continue
+            try:
+                ros_msg = decoder(message.data)
+            except Exception:
+                continue
+            yield McapROS2Message(
+                ros_msg=ros_msg,
+                message=message,
+                channel=channel,
+                schema=schema,
+            )
 
 
 def _parse_camera_map(env_val: Optional[str] = None) -> Dict[str, str]:
@@ -67,34 +153,56 @@ def _parse_camera_map(env_val: Optional[str] = None) -> Dict[str, str]:
 
 
 def orin_stream_kind(path: str | Path) -> Optional[str]:
-    """识别 Orin 录制的流类型：'h264'（/streamer/*/h264）| 'jpeg' | None。"""
+    """识别 Orin 录制的流类型：'h264' | 'jpeg' | None。
+
+    不能只看 schema=CompressedImage：H.264 袋同样是 CompressedImage，只是
+    ``format=h264``（topic 可能仍是 ``.../image_raw/compressed``）。
+    """
     from mcap.reader import make_reader
 
     p = Path(path)
     if not p.is_file():
         return None
+
+    topics: List[str] = []
+    names: List[str] = []
     try:
         with open(p, "rb") as f:
             summary = make_reader(f).get_summary()
+        if summary:
+            if summary.channels:
+                topics = [ch.topic or "" for ch in summary.channels.values()]
+            if summary.schemas:
+                names = [s.name for s in summary.schemas.values()]
     except Exception:
+        log.debug("orin_stream_kind: summary read failed for %s", p, exc_info=True)
+
+    if _looks_like_headcam(topics, names):
         return None
-    if not summary:
-        return None
-    if summary.channels:
-        topics = [ch.topic or "" for ch in summary.channels.values()]
-        if any(_H264_TOPIC_RE.match(t) for t in topics):
+
+    if any(_H264_TOPIC_RE.match(t.strip()) or _topic_has_h264_segment(t) for t in topics):
+        return "h264"
+
+    looks_compressed = any(_looks_like_orin_topic(t) for t in topics) or any(
+        "CompressedImage" in n or "CompressedVideo" in n for n in names
+    )
+
+    # CompressedImage 可能是 JPEG 或 H.264；summary 无 channel 时也要看 payload。
+    # 不要在 peek 失败时默认 jpeg：头显 protobuf 包会被官方 ROS2 reader 打挂。
+    if looks_compressed or not topics:
+        peeked = _peek_orin_payload_kind(p)
+        if peeked:
+            return peeked
+        if "_h264_" in p.name.lower():
             return "h264"
-        if any("image_raw/compressed" in t for t in topics):
+        if looks_compressed:
             return "jpeg"
-    names = [s.name for s in (summary.schemas or {}).values()]
-    if any("CompressedImage" in n for n in names):
-        return "jpeg"
     return None
 
 
 def is_orin_images_mcap(path: str | Path) -> bool:
-    """True if MCAP carries ROS2 CompressedImage (not protobuf head-cam video)."""
-    return orin_stream_kind(path) == "jpeg"
+    """True if MCAP carries ROS2 CompressedImage (JPEG or H.264, not protobuf)."""
+    return orin_stream_kind(path) in ("jpeg", "h264")
 
 
 def _jpeg_size(data: bytes) -> Tuple[int, int]:
@@ -123,20 +231,43 @@ def _jpeg_size(data: bytes) -> Tuple[int, int]:
 
 
 def _topic_to_channel(topic: str, cam_map: Dict[str, str]) -> Optional[str]:
-    if _H264_TOPIC_RE.match(topic.strip()):
+    t = (topic or "").strip()
+    if _H264_TOPIC_RE.match(t) or _topic_has_h264_segment(t):
         # /streamer/realsense_right/h264 → cam = realsense_right
-        parts = [p for p in topic.strip().split("/") if p]
-        cam = parts[-2] if len(parts) >= 2 else ""
-        return cam_map.get(cam)
-    m = _COMPRESSED_TOPIC_RE.match(topic)
+        # /camera/f_l/h264 → cam = f_l
+        # /streamer/realsense_right/h264/compressed → 同样
+        parts = [p for p in t.split("/") if p]
+        if parts and parts[-1].lower() == "compressed":
+            parts = parts[:-1]
+        if parts and parts[-1].lower() == "h264":
+            parts = parts[:-1]
+        cam = parts[-1] if parts else ""
+        return cam_map.get(cam) or cam_map.get(cam.lower())
+    m = _COMPRESSED_TOPIC_RE.match(t)
     if not m:
-        parts = topic.strip("/").split("/")
+        parts = [p for p in t.strip("/").split("/") if p]
         if not parts:
             return None
+        if len(parts) >= 2 and parts[0].lower() == "camera":
+            cam = parts[1]
+            mapped = cam_map.get(cam) or cam_map.get(cam.lower())
+            if mapped:
+                return mapped
+            up = cam.upper()
+            if up in ("FR", "FL", "RR", "RL"):
+                return up
         cam = parts[0]
     else:
         cam = m.group("cam")
-    return cam_map.get(cam)
+    return cam_map.get(cam) or cam_map.get(cam.lower())
+
+
+def sview_channel_for_topic(
+    topic: str,
+    cam_map: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
+    """Map a camera topic onto FR/FL/RR/RL, or None if unknown."""
+    return _topic_to_channel(topic, cam_map or _parse_camera_map())
 
 
 def parse_orin_jpeg_streams(
@@ -151,17 +282,20 @@ def parse_orin_jpeg_streams(
 
     Keys are SView channel names (FR/FL/RR/RL).
     """
-    from mcap_ros2.reader import read_ros2_messages
-
     cam_map = cam_map or _parse_camera_map()
     frames: Dict[str, List[bytes]] = defaultdict(list)
     timestamps: Dict[str, List[int]] = defaultdict(list)
     metas: Dict[str, dict] = {}
+    skipped_h264 = 0
+    topics_seen: List[str] = []
 
-    for msg in read_ros2_messages(str(path)):
+    for msg in _iter_ros2_messages_tolerant(str(path), topic_ok=_looks_like_orin_topic):
         if msg.schema is None or "CompressedImage" not in msg.schema.name:
             continue
-        ch = _topic_to_channel(msg.channel.topic, cam_map)
+        topic = msg.channel.topic if msg.channel else ""
+        if topic and topic not in topics_seen:
+            topics_seen.append(topic)
+        ch = _topic_to_channel(topic, cam_map)
         if not ch:
             continue
         ros = msg.ros_msg
@@ -169,10 +303,14 @@ def parse_orin_jpeg_streams(
         data = bytes(ros.data)
         if not data:
             continue
-        if "jpeg" not in fmt and "jpg" not in fmt and data[:2] != b"\xff\xd8":
+        kind = _compressed_payload_kind(fmt, data)
+        if kind == "h264":
+            skipped_h264 += 1
+            continue
+        if kind != "jpeg":
             log.warning(
                 "Skip non-JPEG CompressedImage on %s format=%r",
-                msg.channel.topic,
+                topic,
                 fmt,
             )
             continue
@@ -186,7 +324,7 @@ def parse_orin_jpeg_streams(
                 "fps": 30,
                 "position": ch,
                 "codec": "jpeg",
-                "source_topic": msg.channel.topic,
+                "source_topic": topic,
             }
 
     for ch, ts in timestamps.items():
@@ -199,9 +337,17 @@ def parse_orin_jpeg_streams(
                 metas[ch]["fps"] = int(round(fps))
 
     if not frames:
+        hint = ""
+        if skipped_h264:
+            hint = (
+                f"; saw {skipped_h264} H.264 CompressedImage frame(s) on "
+                f"topics={topics_seen} — this bag should be parsed as Orin H.264"
+            )
+        elif topics_seen:
+            hint = f"; CompressedImage topics={topics_seen}"
         raise ValueError(
             f"No Orin CompressedImage JPEG streams found in {path} "
-            f"(camera map={cam_map})"
+            f"(camera map={cam_map}){hint}"
         )
     for ch in sorted(frames.keys()):
         log.info(
@@ -234,6 +380,53 @@ def _looks_like_annexb_h264(data: bytes) -> bool:
         return False
     nal = data[i + sc] & 0x1F
     return nal in (1, 5, 6, 7, 8, 9)
+
+
+def _compressed_payload_kind(fmt: str, data: bytes) -> Optional[str]:
+    """Classify a CompressedImage payload as 'jpeg' | 'h264' | None."""
+    f = (fmt or "").lower()
+    if "h264" in f or "avc" in f or "annexb" in f:
+        return "h264"
+    if "jpeg" in f or "jpg" in f or "mjpeg" in f:
+        return "jpeg"
+    if data[:2] == b"\xff\xd8":
+        return "jpeg"
+    if _looks_like_annexb_h264(data):
+        return "h264"
+    return None
+
+
+def _peek_orin_payload_kind(
+    path: Path, *, max_msgs: int = 200, max_image: int = 8
+) -> Optional[str]:
+    """Scan the start of the bag for CompressedImage format=jpeg vs h264."""
+    n_msg = 0
+    n_img = 0
+    try:
+        for msg in _iter_ros2_messages_tolerant(
+            str(path), topic_ok=_looks_like_orin_topic
+        ):
+            n_msg += 1
+            topic = msg.channel.topic if msg.channel else ""
+            if _H264_TOPIC_RE.match(topic.strip()) or _topic_has_h264_segment(topic):
+                return "h264"
+            schema = msg.schema.name if msg.schema else ""
+            if "CompressedImage" not in schema and "CompressedVideo" not in schema:
+                if n_msg >= max_msgs:
+                    break
+                continue
+            n_img += 1
+            ros = msg.ros_msg
+            fmt = getattr(ros, "format", "") or ""
+            data = bytes(getattr(ros, "data", b"") or b"")
+            kind = _compressed_payload_kind(fmt, data)
+            if kind:
+                return kind
+            if n_img >= max_image or n_msg >= max_msgs:
+                break
+    except Exception:
+        log.debug("peek orin payload failed for %s", path, exc_info=True)
+    return None
 
 
 def _iter_h264_nals(data: bytes):
@@ -318,10 +511,13 @@ def _to_annexb_h264(data: bytes) -> Optional[bytes]:
     avcc = _avcc_to_annexb(data)
     if avcc:
         return avcc
-    # Raw NAL without start code (forbidden_zero_bit must be 0).
     if (data[0] & 0x80) == 0 and (data[0] & 0x1F) in (1, 5, 6, 7, 8, 9):
         return b"\x00\x00\x00\x01" + data
     return None
+
+
+def _coerce_annexb_h264(data: bytes) -> Optional[bytes]:
+    return _to_annexb_h264(data)
 
 
 def _prepare_h264_decode_start(
@@ -503,6 +699,107 @@ def _estimate_fps_into_metas(timestamps: Dict[str, List[int]], metas: Dict[str, 
                 metas[ch]["fps"] = int(round(fps))
 
 
+def orin_h264_channels_from_summary(path: str | Path) -> List[str]:
+    """SView channels present as H.264 topics in the MCAP summary (footer seek)."""
+    from mcap.reader import make_reader
+
+    p = Path(path)
+    if not p.is_file():
+        return []
+    try:
+        with open(p, "rb") as fh:
+            summary = make_reader(fh).get_summary()
+    except Exception:
+        return []
+    if not summary or not summary.channels:
+        return []
+    cam_map = _parse_camera_map()
+    out: List[str] = []
+    for channel in summary.channels.values():
+        topic = (getattr(channel, "topic", None) or "").strip()
+        if not topic:
+            continue
+        if not (
+            _H264_TOPIC_RE.match(topic)
+            or _topic_has_h264_segment(topic)
+            or _TELEOP_H264_RE.match(topic)
+        ):
+            continue
+        ch = _topic_to_channel(topic, cam_map)
+        if ch and ch not in out:
+            out.append(ch)
+    return out
+
+
+def iter_orin_h264_annexb(
+    path: str | Path,
+    cam_map: Optional[Dict[str, str]] = None,
+):
+    """Yield ``(channel, annexb, timestamp_ns, camera_meta)`` one frame at a time.
+
+    Does not load the whole bag first — callers can encode the first GOP while
+    the rest of the file is still being read.
+    """
+    cam_map = cam_map or _parse_camera_map()
+    topics_seen: List[str] = []
+    unmapped: List[str] = []
+    yielded = 0
+    sized: set = set()
+    for msg in _iter_ros2_messages_tolerant(str(path), topic_ok=_looks_like_orin_topic):
+        topic = msg.channel.topic if msg.channel else ""
+        schema = msg.schema.name if msg.schema else ""
+        is_h264_topic = bool(
+            _H264_TOPIC_RE.match(topic.strip()) or _topic_has_h264_segment(topic)
+        )
+        is_ci = "CompressedImage" in schema or "CompressedVideo" in schema
+        if not is_h264_topic and not is_ci:
+            continue
+        if topic and topic not in topics_seen:
+            topics_seen.append(topic)
+        ros = msg.ros_msg
+        fmt = getattr(ros, "format", "") or ""
+        data = bytes(getattr(ros, "data", b"") or b"")
+        if not data:
+            continue
+        kind = _compressed_payload_kind(fmt, data)
+        if kind == "jpeg":
+            continue
+        if not (is_h264_topic or kind == "h264"):
+            continue
+        annexb = _coerce_annexb_h264(data)
+        if not annexb:
+            log.warning("Skip non-Annex-B/AVCC H.264 payload on %s format=%r", topic, fmt)
+            continue
+        data = annexb
+        ch = _topic_to_channel(topic, cam_map)
+        if not ch:
+            if topic not in unmapped:
+                unmapped.append(topic)
+            continue
+        w = h = 0
+        if ch not in sized:
+            w, h = _h264_sps_size(data)
+            if w > 0 and h > 0:
+                sized.add(ch)
+            else:
+                w, h = 1280, 720
+        meta = {
+            "width": w,
+            "height": h,
+            "fps": 30,
+            "position": ch,
+            "codec": "h264",
+            "source_topic": topic,
+        }
+        yielded += 1
+        yield ch, data, int(msg.log_time_ns), meta
+    if yielded <= 0:
+        raise ValueError(
+            f"No Orin H.264 streams found in {path} "
+            f"(topics={topics_seen}, unmapped={unmapped}, camera map={cam_map})"
+        )
+
+
 def parse_orin_h264_streams(
     path: str | Path,
     cam_map: Optional[Dict[str, str]] = None,
@@ -511,48 +808,29 @@ def parse_orin_h264_streams(
     Dict[str, List[int]],
     Dict[str, dict],
 ]:
-    """Read /streamer/realsense_*/h264 Annex-B streams → (frames, timestamps_ns, metas).
+    """Read Orin Annex-B H.264 CompressedImage streams → (frames, timestamps_ns, metas).
 
-    约定：一条消息一帧（realsense streamer 每帧发一个 CompressedImage format=h264，
-    payload 为 Annex-B）。与 JPEG 版共用通道映射；payload 已是 H.264，后续走
+    两种 topic（与 JPEG 不会同时出现）::
+
+        /streamer/realsense_*/h264
+        /left_camera/.../color/image_raw/compressed   format=h264
+        /camera/f_l|f_r|left_wrist|right_wrist/h264
+
+    约定：一条消息一帧，payload 为 Annex-B。后续走
     LiveX264Encoder.annexb / cpu_transcode_chunk 重编码归一化。
     """
-    from mcap_ros2.reader import read_ros2_messages
-
-    cam_map = cam_map or _parse_camera_map()
     frames: Dict[str, List[bytes]] = defaultdict(list)
     timestamps: Dict[str, List[int]] = defaultdict(list)
     metas: Dict[str, dict] = {}
-
-    for msg in read_ros2_messages(str(path)):
-        topic = msg.channel.topic if msg.channel else ""
-        if not _H264_TOPIC_RE.match(topic.strip()):
-            continue
-        ch = _topic_to_channel(topic, cam_map)
-        if not ch:
-            continue
-        data = _to_annexb_h264(bytes(getattr(msg.ros_msg, "data", b"") or b""))
-        if not data:
-            log.warning("Skip non-H.264 payload on %s", topic)
-            continue
+    for ch, data, ts_ns, meta in iter_orin_h264_annexb(path, cam_map):
         frames[ch].append(data)
-        timestamps[ch].append(int(msg.log_time_ns))
+        timestamps[ch].append(ts_ns)
         if ch not in metas:
-            w, h = _h264_sps_size(data)
-            metas[ch] = {
-                "width": w or 1280,
-                "height": h or 720,
-                "fps": 30,
-                "position": ch,
-                "codec": "h264",
-                "source_topic": topic,
-            }
+            metas[ch] = dict(meta)
+        elif meta.get("width") and meta.get("height"):
+            metas[ch]["width"] = meta["width"]
+            metas[ch]["height"] = meta["height"]
 
-    if not frames:
-        raise ValueError(
-            f"No Orin H.264 streams (/streamer/*/h264) found in {path} "
-            f"(camera map={cam_map})"
-        )
     _prepare_h264_decode_start(frames, timestamps, metas)
     _estimate_fps_into_metas(timestamps, metas)
     for ch in sorted(frames.keys()):

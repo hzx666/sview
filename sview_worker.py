@@ -7,7 +7,7 @@ Pairs with sview_http.py. Splits H.264 into per-frame AUs via Annex-B NAL scan
 
 Input formats (auto-detected):
   - Head-cam / SSIEGO: protobuf ``/camera/*/video`` (H.264/HEVC AUs)
-  - Orin teleop: ROS2 ``sensor_msgs/CompressedImage`` JPEG，或
+  - Orin / Agilex: ROS2 ``sensor_msgs/CompressedImage`` JPEG（边读边编，不必先扫完整袋），或
     ``/streamer/realsense_*/h264`` / ``/camera/{f_l,f_r,left_wrist,right_wrist}/h264``
     Annex-B H.264（见 ``orin_images.py``；映射到 FR/FL/RR/RL）
 
@@ -39,8 +39,7 @@ Resolution / quality (env or CLI):
   ENCODE_PLAYABLE_MAX_CONCURRENT=4   after playable, keep 4-cam parallel (1 = serializes, <realtime)
   ENCODE_FOREGROUND_RESERVE=0        slots kept for not-yet-playable jobs (0=auto ~25%)
   LIVE_ENCODE=1                      hold 4 encode slots for the job so cameras stay parallel
-  ORIN_DIRECT=1                      Orin JPEG CRF-only (no ABR); H.264 uses TRANSCODE_*
-  ORIN_CRF=23                        Orin JPEG→H.264 CRF (HD compress; raise toward 12 for near-lossless)
+  ORIN_DIRECT=1                      JPEG 仅 CRF、不加 ABR（默认 0，与头显同一套 TRANSCODE_*）
   LOG_FILE=sview.log                 project log under cwd (shared by all modules)
   LOG_PROGRESS_EVERY_PCT=5           job progress log step (percent); 0=every callback
   SVIEW_ROLE=all|master|worker       master=HTTP only; worker=encode; all=both
@@ -380,10 +379,10 @@ def _env_int(name: str, default: str = "0") -> int:
         return int(default)
 
 
-# Orin JPEG→H.264 only. Orin H.264 uses the same TRANSCODE_* knobs as head-cam.
-# ORIN_DIRECT=1 still skips bitrate crush on JPEG; scale applies when SIZE/W/H set.
-ORIN_DIRECT = _env_bool("ORIN_DIRECT", "1")
-ORIN_CRF = max(1, min(51, _env_int("ORIN_CRF", "23")))
+# Orin JPEG→H.264 uses the same TRANSCODE_* knobs as head-cam / Orin H.264.
+# ORIN_DIRECT=1: JPEG CRF-only (no ABR), still applies TRANSCODE_SIZE + TRANSCODE_CRF.
+ORIN_DIRECT = _env_bool("ORIN_DIRECT", "0")
+ORIN_CRF = max(1, min(51, _env_int("ORIN_CRF", "23")))  # unused; kept for env compat
 
 # HD compress defaults: 1080 square + CRF28 + force re-encode (no H.264 passthrough).
 # Set TRANSCODE_SIZE=0 to keep source resolution; TRANSCODE_BITRATE=0 → CRF+VBV (no ABR).
@@ -528,6 +527,18 @@ def _tc_force_reencode() -> bool:
 def _resize_requested() -> bool:
     """True when env/CLI/thread override asks to change output resolution."""
     return _tc_size() > 0 or _tc_width() > 0 or _tc_height() > 0
+
+
+def _apply_output_scale(camera_metas: dict) -> tuple[int | None, int | None]:
+    """Stamp TRANSCODE_SIZE/W/H onto camera_metas; return (w, h) or (None, None)."""
+    if not _resize_requested() or not camera_metas:
+        return None, None
+    sw = _scale_dim(camera_metas, "w")
+    sh = _scale_dim(camera_metas, "h")
+    for ch in camera_metas:
+        camera_metas[ch]["width"] = sw
+        camera_metas[ch]["height"] = sh
+    return sw, sh
 
 
 def _transcode_size_desc() -> str:
@@ -713,20 +724,21 @@ def _pack_segment_bytes(start_index: int, frame_blobs: list[bytes], segment_fram
     )
 
 
-def _oss_cache_upload_segment(job_id: str, start: int, end: int, frame_dir: Path) -> None:
-    """Upload frames [start, end) as one segment object (end exclusive)."""
+def _oss_cache_upload_segment(job_id: str, start: int, end: int, frame_dir: Path) -> bool:
+    """Upload frames [start, end) as one segment. True only after OSS PUT succeeds."""
     if end <= start:
-        return
+        return False
     blobs: list[bytes] = []
     for i in range(start, end):
         path = frame_dir / f"{i:06d}.bin"
         if not path.is_file():
             log.warning("[%s] oss-cache skip segment %d: missing %s", job_id, start, path.name)
-            return
+            return False
         blobs.append(path.read_bytes())
     data = _pack_segment_bytes(start, blobs, SEGMENT_FRAMES)
     key = oss_cache_key(job_id, "segments", f"{start:06d}.bin")
     upload_bytes_to_oss(key, data, job_id=job_id)
+    return True
 
 
 def _oss_cache_upload_manifest(job_id: str, manifest: dict) -> None:
@@ -744,7 +756,11 @@ def _oss_cache_maybe_flush(
     frame_dir: Path,
     manifest: dict | None,
 ) -> None:
-    """After local progressive write, mirror completed segments (+ manifest) to OSS."""
+    """Mirror a completed local segment to OSS, then advertise it in manifest.
+
+    Manifest is uploaded only after the segment PUT succeeds, so
+    frames_available never claims frames that are not on OSS.
+    """
     if not OSS_CACHE:
         return
     if frames_done <= 0:
@@ -757,16 +773,56 @@ def _oss_cache_maybe_flush(
 
     start = ((frames_done - 1) // SEGMENT_FRAMES) * SEGMENT_FRAMES
     end = frames_done
+    uploaded = False
     try:
-        _oss_cache_upload_segment(job_id, start, end, frame_dir)
+        uploaded = _oss_cache_upload_segment(job_id, start, end, frame_dir)
     except Exception:
         log.exception("[%s] oss-cache segment upload failed [%d:%d)", job_id, start, end)
+        uploaded = False
 
-    if manifest is not None:
+    if manifest is None:
+        return
+    if not uploaded:
+        log.warning(
+            "[%s] oss-cache skip manifest: segment [%d:%d) not on OSS",
+            job_id,
+            start,
+            end,
+        )
+        return
+
+    man = dict(manifest)
+    bundle = dict(man.get("bundle") or {})
+    bundle["frames_available"] = int(end)
+    man["bundle"] = bundle
+
+    for attempt in range(2):
         try:
-            _oss_cache_upload_manifest(job_id, manifest)
+            _oss_cache_upload_manifest(job_id, man)
+            return
         except Exception:
-            log.exception("[%s] oss-cache manifest upload failed", job_id)
+            log.exception(
+                "[%s] oss-cache manifest upload failed (attempt %d)",
+                job_id,
+                attempt + 1,
+            )
+
+
+def _oss_cache_publish_done(
+    job_id: str,
+    frames_done: int,
+    frame_dir: Path,
+    manifest: dict | None,
+) -> None:
+    """After local status=done, push the last (possibly short) segment + manifest.
+
+    In-loop flush only runs on SEGMENT_FRAMES boundaries or when
+    frames_done == min_frames. If min_frames was the MCAP summary count and
+    actual published frames are fewer, the tail never left the worker.
+    """
+    if not OSS_CACHE or frames_done <= 0 or manifest is None:
+        return
+    _oss_cache_maybe_flush(job_id, frames_done, frames_done, frame_dir, manifest)
 
 
 # ---------------------------------------------------------------------------
@@ -1487,6 +1543,36 @@ def _tls_call(override, fn, *args, **kwargs):
 # ---------------------------------------------------------------------------
 
 
+def _known_frame_total(value) -> int | None:
+    """Positive full-job frame_count, or None when still unknown."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _progressive_frame_count(
+    summary_n: int | None,
+    aligned_n: int,
+    *,
+    final: bool,
+) -> int | None:
+    """Stable full-job total for progressive publish; None until known.
+
+    MCAP summary (min of video topic counts) is the seek max while encoding.
+    Without a summary, do not advertise the growing published prefix as the
+    total. The done manifest always uses the actual aligned count.
+    """
+    have = int(aligned_n or 0)
+    if final:
+        return have if have > 0 else None
+    declared = _known_frame_total(summary_n)
+    if declared is None:
+        return None
+    return max(declared, have) if have > 0 else declared
+
+
 def _write_bundle_range(
     f_start: int,
     f_end: int,
@@ -1499,7 +1585,7 @@ def _write_bundle_range(
     manifest_path: Path,
     job_id: str,
     camera_metas: dict,
-    min_frames: int,
+    min_frames: int | None,
     key_frame_indices: list,
     progressive: bool,
     progress_cb=None,
@@ -1569,45 +1655,50 @@ def _write_bundle_range(
         _write_bytes_atomic(output_frame_dir / f"{fidx:06d}.bin", bundle)
 
         frames_done = fidx + 1
+        known_total = _known_frame_total(min_frames)
+        job_complete = known_total is not None and frames_done >= known_total
+        timeline_upto = known_total if known_total is not None else frames_done
         published_manifest = None
         if progressive and (
             frames_done == 1
             or frames_done % PARTIAL_MANIFEST_EVERY == 0
-            or frames_done == min_frames
+            or job_complete
         ):
             tl_start, tl_end = _estimate_timeline(
-                video_timestamps, channel_aus, min_frames,
+                video_timestamps, channel_aus, timeline_upto,
             )
             published_manifest = _build_manifest_dict(
                 job_id=job_id,
                 camera_metas=camera_metas,
-                frame_count=min_frames,
+                frame_count=known_total,
                 frames_available=frames_done,
                 key_frame_indices=key_frame_indices,
                 timeline_start_ns=tl_start,
                 timeline_end_ns=tl_end,
-                status="partial" if frames_done < min_frames else "done",
+                status="done" if job_complete else "partial",
             )
             _publish_manifest(manifest_path, published_manifest)
 
         if progressive and OSS_CACHE and (
-            frames_done % SEGMENT_FRAMES == 0 or frames_done == min_frames
+            frames_done % SEGMENT_FRAMES == 0 or job_complete
         ):
             # Prefer freshly built manifest; otherwise rebuild a light one for OSS.
             man = published_manifest
-            if man is None and (frames_done % PARTIAL_MANIFEST_EVERY == 0 or frames_done == min_frames):
+            if man is None and (
+                frames_done % PARTIAL_MANIFEST_EVERY == 0 or job_complete
+            ):
                 tl_start, tl_end = _estimate_timeline(
-                    video_timestamps, channel_aus, min_frames,
+                    video_timestamps, channel_aus, timeline_upto,
                 )
                 man = _build_manifest_dict(
                     job_id=job_id,
                     camera_metas=camera_metas,
-                    frame_count=min_frames,
+                    frame_count=known_total,
                     frames_available=frames_done,
                     key_frame_indices=key_frame_indices,
                     timeline_start_ns=tl_start,
                     timeline_end_ns=tl_end,
-                    status="partial" if frames_done < min_frames else "done",
+                    status="done" if job_complete else "partial",
                 )
             elif man is None and manifest_path.is_file():
                 try:
@@ -1616,7 +1707,7 @@ def _write_bundle_range(
                 except Exception:
                     man = None
             _oss_cache_maybe_flush(
-                job_id, frames_done, min_frames, output_frame_dir, man,
+                job_id, frames_done, known_total or 0, output_frame_dir, man,
             )
 
         # Must fire exactly at PLAYABLE_MIN_FRAMES so the Redis scheduler can
@@ -1625,12 +1716,12 @@ def _write_bundle_range(
         if progress_cb and (
             fidx == f_start
             or fidx % 10 == 0
-            or frames_done == min_frames
+            or job_complete
             or frames_done == PLAYABLE_MIN_FRAMES
             or frames_done == f_end
         ):
             try:
-                progress_cb(frames_done, min_frames)
+                progress_cb(frames_done, known_total)
             except Exception:
                 log.exception("progress_cb failed at frame %s", fidx)
 
@@ -1660,7 +1751,7 @@ def _publish_headcam_chunk(
     output_frame_dir: Path,
     manifest_path: Path,
     job_id: str,
-    min_frames: int,
+    min_frames: int | None,
     key_frame_indices: list,
     progressive: bool,
     passthrough: bool,
@@ -1868,8 +1959,9 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
             jpeg_sequence_to_h264,
             orin_h264_channels_from_summary,
             orin_stream_kind,
-            parse_orin_jpeg_streams,
             iter_orin_h264_annexb,
+            iter_orin_jpeg_frames,
+            read_orin_video_frame_count,
             sview_channel_for_topic,
             _h264_sps_size,
         )
@@ -1905,21 +1997,11 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         # GOP is published without waiting to scan the whole bag.
                     else:
                         log.info(
-                            "[%s]  Format=Orin ROS2 CompressedImage (JPEG→H.264 progressive, chunk=%d)",
+                            "[%s]  Format=Orin ROS2 CompressedImage JPEG "
+                            "(stream encode, first GOP without full-bag scan, chunk=%d)",
                             fname, ORIN_CHUNK_FRAMES,
                         )
-                        try:
-                            frame_blobs, video_timestamps, camera_metas = parse_orin_jpeg_streams(
-                                local_path,
-                            )
-                        except ValueError as e:
-                            # ACS 旧镜像会把 format=h264 的 CompressedImage 当 JPEG。
-                            # 新代码 peek 后应走 h264；这里再兜底一次，避免误分类。
-                            log.warning(
-                                "[%s]  JPEG parse failed (%s); retry as Orin H.264",
-                                fname, e,
-                            )
-                            orin_kind = "h264"
+                        # Parsed incrementally in the JPEG stream loop below.
                     orin_ok = True
                 except Exception as exc:
                     log.warning(
@@ -1932,7 +2014,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 jpeg_frames = defaultdict(list)
                 idr_seen: dict = {}
                 expected_ch = sorted(orin_h264_channels_from_summary(local_path))
-                summary_n = read_headcam_video_frame_count(local_path)
+                summary_n = read_orin_video_frame_count(local_path, "h264")
                 job_id = out_job_id
                 progressive = bool(no_upload and PROGRESSIVE_PUBLISH)
                 if progressive:
@@ -1950,7 +2032,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 channels: list = []
                 channel_aus: dict = {}
                 live_encoders = {}
-                min_frames = summary_n or 0
+                min_frames = _known_frame_total(summary_n)
                 start = 0
                 cidx = 0
                 sw = sh = None
@@ -1960,9 +2042,15 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         "[%s]  Orin H.264 frame_count from mcap summary: %d (channels=%s)",
                         fname, summary_n, ",".join(expected_ch) or "?",
                     )
+                else:
+                    log.info(
+                        "[%s]  Orin H.264 frame_count unknown until aligned publish "
+                        "(no matching mcap summary)",
+                        fname,
+                    )
                 if progress_cb:
                     try:
-                        progress_cb(0, min_frames or 0)
+                        progress_cb(0, min_frames)
                     except Exception:
                         log.exception("progress_cb failed at start")
 
@@ -2086,10 +2174,15 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                     if not _lock_channels(final=final):
                         return
                     n = _aligned_n()
-                    if summary_n:
-                        min_frames = summary_n
-                    else:
-                        min_frames = max(min_frames, n)
+                    min_frames = _progressive_frame_count(
+                        summary_n, n, final=final,
+                    )
+                    if final and summary_n and n and n != summary_n:
+                        log.info(
+                            "[%s]  mcap summary frame_count=%d actual aligned=%d; "
+                            "done manifest uses actual",
+                            fname, summary_n, n,
+                        )
                     while start < n:
                         step = (
                             PLAYABLE_MIN_FRAMES if cidx == 0
@@ -2132,7 +2225,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                             manifest_path=manifest_path,
                             job_id=job_id,
                             camera_metas=camera_metas,
-                            min_frames=max(min_frames, end),
+                            min_frames=min_frames,
                             key_frame_indices=key_frame_indices,
                             progressive=progressive,
                             progress_cb=progress_cb,
@@ -2144,7 +2237,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                             cidx,
                             start,
                             end,
-                            _progress_pct(end, max(min_frames, end)),
+                            _progress_pct(end, min_frames),
                             elapsed,
                             _encode_rate_suffix(end - start, elapsed),
                             " [passthrough]" if passthrough else (
@@ -2194,19 +2287,18 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 tl_start, tl_end = _estimate_timeline(
                     video_timestamps, channel_aus, min_frames,
                 )
-                _publish_manifest(
-                    manifest_path,
-                    _build_manifest_dict(
-                        job_id=job_id,
-                        camera_metas=camera_metas,
-                        frame_count=min_frames,
-                        frames_available=min_frames,
-                        key_frame_indices=key_frame_indices,
-                        timeline_start_ns=tl_start,
-                        timeline_end_ns=tl_end,
-                        status="done",
-                    ),
+                done_man = _build_manifest_dict(
+                    job_id=job_id,
+                    camera_metas=camera_metas,
+                    frame_count=min_frames,
+                    frames_available=min_frames,
+                    key_frame_indices=key_frame_indices,
+                    timeline_start_ns=tl_start,
+                    timeline_end_ns=tl_end,
+                    status="done",
                 )
+                _publish_manifest(manifest_path, done_man)
+                _oss_cache_publish_done(job_id, min_frames, output_frame_dir, done_man)
                 if progress_cb:
                     try:
                         progress_cb(min_frames, min_frames)
@@ -2221,7 +2313,281 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 )
                 orin_kind = None
                 orin_ok = False
-        elif orin_ok:
+        if (
+            (not orin_published)
+            and orin_ok
+            and orin_kind == "jpeg"
+            and not is_hdf5_file(local_path)
+        ):
+            try:
+                jpeg_frames = defaultdict(list)
+                summary_n = read_orin_video_frame_count(local_path, "jpeg")
+                job_id = out_job_id
+                progressive = bool(no_upload and PROGRESSIVE_PUBLISH)
+                if progressive:
+                    publish_dir = _prepare_publish_dir(job_id)
+                    output_frame_dir = publish_dir / "frames"
+                    log.info("[%s]  Progressive publish -> %s", fname, publish_dir)
+                else:
+                    publish_dir = None
+                    output_frame_dir = work_dir / "frames"
+                    output_frame_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path = (
+                    (publish_dir / "manifest.json") if publish_dir else (work_dir / "manifest.json")
+                )
+                key_frame_indices = []
+                channels: list = []
+                channel_aus: dict = {}
+                live_encoders = {}
+                min_frames = _known_frame_total(summary_n)
+                start = 0
+                cidx = 0
+                sw = sh = None
+                if summary_n:
+                    log.info(
+                        "[%s]  Orin JPEG frame_count from mcap summary: %d",
+                        fname, summary_n,
+                    )
+                else:
+                    log.info(
+                        "[%s]  Orin JPEG frame_count unknown until aligned publish "
+                        "(no matching mcap summary)",
+                        fname,
+                    )
+                if progress_cb:
+                    try:
+                        progress_cb(0, min_frames)
+                    except Exception:
+                        log.exception("progress_cb failed at start")
+
+                def _aligned_n() -> int:
+                    if not channels:
+                        return 0
+                    return min(len(jpeg_frames.get(ch, [])) for ch in channels)
+
+                def _lock_channels(final: bool = False) -> bool:
+                    nonlocal channels, channel_aus, live_encoders, sw, sh
+                    if channels:
+                        return True
+                    have = [ch for ch, rows in jpeg_frames.items() if rows]
+                    preferred = [c for c in ("FL", "FR", "RL", "RR") if jpeg_frames.get(c)]
+                    if not final:
+                        if len(preferred) < 4 and len(have) < 4:
+                            return False
+                    pick = preferred or sorted(have)
+                    if not pick:
+                        return False
+                    channels = pick
+                    sw, sh = _apply_output_scale(camera_metas)
+                    channel_aus = {ch: [] for ch in channels}
+                    log.info(
+                        "[%s]  Orin JPEG progressive libx264, cams=%s "
+                        "size=%s crf=%s bitrate=%s maxrate=%s direct=%s",
+                        fname,
+                        ",".join(channels),
+                        _transcode_size_desc(),
+                        _tc_crf(),
+                        TRANSCODE_BITRATE,
+                        TRANSCODE_MAXRATE,
+                        int(ORIN_DIRECT),
+                    )
+                    if LIVE_ENCODE:
+                        live_encoders = _start_live_jpeg_encoders(
+                            channels,
+                            camera_metas,
+                            job_id,
+                            sw,
+                            sh,
+                            crf=_tc_crf(),
+                            direct=ORIN_DIRECT,
+                        )
+                        log.info(
+                            "[%s]  Live JPEG→H.264 sessions x%d (hold encode slots for job)",
+                            fname, len(live_encoders),
+                        )
+                    return True
+
+                def _enc_one(ch: str, cidx_i: int, f0: int, f1: int):
+                    want = f1 - f0
+                    enc = live_encoders.get(ch) if live_encoders else None
+                    frames_seg = jpeg_frames[ch][f0:f1]
+
+                    def _fit_aus(aus_all: list) -> list:
+                        aus = list(aus_all)
+                        if len(aus) > want:
+                            aus = aus[:want]
+                        while len(aus) < want:
+                            aus.append(b"")
+                        return aus
+
+                    if enc is not None:
+                        t0 = time.time()
+                        aus = _fit_aus(enc.encode_frames(frames_seg))
+                        elapsed = time.time() - t0
+                        nbytes = sum(len(a) for a in aus)
+                        return ch, aus, elapsed, nbytes
+                    fps = float(camera_metas.get(ch, {}).get("fps") or 30)
+                    out_p = work_dir / f"{ch}_orin_c{cidx_i:04d}.h264"
+                    lock = cpu_encode_lock
+                    gate = lock.slot(job_id) if hasattr(lock, "slot") else lock
+                    with gate:
+                        br = mr = bs = None
+                        if not ORIN_DIRECT:
+                            br = None if _rate_control_empty(TRANSCODE_BITRATE) else TRANSCODE_BITRATE
+                            mr = None if _rate_control_empty(TRANSCODE_MAXRATE) else TRANSCODE_MAXRATE
+                            bs = None if _rate_control_empty(TRANSCODE_BUFSIZE) else TRANSCODE_BUFSIZE
+                        elapsed = jpeg_sequence_to_h264(
+                            frames_seg,
+                            out_p,
+                            fps=fps,
+                            scale_w=sw,
+                            scale_h=sh,
+                            ffmpeg=FFMPEG,
+                            crf=_tc_crf(),
+                            preset=TRANSCODE_PRESET,
+                            bitrate=br,
+                            maxrate=mr,
+                            bufsize=bs,
+                            gop=len(frames_seg),
+                            direct=ORIN_DIRECT,
+                            threads=_x264_threads_now(),
+                        )
+                    raw = out_p.read_bytes()
+                    aus = _split_h264_access_units(raw, work_dir)
+                    try:
+                        out_p.unlink()
+                    except OSError:
+                        pass
+                    return ch, _fit_aus(aus), elapsed, len(raw)
+
+                def _emit_chunks(final: bool = False) -> None:
+                    nonlocal start, cidx, min_frames
+                    if not _lock_channels(final=final):
+                        return
+                    n = _aligned_n()
+                    min_frames = _progressive_frame_count(
+                        summary_n, n, final=final,
+                    )
+                    if final and summary_n and n and n != summary_n:
+                        log.info(
+                            "[%s]  mcap summary frame_count=%d actual aligned=%d; "
+                            "done manifest uses actual",
+                            fname, summary_n, n,
+                        )
+                    while start < n:
+                        step = (
+                            PLAYABLE_MIN_FRAMES if cidx == 0
+                            else max(1, ORIN_CHUNK_FRAMES)
+                        )
+                        if not final and n < start + step:
+                            return
+                        end = min(start + step, n)
+                        t_chunk = time.time()
+                        _ovr = getattr(_tls, "override", None)
+                        with ThreadPoolExecutor(max_workers=min(4, len(channels))) as pool:
+                            futs = [
+                                pool.submit(_tls_call, _ovr, _enc_one, ch, cidx, start, end)
+                                for ch in channels
+                            ]
+                            for fut in as_completed(futs):
+                                ch, aus, elapsed, nbytes = fut.result()
+                                channel_aus[ch].extend(aus)
+                        chunk_len = end - start
+                        for ch in channels:
+                            have = len(channel_aus[ch])
+                            expect = start + chunk_len
+                            if have > expect:
+                                channel_aus[ch] = channel_aus[ch][:expect]
+                            while len(channel_aus[ch]) < expect:
+                                channel_aus[ch].append(b"")
+                            for i in range(start, end):
+                                jpeg_frames[ch][i] = b""
+                        _write_bundle_range(
+                            start,
+                            end,
+                            channel_aus=channel_aus,
+                            video_timestamps=video_timestamps,
+                            imu_sorted=[],
+                            imu_idx=0,
+                            output_frame_dir=output_frame_dir,
+                            manifest_path=manifest_path,
+                            job_id=job_id,
+                            camera_metas=camera_metas,
+                            min_frames=min_frames,
+                            key_frame_indices=key_frame_indices,
+                            progressive=progressive,
+                            progress_cb=progress_cb,
+                        )
+                        elapsed = time.time() - t_chunk
+                        log.info(
+                            "[%s]  Orin chunk %d frames [%d:%d) %.1f%% published in %.2fs%s%s",
+                            fname,
+                            cidx,
+                            start,
+                            end,
+                            _progress_pct(end, min_frames),
+                            elapsed,
+                            _encode_rate_suffix(end - start, elapsed),
+                            " [live]" if live_encoders else "",
+                        )
+                        cidx += 1
+                        start = end
+
+                for ch, data, ts_ns, meta in iter_orin_jpeg_frames(local_path):
+                    jpeg_frames[ch].append(data)
+                    video_timestamps[ch].append(ts_ns)
+                    if ch not in camera_metas:
+                        camera_metas[ch] = dict(meta)
+                    if not channels:
+                        _emit_chunks(final=False)
+                    else:
+                        need = (
+                            PLAYABLE_MIN_FRAMES if cidx == 0
+                            else max(1, ORIN_CHUNK_FRAMES)
+                        )
+                        if _aligned_n() >= start + need:
+                            _emit_chunks(final=False)
+                _emit_chunks(final=True)
+                if start < 1:
+                    raise ValueError(f"Orin MCAP has no jpeg frames: {local_path}")
+                min_frames = start
+                for ch in channels:
+                    video_frames[ch] = jpeg_frames.get(ch, [])
+                log.info(
+                    "[%s]  Built %d frame bundles (%d keyframes)%s [orin jpeg stream]",
+                    fname, min_frames, len(key_frame_indices),
+                    " [progressive]" if progressive else "",
+                )
+                tl_start, tl_end = _estimate_timeline(
+                    video_timestamps, channel_aus, min_frames,
+                )
+                done_man = _build_manifest_dict(
+                    job_id=job_id,
+                    camera_metas=camera_metas,
+                    frame_count=min_frames,
+                    frames_available=min_frames,
+                    key_frame_indices=key_frame_indices,
+                    timeline_start_ns=tl_start,
+                    timeline_end_ns=tl_end,
+                    status="done",
+                )
+                _publish_manifest(manifest_path, done_man)
+                _oss_cache_publish_done(job_id, min_frames, output_frame_dir, done_man)
+                if progress_cb:
+                    try:
+                        progress_cb(min_frames, min_frames)
+                    except Exception:
+                        log.exception("progress_cb failed at end")
+                orin_published = True
+            except Exception as exc:
+                log.warning(
+                    "[%s]  Orin JPEG stream encode failed (%s); "
+                    "falling back to head-cam protobuf",
+                    fname, exc,
+                )
+                orin_kind = None
+                orin_ok = False
+        if (not orin_published) and orin_ok:
             jpeg_frames = frame_blobs
             if orin_kind == "h264":
                 for ch in list(jpeg_frames.keys()):
@@ -2260,31 +2626,18 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 video_timestamps[ch] = list(video_timestamps[ch][:n])
                 video_frames[ch] = jpeg_frames[ch][:n]
 
-            # Direct = CRF-only (no ABR crush). Still honor TRANSCODE_SIZE/W/H for HD compress.
-            if ORIN_DIRECT:
-                if _resize_requested():
-                    sw = _scale_dim(camera_metas, "w")
-                    sh = _scale_dim(camera_metas, "h")
-                    for ch in camera_metas:
-                        camera_metas[ch]["width"] = sw
-                        camera_metas[ch]["height"] = sh
-                    log.info(
-                        "[%s]  Orin HD encode (CRF %d, scale %dx%d, no bitrate cap)",
-                        fname, ORIN_CRF, sw, sh,
-                    )
-                else:
-                    sw, sh = None, None
-                    log.info(
-                        "[%s]  Orin direct encode (CRF %d, no bitrate cap, no scale)",
-                        fname, ORIN_CRF,
-                    )
-            else:
-                sw = _scale_dim(camera_metas, "w") if _resize_requested() else None
-                sh = _scale_dim(camera_metas, "h") if _resize_requested() else None
-                if sw and sh:
-                    for ch in camera_metas:
-                        camera_metas[ch]["width"] = sw
-                        camera_metas[ch]["height"] = sh
+            sw, sh = _apply_output_scale(camera_metas)
+            jpeg_crf = _tc_crf()
+            log.info(
+                "[%s]  JPEG→H.264 encode CRF %d scale=%s bitrate=%s maxrate=%s "
+                "direct=%s (same TRANSCODE_* as head-cam)",
+                fname,
+                jpeg_crf,
+                f"{sw}x{sh}" if sw and sh else "source",
+                TRANSCODE_BITRATE,
+                TRANSCODE_MAXRATE,
+                int(ORIN_DIRECT),
+            )
 
             channels = sorted(jpeg_frames.keys())
             channel_aus = {ch: [] for ch in channels}
@@ -2331,7 +2684,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         job_id,
                         sw,
                         sh,
-                        crf=ORIN_CRF if ORIN_DIRECT else _tc_crf(),
+                        crf=_tc_crf(),
                         direct=ORIN_DIRECT,
                     )
                     log.info(
@@ -2403,27 +2756,14 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                             job_id=job_id,
                             acquire_gate=False,
                         )
-                    elif ORIN_DIRECT:
-                        elapsed = jpeg_sequence_to_h264(
-                            jpeg_frames[ch][start:end],
-                            out_p,
-                            fps=fps,
-                            scale_w=sw,
-                            scale_h=sh,
-                            ffmpeg=FFMPEG,
-                            crf=ORIN_CRF,
-                            preset=TRANSCODE_PRESET,
-                            bitrate=None,
-                            maxrate=None,
-                            bufsize=None,
-                            gop=len(jpeg_frames[ch][start:end]),
-                            direct=True,
-                            threads=_x264_threads_now(),
-                        )
                     else:
-                        br = None if _rate_control_empty(TRANSCODE_BITRATE) else TRANSCODE_BITRATE
-                        mr = None if _rate_control_empty(TRANSCODE_MAXRATE) else TRANSCODE_MAXRATE
-                        bs = None if _rate_control_empty(TRANSCODE_BUFSIZE) else TRANSCODE_BUFSIZE
+                        br = None
+                        mr = None
+                        bs = None
+                        if not ORIN_DIRECT:
+                            br = None if _rate_control_empty(TRANSCODE_BITRATE) else TRANSCODE_BITRATE
+                            mr = None if _rate_control_empty(TRANSCODE_MAXRATE) else TRANSCODE_MAXRATE
+                            bs = None if _rate_control_empty(TRANSCODE_BUFSIZE) else TRANSCODE_BUFSIZE
                         elapsed = jpeg_sequence_to_h264(
                             jpeg_frames[ch][start:end],
                             out_p,
@@ -2437,7 +2777,7 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                             maxrate=mr,
                             bufsize=bs,
                             gop=len(jpeg_frames[ch][start:end]),
-                            direct=False,
+                            direct=ORIN_DIRECT,
                             threads=_x264_threads_now(),
                         )
                 raw = out_p.read_bytes()
@@ -2534,24 +2874,22 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 " [progressive]" if progressive else "",
             )
             tl_start, tl_end = _estimate_timeline(video_timestamps, channel_aus, min_frames)
-            _publish_manifest(
-                manifest_path,
-                _build_manifest_dict(
-                    job_id=job_id,
-                    camera_metas=camera_metas,
-                    frame_count=min_frames,
-                    frames_available=min_frames,
-                    key_frame_indices=key_frame_indices,
-                    timeline_start_ns=tl_start,
-                    timeline_end_ns=tl_end,
-                    status="done",
-                ),
+            done_man = _build_manifest_dict(
+                job_id=job_id,
+                camera_metas=camera_metas,
+                frame_count=min_frames,
+                frames_available=min_frames,
+                key_frame_indices=key_frame_indices,
+                timeline_start_ns=tl_start,
+                timeline_end_ns=tl_end,
+                status="done",
             )
+            _publish_manifest(manifest_path, done_man)
+            _oss_cache_publish_done(job_id, min_frames, output_frame_dir, done_man)
             orin_published = True
-        else:
+        if not orin_published:
             # Head-cam: stream-read → per-chunk encode/passthrough → publish immediately
             # (same progressive model as Orin; first chunk = PLAYABLE_MIN_FRAMES).
-            size_guess = max(1, int(total_size * 0.60 / (4 * 30000)))
             summary_frames = read_headcam_video_frame_count(local_path)
             job_id = out_job_id
             progressive = bool(no_upload and PROGRESSIVE_PUBLISH)
@@ -2574,19 +2912,16 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
             ts_wall_offset = 0
             passthrough = None  # decided once metas+channels are ready
             channels = []
-            if summary_frames and summary_frames > 0:
-                declared_total = summary_frames
-                total_from_summary = True
+            declared_total = _known_frame_total(summary_frames)
+            if declared_total:
                 log.info(
                     "[%s]  frame_count from mcap summary: %d",
-                    fname, summary_frames,
+                    fname, declared_total,
                 )
             else:
-                declared_total = size_guess
-                total_from_summary = False
                 log.info(
-                    "[%s]  frame_count estimated from file size: %d (no mcap summary)",
-                    fname, declared_total,
+                    "[%s]  frame_count unknown until aligned publish (no mcap summary)",
+                    fname,
                 )
 
             if progress_cb:
@@ -2719,12 +3054,9 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                         if min_count < next_end:
                             break
                     _try_rebase_timeline()
-                    # Summary count is the full-job total; only grow if we publish past it.
-                    # Size guess is a floor when Summary is missing.
-                    if total_from_summary:
-                        declared_total = max(declared_total, next_end)
-                    else:
-                        declared_total = max(declared_total, next_end, size_guess)
+                    declared_total = _progressive_frame_count(
+                        summary_frames, next_end, final=final,
+                    )
                     imu_sorted = sorted(imu_rows, key=lambda r: r["log_time_ns"])
                     imu_idx = _publish_headcam_chunk(
                         fname=fname,
@@ -2842,19 +3174,18 @@ def process_mcap(source_path, no_upload=False, progress_cb=None, job_id=None):
                 " [progressive]" if progressive else "",
             )
             tl_start, tl_end = _estimate_timeline(video_timestamps, channel_aus, min_frames)
-            _publish_manifest(
-                manifest_path,
-                _build_manifest_dict(
-                    job_id=job_id,
-                    camera_metas=camera_metas,
-                    frame_count=min_frames,
-                    frames_available=min_frames,
-                    key_frame_indices=key_frame_indices,
-                    timeline_start_ns=tl_start,
-                    timeline_end_ns=tl_end,
-                    status="done",
-                ),
+            done_man = _build_manifest_dict(
+                job_id=job_id,
+                camera_metas=camera_metas,
+                frame_count=min_frames,
+                frames_available=min_frames,
+                key_frame_indices=key_frame_indices,
+                timeline_start_ns=tl_start,
+                timeline_end_ns=tl_end,
+                status="done",
             )
+            _publish_manifest(manifest_path, done_man)
+            _oss_cache_publish_done(job_id, min_frames, output_frame_dir, done_man)
             if progress_cb:
                 try:
                     progress_cb(min_frames, min_frames)
@@ -3156,10 +3487,13 @@ def _estimate_timeline(video_timestamps: dict, channel_aus: dict, upto_frame: in
 def _duration_sec(
     timeline_start_ns: int,
     timeline_end_ns: int,
-    frame_count: int,
+    frame_count: int | None,
     camera_metas: dict,
 ) -> float:
-    """Stable total duration for manifest (never shrink/grow during progressive)."""
+    """Stable total duration for manifest (never shrink/grow during progressive).
+
+    When frame_count is still unknown, duration follows the published prefix.
+    """
     if timeline_start_ns and timeline_end_ns and timeline_end_ns > timeline_start_ns:
         return round((timeline_end_ns - timeline_start_ns) / 1e9, 6)
     fps = 30
@@ -3178,7 +3512,7 @@ def _duration_sec(
                     break
                 except (TypeError, ValueError):
                     pass
-    if frame_count <= 0:
+    if not frame_count or frame_count <= 0:
         return 0.0
     return round(max(0, frame_count - 1) / float(fps), 6)
 
@@ -3186,7 +3520,7 @@ def _duration_sec(
 def _build_manifest_dict(
     job_id: str,
     camera_metas: dict,
-    frame_count: int,
+    frame_count: int | None,
     frames_available: int,
     key_frame_indices: list,
     timeline_start_ns: int,
@@ -3197,6 +3531,7 @@ def _build_manifest_dict(
 
     timeline/duration_sec always reflect the *full* job (frame_count), not the
     currently published prefix — so progressive clients get a stable seek range.
+    When frame_count is still unknown (no MCAP summary), it is JSON null.
     """
     manifest = {
         "job_id": job_id,
@@ -3456,7 +3791,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
             "source": redis_path,
             "error": "",
             "frames_done": 0,
-            "frames_total": 0,
+            "frames_total": "",
             "playable": 0,
             "cancel": 0,
             "owner_pod": POD_IP,
@@ -3500,7 +3835,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
                     "status": "processing",
                     "source": redis_path,
                     "frames_done": done,
-                    "frames_total": total,
+                    "frames_total": _known_frame_total(total) or "",
                     "playable": playable,
                     "owner_pod": POD_IP,
                     "error": "",

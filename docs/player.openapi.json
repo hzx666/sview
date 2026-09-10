@@ -627,7 +627,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "批量为 `player-bin/{job_id}/segments|frames/*.bin` 签发公网 GET URL，供浏览器直连 OSS。单次最多 32 条。会 touch。Bucket 需 CORS 放行前端 Origin 的 GET/HEAD。`expires_in` 来自 `OSS_SIGN_EXPIRES`（默认 7200）。参数非法为 400 text/plain；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
+        "description": "批量为 `player-bin/{job_id}/segments/*.bin` 签发公网 GET URL。OSS 无逐帧 frames。单次最多 32 条。会 touch。超出 frames_available / 未按段对齐的 starts 不签发，放入 skipped。OSS list 失败为 425 text/plain。kind=frames 为 400 text/plain。参数非法为 400 text/plain；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
         "parameters": [
           {
             "name": "job_id",
@@ -684,12 +684,11 @@
             "name": "kind",
             "in": "query",
             "required": false,
-            "description": "segments（默认）或 frames",
+            "description": "仅 segments。OSS 播放缓存不存放逐帧 frames",
             "schema": {
               "type": "string",
               "enum": [
-                "segments",
-                "frames"
+                "segments"
               ],
               "default": "segments"
             }
@@ -758,7 +757,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "SView 四路播放清单。Master 直接返回 JSON（本地优先，缺则回源 OSS 后仍以 JSON 响应，避免跨域 302）。\n`status=partial` 仍在写帧；`done` 且 `frames_available === frame_count` 后可停刷。\n`format` 当前 Worker 固定写 `head_cam`（头显与 Orin 相同）。\nOSS 对齐后可能带 `cache_aligned`；从 0 起无连续段时 404 text/plain。\n非法 job_id / 清单不存在为 400/404 **text/plain**。",
+        "description": "SView 四路播放清单。Master 直接返回 JSON（OSS_CACHE 时优先 OSS manifest，再按从 0 连续 segment 对齐，避免本地虚高）。\n`status=partial` 仍在写帧；`done` 且 `frames_available === frame_count` 后可停刷。\n`format` 当前 Worker 固定写 `head_cam`（头显与 Orin 相同）。\nOSS 对齐后可能带 `cache_aligned`；从 0 起无连续段时 404 text/plain。OSS list 失败为 425 text/plain。\n非法 job_id / 清单不存在为 400/404 **text/plain**。",
         "parameters": [
           {
             "name": "job_id",
@@ -2372,8 +2371,7 @@
           "kind": {
             "type": "string",
             "enum": [
-              "segments",
-              "frames"
+              "segments"
             ]
           },
           "expires_in": {
@@ -2383,6 +2381,27 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/SignedMediaItem"
+            }
+          },
+          "skipped": {
+            "type": "array",
+            "description": "未签发的 starts（越界 / 未对齐）",
+            "items": {
+              "type": "object",
+              "properties": {
+                "start": {
+                  "type": "number"
+                },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "not_ready",
+                    "unaligned",
+                    "negative",
+                    "invalid"
+                  ]
+                }
+              }
             }
           }
         }

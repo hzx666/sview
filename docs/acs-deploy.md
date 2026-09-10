@@ -150,7 +150,7 @@ kubectl -n mcap-extract logs -l app=sview-worker --tail=50
 | `TRANSCODE_CRF` | — | 默认 `28` | 高清压缩；越大越小越糊 |
 | `TRANSCODE_BITRATE` | — | 默认 `0` | `0`=CRF+VBV；设成 `2M` 等则走 ABR |
 | `TRANSCODE_MAXRATE` / `BUFSIZE` | — | `1.5M` / `3M` | CRF 模式码率天花板 |
-| `ORIN_CRF` | — | 默认 `23` | Orin JPEG→H.264 质量 |
+| `ORIN_DIRECT` | — | 默认 `0` | `1`=JPEG 仅 CRF、不加 ABR；分辨率/CRF 仍用 `TRANSCODE_*` |
 | `PLAYABLE_MIN_FRAMES` | — | `30` | 可播阈值 |
 | `CACHE_MAX_BYTES` | ~500GiB | — | Master GC 上限 |
 

@@ -118,10 +118,9 @@ spec:
               value: "3"
             - name: OVERLAP_AFTER_PLAYABLE
               value: "1"
+            # JPEG/HDF5/Agilex 与头显同一套 TRANSCODE_*。ORIN_DIRECT=1 时 JPEG 仅 CRF、不加 ABR。
             - name: ORIN_DIRECT
-              value: "1"
-            - name: ORIN_CRF
-              value: "23"
+              value: "0"
             # HD compress: 1080 square + CRF28 + force re-encode (no H.264 passthrough).
             # Expected ~0.5–1.5MB / 30-frame segment (was ~3MB with source passthrough).
             - name: TRANSCODE_SIZE

@@ -256,15 +256,19 @@ Redis 不可用时 `503`。
 
 ## 3e. `GET /api/jobs/{job_id}/signed-media`
 
-**作用：** 批量为 `player-bin/{job_id}/segments|frames/*.bin` 签发**公网** GET URL，供浏览器直连 OSS（去掉 Master 中转大包）。
+**作用：** 批量为 `player-bin/{job_id}/segments/*.bin` 签发**公网** GET URL，供浏览器直连 OSS（去掉 Master 中转大包）。
+
+OSS 播放缓存只有打包段，没有逐帧 `frames/*.bin`。`kind=frames` 返回 **400**。
 
 **Query：**
 
 | 参数 | 说明 |
 |------|------|
-| `starts` | 逗号分隔索引，如 `0,30,60`（优先） |
+| `starts` | 逗号分隔段起始索引，如 `0,30,60`（优先） |
 | `start` / `count` / `step` | 区间形式；`step` 默认 `SEGMENT_FRAMES`；单次最多 32 条 |
-| `kind` | `segments`（默认）或 `frames` |
+| `kind` | 仅 `segments`（默认）。`frames` 非法 |
+
+超过 `frames_available`、未按 30 对齐的 `starts` **不会签发**，出现在响应 `skipped` 里（例如 `frames_available=330` 时 `330` 为 `not_ready`，最后一段是 `000300.bin`）。OSS list 失败时 **425**，请重试或走 Master `?proxy=1`。
 
 **返回：** `200`
 
@@ -292,7 +296,7 @@ Redis 不可用时 `503`。
 
 ## 4. `GET /api/jobs/{job_id}/manifest.json`
 
-**作用：** 播放清单。Master **直接返回 JSON**（本地优先，缺则回源 OSS 后仍以 JSON 响应，避免浏览器跨域 302 解析失败）。
+**作用：** 播放清单。Master **直接返回 JSON**（`OSS_CACHE` 时优先 OSS 上的 manifest，再按从 0 起连续 segment 对齐，避免本地虚高；OSS list 失败返回 **425**）。
 
 > 兼容旧路径：`GET /{job_id}/manifest.json`
 

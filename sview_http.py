@@ -203,6 +203,15 @@ def _optional_int(value) -> Optional[int]:
         return None
 
 
+def _optional_frame_count(*values) -> Optional[int]:
+    """First positive int among values; 0/empty means total is still unknown."""
+    for value in values:
+        n = _optional_int(value)
+        if n is not None and n > 0:
+            return n
+    return None
+
+
 def _purge_job_play_cache(cache_root: Path, job_id: str, *, reason: str) -> dict:
     """Wipe local /cache/{job_id}, OSS player-bin/{job_id}/, and Redis progress fields."""
     import shutil
@@ -227,9 +236,13 @@ def _purge_job_play_cache(cache_root: Path, job_id: str, *, reason: str) -> dict
     return summary
 
 
+def _oss_cache_on() -> bool:
+    return os.environ.get("OSS_CACHE", "0").lower() in ("1", "true", "yes", "on")
+
+
 def _align_manifest_dict(job_id: str, data: dict) -> dict:
     """Clamp frames_available to contiguous OSS segments when OSS_CACHE is on."""
-    if os.environ.get("OSS_CACHE", "0").lower() not in ("1", "true", "yes", "on"):
+    if not _oss_cache_on():
         return data
     try:
         from oss_cache_gc import align_manifest_to_oss
@@ -249,7 +262,48 @@ def _align_manifest_dict(job_id: str, data: dict) -> dict:
         )
     except Exception:
         log.exception("manifest OSS align failed for %s", job_id)
+        data["cache_align_failed"] = True
+        data["cache_align_reason"] = "oss_align_exception"
         return data
+
+
+def _read_local_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
+    path = _resolve_under(cache_root, job_id, "manifest.json")
+    if path is None or not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        log.warning("Failed reading local manifest for %s: %s", job_id, e)
+        return None
+
+
+def _read_oss_manifest(job_id: str) -> Optional[dict]:
+    try:
+        from sview_worker import get_oss_bucket, oss_cache_key
+
+        key = oss_cache_key(job_id, "manifest.json")
+        raw = get_oss_bucket().get_object(key).read()
+        return json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _load_play_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
+    """Load play manifest; with OSS_CACHE prefer the OSS object over local.
+
+    Local progressive files can claim frames that have not been PUT yet.
+    Signed playback must follow what is on OSS, then clamp to contiguous segments.
+    """
+    local = _read_local_manifest(cache_root, job_id)
+    if _oss_cache_on():
+        oss = _read_oss_manifest(job_id)
+        data = oss if oss is not None else local
+    else:
+        data = local
+    if data is None:
+        return None
+    return _align_manifest_dict(job_id, data)
 
 
 def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
@@ -259,33 +313,31 @@ def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
       job_id, status, frame_count, frames_done, playable, cached, duration_sec
     Plus internal `_manifest_status` for server-side logic only (stripped before send).
     """
-    path = _resolve_under(cache_root, job_id, "manifest.json")
-    data = None
-    if path is not None and path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except Exception as e:
-            log.warning("Failed reading manifest for %s: %s", job_id, e)
-            return None
-    elif os.environ.get("OSS_CACHE", "0").lower() in ("1", "true", "yes", "on"):
-        try:
-            from sview_worker import get_oss_bucket, oss_cache_key
-
-            key = oss_cache_key(job_id, "manifest.json")
-            raw = get_oss_bucket().get_object(key).read()
-            data = json.loads(raw.decode("utf-8"))
-        except Exception:
-            return None
+    data = _load_play_manifest(cache_root, job_id)
     if data is None:
         return None
     try:
-        data = _align_manifest_dict(job_id, data)
         bundle = data.get("bundle") or {}
         m_status = (data.get("status") or "done").lower()
-        frame_count = _optional_int(bundle.get("frame_count"))
+        frame_count = _optional_frame_count(bundle.get("frame_count"))
         frames_done = _optional_int(bundle.get("frames_available"))
         if frames_done is None:
             frames_done = frame_count
+        duration_sec = (bundle.get("timeline") or {}).get("duration_sec")
+        # Cannot confirm OSS objects — do not advertise a local/OSS claim.
+        if data.get("cache_align_failed"):
+            return {
+                "job_id": data.get("job_id", job_id),
+                "status": "processing",
+                "frame_count": frame_count,
+                "frames_done": None,
+                "playable": False,
+                "cached": False,
+                "duration_sec": duration_sec,
+                "play_base": data.get("play_base") or None,
+                "_manifest_status": "partial",
+                "cache_aligned": False,
+            }
         # Ghost cache: aligned to 0 frames → never report ready/cached.
         if frames_done is not None and frames_done <= 0 and data.get("cache_aligned"):
             return {
@@ -295,7 +347,7 @@ def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
                 "frames_done": 0,
                 "playable": False,
                 "cached": False,
-                "duration_sec": (bundle.get("timeline") or {}).get("duration_sec"),
+                "duration_sec": duration_sec,
                 "play_base": data.get("play_base") or None,
                 "_manifest_status": "partial",
                 "cache_aligned": True,
@@ -1043,15 +1095,16 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         # stale on-disk ready manifest from a previous force run.
         if rstatus in ("queued", "processing", "failed"):
             frames_done = _optional_int(fields.get("frames_done"))
-            frame_count = _optional_int(fields.get("frame_count"))
-            if frame_count is None:
-                frame_count = _optional_int(fields.get("frames_total"))
+            frame_count = _optional_frame_count(
+                fields.get("frame_count"),
+                fields.get("frames_total"),
+            )
             if summary and rstatus == "processing":
                 avail = summary.get("frames_done")
                 if avail is not None and (frames_done is None or avail > frames_done):
                     frames_done = avail
                 if frame_count is None:
-                    frame_count = summary.get("frame_count")
+                    frame_count = _optional_frame_count(summary.get("frame_count"))
 
             playable_flag = fields.get("playable")
             playable = str(playable_flag).lower() in ("1", "true", "yes")
@@ -1231,10 +1284,9 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                     break
                 status = (fields.get("status") or "unknown").lower()
                 done = _optional_int(fields.get("frames_done")) or 0
-                total = (
-                    _optional_int(fields.get("frame_count"))
-                    or _optional_int(fields.get("frames_total"))
-                    or 0
+                total = _optional_frame_count(
+                    fields.get("frame_count"),
+                    fields.get("frames_total"),
                 )
                 pct = job_progress_percent(fields)
                 playable = str(fields.get("playable") or "").lower() in (
@@ -1246,7 +1298,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                     "job_id": job_id,
                     "status": status,
                     "frames_done": done,
-                    "frame_count": total or None,
+                    "frame_count": total,
                     "percent": pct,
                     "playable": playable,
                     "play_base": fields.get("play_base") or None,
@@ -1321,15 +1373,16 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
 
         if fields:
             frames_done = _optional_int(fields.get("frames_done"))
-            frame_count = _optional_int(fields.get("frame_count"))
-            if frame_count is None:
-                frame_count = _optional_int(fields.get("frames_total"))
+            frame_count = _optional_frame_count(
+                fields.get("frame_count"),
+                fields.get("frames_total"),
+            )
             if summary:
                 avail = summary.get("frames_done")
                 if avail is not None and (frames_done is None or avail > frames_done):
                     frames_done = avail
                 if frame_count is None:
-                    frame_count = summary.get("frame_count")
+                    frame_count = _optional_frame_count(summary.get("frame_count"))
             if frames_done is None and frame_count is not None and summary and summary.get("status") == "ready":
                 frames_done = frame_count
 
@@ -1702,13 +1755,14 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         self._send_err(404, "not found")
 
     def _handle_signed_media(self, job_id: str):
-        """Batch-sign player-bin segment/frame GET URLs on the public OSS endpoint.
+        """Batch-sign player-bin segment GET URLs on the public OSS endpoint.
 
         Query:
-          starts=0,30,60          explicit segment/frame indices
+          starts=0,30,60          explicit segment indices
           start=0&count=8&step=30 range form (defaults step=SEGMENT_FRAMES)
-          kind=segments|frames    default segments
+          kind=segments           only; frames are not stored on OSS
         Browser should fetch returned HTTPS URLs directly (CORS on bucket required).
+        Out-of-range starts are omitted (see `skipped`); they are not signed.
         """
         if not self._oss_cache_enabled():
             self._send_json(503, {"error": "OSS_CACHE disabled"})
@@ -1719,8 +1773,14 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             qs = parse_qs(self.path.split("?", 1)[1], keep_blank_values=False)
 
         kind = (qs.get("kind", ["segments"])[0] or "segments").strip().lower()
-        if kind not in ("segments", "frames"):
-            self._send_err(400, "kind must be segments or frames")
+        if kind == "frames":
+            self._send_err(
+                400,
+                "kind=frames is not stored on OSS play cache; use kind=segments",
+            )
+            return
+        if kind != "segments":
+            self._send_err(400, "kind must be segments")
             return
 
         starts: list[int] = []
@@ -1756,6 +1816,40 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                 self._send_err(400, "negative start")
                 return
 
+        man = _load_play_manifest(self.cache_root, job_id)
+        if man is None:
+            self._send_err(404, "manifest not found")
+            return
+        if man.get("cache_align_failed"):
+            self._send_retry(425, "play cache not aligned yet", retry_after=1)
+            return
+        if man.get("cache_aligned") and (
+            _optional_int((man.get("bundle") or {}).get("frames_available")) or 0
+        ) <= 0:
+            self._send_err(404, "play cache missing or not contiguous from frame 0")
+            return
+
+        from oss_cache_gc import filter_playable_segment_starts
+
+        avail = _optional_int((man.get("bundle") or {}).get("frames_available"))
+        kept, skipped = filter_playable_segment_starts(
+            starts,
+            frames_available=avail,
+            segment_frames=_segment_frames(),
+        )
+        if not kept:
+            self._send_json(
+                200,
+                {
+                    "job_id": job_id,
+                    "kind": kind,
+                    "expires_in": int(os.environ.get("OSS_SIGN_EXPIRES", "7200")),
+                    "items": [],
+                    "skipped": skipped,
+                },
+            )
+            return
+
         expires = int(os.environ.get("OSS_SIGN_EXPIRES", "7200"))
         try:
             from job_status import touch_job
@@ -1767,9 +1861,9 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                 pass
 
             items = []
-            for s in starts:
+            for s in kept:
                 name = f"{s:06d}.bin"
-                key = oss_cache_key(job_id, kind, name)
+                key = oss_cache_key(job_id, "segments", name)
                 url = sign_oss_url(key, expires=expires)
                 if "-internal." in url:
                     self._send_json(
@@ -1786,15 +1880,15 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": f"sign failed: {e}"})
             return
 
-        self._send_json(
-            200,
-            {
-                "job_id": job_id,
-                "kind": kind,
-                "expires_in": expires,
-                "items": items,
-            },
-        )
+        payload = {
+            "job_id": job_id,
+            "kind": kind,
+            "expires_in": expires,
+            "items": items,
+        }
+        if skipped:
+            payload["skipped"] = skipped
+        self._send_json(200, payload)
 
     def _owner_for_proxy(self, job_id: str) -> Optional[str]:
         """Return remote owner pod IP if we should reverse-proxy; else None."""
@@ -1869,7 +1963,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             return True
 
     def _oss_cache_enabled(self) -> bool:
-        return os.environ.get("OSS_CACHE", "0").lower() in ("1", "true", "yes", "on")
+        return _oss_cache_on()
 
     def _query_flag(self, name: str) -> bool:
         if "?" not in self.path:
@@ -1990,31 +2084,14 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         if owner and self._proxy_from_owner(owner, body=body):
             return
 
-        data = None
-        file_path = _resolve_under(self.cache_root, job_id, "manifest.json")
-        if file_path and file_path.is_file():
-            try:
-                data = json.loads(file_path.read_text(encoding="utf-8"))
-            except Exception as e:
-                log.warning("bad local manifest %s: %s", job_id, e)
-                data = None
-
-        if data is None and self._oss_cache_enabled():
-            try:
-                from sview_worker import get_oss_bucket, oss_cache_key
-
-                key = oss_cache_key(job_id, "manifest.json")
-                raw = get_oss_bucket().get_object(key).read()
-                data = json.loads(raw.decode("utf-8"))
-            except Exception as e:
-                log.debug("oss manifest miss %s: %s", job_id, e)
-                data = None
-
+        data = _load_play_manifest(self.cache_root, job_id)
         if data is None:
             self._send_err(404, "file not found")
             return
+        if data.get("cache_align_failed"):
+            self._send_retry(425, "play cache not aligned yet", retry_after=1)
+            return
 
-        data = _align_manifest_dict(job_id, data)
         # After cancel/GC/hole: nothing contiguous → 404 so FE cannot start on ghost cache.
         avail = _optional_int((data.get("bundle") or {}).get("frames_available"))
         if data.get("cache_aligned") and (avail is None or avail <= 0):

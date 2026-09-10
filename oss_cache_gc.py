@@ -142,6 +142,38 @@ def contiguous_oss_frames(
     )
 
 
+def filter_playable_segment_starts(
+    starts: list[int],
+    *,
+    frames_available: Optional[int],
+    segment_frames: int = 30,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Keep OSS segment starts that exist for the advertised playable prefix.
+
+    A start is playable when it is a non-negative multiple of segment_frames
+    and strictly less than frames_available (last object is
+    floor((avail-1)/seg)*seg). Out-of-range starts are skipped, not signed.
+    """
+    seg_n = max(1, int(segment_frames or 30))
+    kept: list[int] = []
+    skipped: list[dict[str, Any]] = []
+    for s in starts:
+        try:
+            idx = int(s)
+        except (TypeError, ValueError):
+            skipped.append({"start": s, "reason": "invalid"})
+            continue
+        if idx < 0:
+            skipped.append({"start": idx, "reason": "negative"})
+        elif (idx % seg_n) != 0:
+            skipped.append({"start": idx, "reason": "unaligned"})
+        elif frames_available is not None and idx >= int(frames_available):
+            skipped.append({"start": idx, "reason": "not_ready"})
+        else:
+            kept.append(idx)
+    return kept, skipped
+
+
 def oss_segment_hole(starts: set[int]) -> bool:
     """True if objects exist but segment 0 is missing (orphaned tail / partial Lifecycle)."""
     return bool(starts) and 0 not in starts
@@ -218,7 +250,8 @@ def align_manifest_to_oss(
 ) -> dict:
     """Clamp manifest frames_available to contiguous OSS segments (fixes ghost tails).
 
-    If OSS listing fails, returns manifest unchanged.
+    If OSS listing fails, sets cache_align_failed so callers must not advertise
+    the unclamped local/OSS claim (Master returns 425 instead of a ghost tail).
     """
     if not isinstance(manifest, dict):
         return manifest
@@ -239,7 +272,10 @@ def align_manifest_to_oss(
 
     starts = list_oss_segment_starts(job_id)
     if starts is None:
+        manifest["cache_align_failed"] = True
+        manifest["cache_align_reason"] = "oss_list_failed"
         return manifest
+    manifest.pop("cache_align_failed", None)
 
     aligned = contiguous_frames_from_starts(
         starts, segment_frames=seg_n, claimed=claimed_i

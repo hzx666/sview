@@ -40,7 +40,7 @@ oss://{bucket}/player-bin/{job_id}/segments/000000.bin
    - 驱逐时 **整前缀删除** `player-bin/{job_id}/`，并清 Redis `frames_done/playable/play_base`
 3. **取消 / force 重提**：同样 purge 本地 `/cache/{job_id}` + OSS 前缀 + Redis 进度，避免「manifest 虚高、早期 segment 404」
 4. Worker 开转前会先 wipe 该 job 的 OSS 播放缓存，防止 Lifecycle/中断留下的尾段空洞
-5. Master 读 manifest 时按 OSS **从 0 起连续 segment** 对齐 `frames_available`；发现空洞则压到真实可播帧（常为 0）并避免当 ready
+5. Master 读 manifest 时 **优先 OSS 对象**（避免本地虚高），再按从 0 起连续 segment 对齐；list 失败返回 425，不放行未确认的 `frames_available`
 6. 控制台 Lifecycle 仍可做兜底：见 [oss-lifecycle-player-bin.md](../deploy/oss-lifecycle-player-bin.md)（注意按修改时间删对象可能先删早期段，务必依赖上述对齐）
 
 浏览器播媒体（私有 Bucket）——两套 endpoint，不要混用：

@@ -25,8 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from bench_types import BENCH_TYPES, list_bench_types
-from sview_logging import setup_logging
+from sview.jobs.bench_types import BENCH_TYPES, list_bench_types
+from sview.logging_setup import setup_logging
 
 log = setup_logging("bench_online")
 

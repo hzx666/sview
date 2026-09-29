@@ -85,6 +85,43 @@ def _teleop_robot_and_rel(key: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def ingest_family(raw_path: str) -> str:
+    """Which ingest pipeline this source belongs to.
+
+    Returns ``head_cam`` | ``teleop`` | ``unknown``.
+    Path wins: ``ego_human_data/head_cam`` is always head-ring protobuf;
+    ``teleoperation/{Orin,Agilex,...}`` is always teleop (never protobuf fallback).
+    ``unknown`` is a file copied off the mount tree (CLI); callers may auto-detect.
+    """
+    kind, _mount, _rel = classify_source(raw_path)
+    if kind in ("head_cam", "legacy"):
+        return "head_cam"
+    if kind == "orin":
+        return "teleop"
+    key = _strip_oss_scheme(raw_path.strip().replace("\\", "/"))
+    if _relative_after_prefix(key, _HEAD_CAM_KEY_PREFIXES) is not None:
+        return "head_cam"
+    if _teleop_robot_and_rel(key) is not None:
+        return "teleop"
+    low = f"/{key.lower().strip('/')}/"
+    if "/head_cam/" in low or "/head-cam/" in low or "/head-data/" in low:
+        return "head_cam"
+    if "/teleoperation/" in low:
+        return "teleop"
+    return "unknown"
+
+
+def teleop_robot(raw_path: str) -> Optional[str]:
+    """Orin / Agilex / Astribot / Franka / Unitree, or None."""
+    kind, _mount, rel = classify_source(raw_path)
+    if kind == "orin" and rel:
+        name = rel.split("/")[0]
+        if name in _TELEOP_ROBOTS:
+            return name
+    hit = _teleop_robot_and_rel(_strip_oss_scheme(raw_path.strip().replace("\\", "/")))
+    return hit[0] if hit else None
+
+
 def classify_source(raw_path: str) -> Tuple[str, Path, str]:
     """
     Returns (kind, mount_root, relative).
@@ -168,3 +205,4 @@ if __name__ == "__main__":
         print(s)
         print(" ->", source_to_local(s))
         print("   ", classify_source(s))
+        print("   family=", ingest_family(s), "robot=", teleop_robot(s))

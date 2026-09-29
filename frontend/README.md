@@ -58,7 +58,8 @@ http(s)://<master-host>:8080
 
 也可只填已有 **Job ID**，点「仅加载」。
 
-进度：`GET /api/jobs/{id}/events`（SSE）。本页默认 SSE-only，失败直接报错（排查代理）；对接方可自行加轮询回退。  
+进度：`GET /api/jobs/{id}/events`（SSE）。连接失败或服务端约 300 秒结束时，
+本页会退避轮询 `GET /api/jobs/{id}`。
 长播会 touch，避免缓存被 GC。
 
 ### API 摘要

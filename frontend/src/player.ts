@@ -1,11 +1,13 @@
 import type { Channel, Manifest } from "./api";
 import {
-  CHANNELS,
   FramePendingError,
   SviewApi,
   framesAvailable,
   isFramePendingError,
   isManifestComplete,
+  manifestFps,
+  playChannels,
+  streamLabel,
 } from "./api";
 import {
   parseBundle,
@@ -48,10 +50,14 @@ type CamState = {
   description: Uint8Array | null;
   codedWidth: number;
   codedHeight: number;
+  /** Timeline generation this decoder is allowed to present. */
+  epoch: number;
 };
 
 /** How many segments ahead of the playhead to prefetch (Vite/Master proxy is slow). */
 const PREFETCH_SEGMENTS = 8;
+/** Sparse encode keeps a short forward window; the server continues it. */
+const ENCODE_PREFETCH_SEGMENTS = 3;
 /** Keep roughly this many segments of frame bundles in memory. */
 const CACHE_SEGMENTS = 16;
 /** Segments to fully cache before autoplay (reduces start-of-play underruns). */
@@ -69,10 +75,29 @@ const FRONTIER_PAD_FRAMES = 90; // ~3s @ 30fps
 const FRONTIER_RESUME_FRAMES = 150; // ~5s @ 30fps
 const MANIFEST_POLL_MS = 1000;
 
+function isAbortError(e: unknown): boolean {
+  return e instanceof DOMException
+    ? e.name === "AbortError"
+    : e instanceof Error && e.name === "AbortError";
+}
+
 function isWindowsPlatform(): boolean {
   const nav = navigator as Navigator & { userAgentData?: { platform?: string } };
   const p = nav.userAgentData?.platform || navigator.platform || "";
   return /win/i.test(p);
+}
+
+export function sharedClientId(): string {
+  const key = "sview.client_id";
+  try {
+    const current = sessionStorage.getItem(key);
+    if (current) return current;
+    const created = crypto.randomUUID();
+    sessionStorage.setItem(key, created);
+    return created;
+  } catch {
+    return crypto.randomUUID();
+  }
 }
 
 /** Resolve accel: URL ?decode=software|hardware|auto, else Windows→software. */
@@ -96,7 +121,14 @@ export class SviewPlayer {
   private cams = new Map<Channel, CamState>();
   private cache = new Map<number, ArrayBuffer>();
   /** In-flight segment loads keyed by segment start index. */
-  private segmentInflight = new Map<number, Promise<void>>();
+  private segmentInflight = new Map<
+    number,
+    { epoch: number; promise: Promise<void> }
+  >();
+  private sparseReadyInflight = new Map<
+    number,
+    { epoch: number; promise: Promise<void> }
+  >();
   private index = 0;
   private playing = false;
   private raf = 0;
@@ -111,9 +143,16 @@ export class SviewPlayer {
   private advancing = false;
   /** After frontier underrun: hold until resume lead is rebuilt. */
   private frontierHold = false;
+  /** Monotonic generation shared with sparse encode requests. */
+  private seekEpoch = 0;
+  private seekAbort: AbortController | null = null;
+  private seekSerial: Promise<unknown> = Promise.resolve();
+  private resumeAfterSeek = false;
+  private readonly clientId = sharedClientId();
+  private activeRequestId = "";
 
   constructor(
-    canvases: Record<Channel, HTMLCanvasElement>,
+    canvases: Record<string, HTMLCanvasElement>,
     cb: PlayerCallbacks = {},
     opts: { decodeAccel?: DecodeAccel } = {},
   ) {
@@ -123,12 +162,17 @@ export class SviewPlayer {
     this.api = new SviewApi("");
   }
 
-  private attachCanvases(canvases: Record<Channel, HTMLCanvasElement>) {
+  setCanvases(canvases: Record<string, HTMLCanvasElement>) {
+    this.attachCanvases(canvases);
+  }
+
+  private attachCanvases(canvases: Record<string, HTMLCanvasElement>) {
     this.resetDecoders();
     this.cams.clear();
     const desync = !isWindowsPlatform();
-    for (const ch of CHANNELS) {
+    for (const ch of Object.keys(canvases)) {
       const canvas = canvases[ch];
+      if (!canvas) continue;
       this.cams.set(ch, {
         decoder: null,
         canvas,
@@ -143,12 +187,14 @@ export class SviewPlayer {
         description: null,
         codedWidth: 0,
         codedHeight: 0,
+        epoch: this.seekEpoch,
       });
     }
   }
 
   private channelList(): Channel[] {
-    return [...CHANNELS];
+    if (this.cams.size) return [...this.cams.keys()];
+    return playChannels(this.manifest);
   }
 
   get Manifest() {
@@ -165,11 +211,16 @@ export class SviewPlayer {
 
   /** Frames currently on disk / safe to request (encoder frontier). */
   get Available() {
+    if (this.Sparse) return this.manifest?.bundle.frame_count ?? 0;
     return framesAvailable(this.manifest);
   }
 
   get Complete() {
     return isManifestComplete(this.manifest);
+  }
+
+  get Sparse() {
+    return this.manifest?.publish_mode === "sparse";
   }
 
   /**
@@ -178,6 +229,7 @@ export class SviewPlayer {
    */
   private playLimit(): number {
     const raw = this.Available;
+    if (this.Sparse) return this.manifest?.bundle.frame_count ?? raw;
     if (this.Complete) return raw;
     return Math.max(0, raw - FRONTIER_PAD_FRAMES);
   }
@@ -193,9 +245,11 @@ export class SviewPlayer {
     opts: { mediaBase?: string } = {},
   ) {
     this.stop();
+    this.cancelSeek();
     this.resetDecoders();
     this.cache.clear();
     this.segmentInflight.clear();
+    this.sparseReadyInflight.clear();
     // Only use explicit mediaBase. Do NOT auto-switch to manifest.play_base:
     // private buckets block anonymous GET (403); Master 302 → signed OSS instead.
     const mediaBase = (opts.mediaBase || "").replace(/\/+$/, "") || "";
@@ -205,11 +259,15 @@ export class SviewPlayer {
       mediaBase ? `Loading manifest from OSS…` : "Loading manifest…",
     );
     this.manifest = manifest ?? (await this.api.fetchManifest(jobId));
+    this.seekEpoch = Math.max(
+      this.seekEpoch,
+      this.manifest.segment_epoch ?? 0,
+    );
     const st = (this.manifest.status || "done").toLowerCase();
     if (st !== "done" && st !== "partial" && st !== "ready") {
       throw new Error(`job status=${this.manifest.status}`);
     }
-    const fr = this.manifest.streams.camera_fr?.fps || 30;
+    const fr = manifestFps(this.manifest);
     this.fps = fr > 0 ? fr : 30;
     this.index = 0;
     const avail = this.Available;
@@ -221,6 +279,10 @@ export class SviewPlayer {
         via,
     );
     this.cb.onManifest?.(this.manifest);
+    if (this.Sparse) {
+      const epoch = this.nextSeekEpoch();
+      await this.ensureSparseSegmentReady(0, epoch, this.seekAbort!.signal, true);
+    }
     await this.ensureConfigured();
     if (avail < 1) {
       throw new Error("还没有可播放的帧，请稍后再试");
@@ -254,9 +316,16 @@ export class SviewPlayer {
     const starts: number[] = [];
     for (let s = 0; s < n; s++) {
       const start = s * segN;
-      if (start >= this.Available) break;
-      const fullReady = this.Available >= start + segN;
-      const finalPartial = this.Complete && this.Available > start;
+      const total = this.manifest.bundle.frame_count;
+      if (start >= total) break;
+      if (this.Sparse && !this.isSparseSegmentReady(start)) break;
+      if (!this.Sparse && start >= this.Available) break;
+      const fullReady = this.Sparse
+        ? this.isSparseSegmentReady(start)
+        : this.Available >= start + segN;
+      const finalPartial = this.Sparse
+        ? this.isSparseSegmentReady(start)
+        : this.Complete && this.Available > start;
       if (!fullReady && !finalPartial) break;
       starts.push(start);
     }
@@ -266,7 +335,13 @@ export class SviewPlayer {
       });
     }
     for (const start of starts) {
-      tasks.push(this.ensureSegment(start, { quiet: true }));
+      tasks.push(
+        this.ensureSegment(start, {
+          quiet: true,
+          epoch: this.seekEpoch,
+          signal: this.Sparse ? this.seekAbort?.signal : undefined,
+        }),
+      );
     }
     await Promise.all(tasks);
     void this.prefetchAround(0);
@@ -278,6 +353,7 @@ export class SviewPlayer {
     this.waitingForFrames = false;
     this.advancing = false;
     this.frontierHold = false;
+    this.resumeAfterSeek = false;
     this.lastTick = performance.now();
     const loop = (now: number) => {
       if (!this.playing || !this.manifest) return;
@@ -313,7 +389,7 @@ export class SviewPlayer {
     this.raf = requestAnimationFrame(loop);
   }
 
-  pause() {
+  private haltPlayback() {
     this.playing = false;
     this.waitingForFrames = false;
     this.advancing = false;
@@ -322,44 +398,120 @@ export class SviewPlayer {
     this.raf = 0;
   }
 
+  pause() {
+    this.resumeAfterSeek = false;
+    this.haltPlayback();
+  }
+
   stop() {
     this.pause();
+    this.cancelSeek();
     this.stopManifestPolling();
   }
 
-  async seek(index: number) {
-    if (!this.manifest) return;
-    const avail = this.Available;
-    const clamped = Math.max(0, Math.min(index, Math.max(0, avail - 1)));
-    if (clamped < index) {
-      this.cb.onStatus?.(
-        `加载中… 目标 ${index}，当前仅可用到 ${Math.max(0, avail - 1)}`,
-      );
+  private cancelSeek() {
+    this.cancelActiveRequest();
+    this.seekAbort?.abort();
+    this.seekAbort = null;
+    this.seekEpoch += 1;
+    this.segmentInflight.clear();
+    this.sparseReadyInflight.clear();
+  }
+
+  private nextSeekEpoch(): number {
+    this.cancelActiveRequest();
+    this.seekAbort?.abort();
+    this.seekAbort = new AbortController();
+    this.seekEpoch = Math.max(
+      this.seekEpoch + 1,
+      (this.manifest?.segment_epoch ?? 0) + 1,
+    );
+    this.segmentInflight.clear();
+    this.sparseReadyInflight.clear();
+    return this.seekEpoch;
+  }
+
+  private cancelActiveRequest() {
+    const requestId = this.activeRequestId;
+    this.activeRequestId = "";
+    if (!requestId || !this.jobId) return;
+    void this.api.cancelEncodeRequest(this.jobId, requestId).catch(() => {
+      /* request may already be ready or expired */
+    });
+  }
+
+  private assertCurrent(epoch: number, signal?: AbortSignal) {
+    if (signal?.aborted || epoch !== this.seekEpoch) {
+      throw new DOMException("Aborted", "AbortError");
     }
-    const keys = this.manifest.bundle.key_frame_indices || [0];
-    let k = keys[0] ?? 0;
-    for (const ki of keys) {
-      if (ki <= clamped) k = ki;
-      else break;
+  }
+
+  /** Latest seek wins; superseded seeks never cache or present a frame. */
+  async seek(index: number): Promise<boolean> {
+    if (!this.manifest) return false;
+    const wasPlaying = this.playing || this.resumeAfterSeek;
+    this.resumeAfterSeek = wasPlaying;
+    this.haltPlayback();
+    const epoch = this.nextSeekEpoch();
+    const signal = this.seekAbort!.signal;
+    const run = async (): Promise<boolean> => {
+      const total = this.manifest?.bundle.frame_count ?? 0;
+      const clamped = Math.max(0, Math.min(index, Math.max(0, total - 1)));
+      if (!this.Sparse && clamped >= this.Available) {
+        this.cb.onStatus?.(
+          `第 ${clamped} 帧还没转完，当前可播到 ${Math.max(0, this.Available - 1)}。转到这一帧再跳过去`,
+        );
+        return false;
+      }
+      if (this.Sparse) {
+        this.cb.onStatus?.(`请求稀疏编码第 ${clamped} 帧…`);
+        await this.ensureSparseSegmentReady(clamped, epoch, signal, true);
+      }
+      this.assertCurrent(epoch, signal);
+      const segStart = segmentStartFor(clamped, this.segmentFrames());
+      // Sparse segments are independently decodable from their segment head.
+      const keys = this.Sparse
+        ? [segStart]
+        : this.manifest!.bundle.key_frame_indices || [0];
+      let k = keys[0] ?? 0;
+      for (const ki of keys) {
+        if (ki <= clamped) k = ki;
+        else break;
+      }
+      this.cb.onStatus?.(`Seek ${clamped} via keyframe ${k}`);
+      await this.resetAllDecoders(epoch, signal);
+      this.assertCurrent(epoch, signal);
+      for (const cam of this.cams.values()) cam.needsKeyframe = true;
+      for (let i = k; i <= clamped; i++) {
+        await this.decodeFrame(i, i === clamped, epoch, signal);
+      }
+      this.assertCurrent(epoch, signal);
+      this.index = clamped;
+      if (this.resumeAfterSeek) {
+        this.resumeAfterSeek = false;
+        this.play();
+      }
+      return true;
+    };
+    const result = this.seekSerial.then(run, run);
+    this.seekSerial = result.catch(() => undefined);
+    try {
+      return await result;
+    } catch (e) {
+      if (isAbortError(e)) return false;
+      throw e;
     }
-    this.pause();
-    this.cb.onStatus?.(`Seek ${clamped} via keyframe ${k}`);
-    // Drop in-flight HW frames from the old timeline — avoids 花屏/残影.
-    await this.resetAllDecoders();
-    for (const cam of this.cams.values()) cam.needsKeyframe = true;
-    for (let i = k; i <= clamped; i++) {
-      await this.decodeFrame(i, i === clamped);
-    }
-    this.index = clamped;
   }
 
   /** Flush/close every decoder and rebind with last (or software) config. */
-  private async resetAllDecoders() {
+  private async resetAllDecoders(epoch = this.seekEpoch, signal?: AbortSignal) {
     for (const ch of this.channelList()) {
+      this.assertCurrent(epoch, signal);
       const cam = this.cams.get(ch);
       if (!cam) continue;
       await this.resetDecoder(ch, cam, cam.forceSoftware);
     }
+    this.assertCurrent(epoch, signal);
   }
 
   private async resetDecoder(
@@ -412,9 +564,14 @@ export class SviewPlayer {
     const next = this.index + 1;
     const raw = this.Available;
     const limit = this.playLimit();
+    if (this.Sparse && next >= this.manifest.bundle.frame_count) {
+      this.pause();
+      this.cb.onStatus?.("Ended");
+      return false;
+    }
 
     // Progressive: hold playhead behind the encoder; hysteresis avoids chatter.
-    if (!this.Complete) {
+    if (!this.Sparse && !this.Complete) {
       const needLead = this.frontierHold
         ? FRONTIER_RESUME_FRAMES
         : FRONTIER_PAD_FRAMES;
@@ -448,7 +605,7 @@ export class SviewPlayer {
       }
     }
 
-    if (next >= raw) {
+    if (!this.Sparse && next >= raw) {
       if (this.Complete) {
         this.pause();
         this.cb.onStatus?.("Ended");
@@ -481,11 +638,27 @@ export class SviewPlayer {
     }
 
     try {
+      if (this.Sparse && !this.isSparseSegmentReady(next)) {
+        this.waitingForFrames = true;
+        this.cb.onStatus?.(`请求后续稀疏窗口… 第 ${next} 帧`);
+        try {
+          await this.ensureSparseSegmentReady(
+            next,
+            this.seekEpoch,
+            this.seekAbort?.signal,
+            true,
+          );
+        } finally {
+          this.waitingForFrames = false;
+        }
+        if (!this.playing) return false;
+      }
       await this.ensureSegmentBoundary(next);
       await this.showFrame(next);
       void this.prefetchAround(next);
       return true;
     } catch (e) {
+      if (isAbortError(e)) return false;
       if (isFramePendingError(e)) {
         this.frontierHold = true;
         this.cb.onStatus?.(`加载中… 等待帧 ${e.index}`);
@@ -505,27 +678,53 @@ export class SviewPlayer {
     const curStart = segmentStartFor(index, segN);
     const pos = index - curStart;
     const nextStart = curStart + segN;
+    const epoch = this.seekEpoch;
+    const signal = this.seekAbort?.signal;
 
     // Always keep current segment warm.
     if (!this.segmentCachedThrough(curStart, segN)) {
-      await this.ensureSegment(curStart, { quiet: true });
+      await this.ensureSegment(curStart, { quiet: true, epoch, signal });
     }
 
-    if (nextStart >= this.Available) return;
-    const fullReady = this.Available >= nextStart + segN;
-    const finalPartial = this.Complete && this.Available > nextStart;
+    const total = this.manifest?.bundle.frame_count ?? this.Available;
+    if (nextStart >= total) return;
+    if (this.Sparse && !this.isSparseSegmentReady(nextStart)) {
+      // Queue the next sparse window before playback reaches the boundary.
+      if (pos === Math.floor(segN / 2)) {
+        void this.ensureSparseSegmentReady(
+          nextStart,
+          epoch,
+          signal,
+          true,
+        ).catch(() => {
+          /* the boundary path retries and reports persistent failures */
+        });
+      }
+      return;
+    }
+    if (!this.Sparse && nextStart >= this.Available) return;
+    const fullReady = this.Sparse
+      ? this.isSparseSegmentReady(nextStart)
+      : this.Available >= nextStart + segN;
+    const finalPartial = this.Sparse
+      ? this.isSparseSegmentReady(nextStart)
+      : this.Complete && this.Available > nextStart;
     if (!fullReady && !finalPartial) return;
 
     if (pos >= segN - BOUNDARY_AWAIT_FRAMES) {
       if (!this.segmentCachedThrough(nextStart, segN)) {
-        await this.ensureSegment(nextStart, { quiet: true });
+        await this.ensureSegment(nextStart, { quiet: true, epoch, signal });
       }
     } else if (
       pos >= Math.floor(segN / 2) &&
       !this.segmentCachedThrough(nextStart, segN) &&
       !this.segmentInflight.has(nextStart)
     ) {
-      void this.ensureSegment(nextStart, { quiet: true }).catch(() => {});
+      void this.ensureSegment(nextStart, {
+        quiet: true,
+        epoch,
+        signal,
+      }).catch(() => {});
     }
   }
 
@@ -559,9 +758,20 @@ export class SviewPlayer {
     }
   }
 
-  async refreshManifest() {
+  async refreshManifest(opts: { epoch?: number; signal?: AbortSignal } = {}) {
     if (!this.jobId) return;
-    const next = await this.api.fetchManifest(this.jobId);
+    // Polling already retries every second; avoid overlapping per-request 425 loops.
+    const next = await this.api.fetchManifest(this.jobId, {
+      retries: 0,
+      signal: opts.signal,
+    });
+    if (opts.epoch != null) this.assertCurrent(opts.epoch, opts.signal);
+    if (
+      (next.manifest_revision ?? 0) <
+      (this.manifest?.manifest_revision ?? 0)
+    ) {
+      return;
+    }
     this.manifest = next;
     this.cb.onManifest?.(next);
     if (isManifestComplete(next)) {
@@ -593,6 +803,7 @@ export class SviewPlayer {
       cam.description = null;
       cam.codedWidth = 0;
       cam.codedHeight = 0;
+      cam.epoch = this.seekEpoch;
     }
     this.hwMode = "unknown";
   }
@@ -601,6 +812,96 @@ export class SviewPlayer {
     const gop = this.manifest?.bundle.gop_size;
     if (typeof gop === "number" && gop > 0) return gop;
     return SEGMENT_FRAMES;
+  }
+
+  private isSparseSegmentReady(index: number): boolean {
+    if (!this.Sparse || !this.manifest) return true;
+    const segN = this.segmentFrames();
+    const start = segmentStartFor(index, segN);
+    const endExclusive = Math.min(
+      this.manifest.bundle.frame_count,
+      start + segN,
+    );
+    return (this.manifest.bundle.available_ranges ?? []).some(
+      ([a, b]) => start >= a && endExclusive <= b,
+    );
+  }
+
+  private waitAbortable(ms: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = window.setTimeout(resolve, ms);
+      signal?.addEventListener(
+        "abort",
+        () => {
+          window.clearTimeout(timer);
+          reject(new DOMException("Aborted", "AbortError"));
+        },
+        { once: true },
+      );
+    });
+  }
+
+  private ensureSparseSegmentReady(
+    frameIndex: number,
+    epoch: number,
+    signal?: AbortSignal,
+    request = false,
+  ): Promise<void> {
+    if (!this.Sparse) return Promise.resolve();
+    const start = segmentStartFor(frameIndex, this.segmentFrames());
+    const existing = this.sparseReadyInflight.get(start);
+    if (existing?.epoch === epoch) return existing.promise;
+    const promise = this.waitForSparseSegment(
+      frameIndex,
+      epoch,
+      signal,
+      request,
+    ).finally(() => {
+      if (this.sparseReadyInflight.get(start)?.promise === promise) {
+        this.sparseReadyInflight.delete(start);
+      }
+    });
+    this.sparseReadyInflight.set(start, { epoch, promise });
+    return promise;
+  }
+
+  private async waitForSparseSegment(
+    frameIndex: number,
+    epoch: number,
+    signal?: AbortSignal,
+    request = false,
+  ): Promise<void> {
+    this.assertCurrent(epoch, signal);
+    if (request || !this.isSparseSegmentReady(frameIndex)) {
+      const response = await this.api.requestEncode(
+        this.jobId,
+        {
+          frame_index: frameIndex,
+          prefetch_segments: ENCODE_PREFETCH_SEGMENTS,
+          client_epoch: epoch,
+          client_id: this.clientId,
+        },
+        signal,
+      );
+      this.assertCurrent(epoch, signal);
+      if (response.request_id && response.status !== "ready") {
+        this.activeRequestId = response.request_id;
+      }
+    }
+    const started = performance.now();
+    while (!this.isSparseSegmentReady(frameIndex)) {
+      this.assertCurrent(epoch, signal);
+      if (performance.now() - started > 2 * 60 * 1000) {
+        throw new Error(`等待稀疏段 ${segmentStartFor(frameIndex, this.segmentFrames())} 超时`);
+      }
+      await this.waitAbortable(400, signal);
+      await this.refreshManifest({ epoch, signal });
+    }
+    this.assertCurrent(epoch, signal);
+    this.activeRequestId = "";
   }
 
   private trimFrameCache() {
@@ -619,7 +920,10 @@ export class SviewPlayer {
   }
 
   private segmentCachedThrough(start: number, segN: number): boolean {
-    const end = Math.min(this.Available, start + segN);
+    const limit = this.Sparse
+      ? this.manifest?.bundle.frame_count ?? 0
+      : this.Available;
+    const end = Math.min(limit, start + segN);
     if (end <= start) return true;
     for (let i = start; i < end; i++) {
       if (!this.cache.has(i)) return false;
@@ -630,30 +934,45 @@ export class SviewPlayer {
   /** Load one transport segment into the frame cache (deduped). */
   private ensureSegment(
     startIndex: number,
-    opts: { retries?: number; quiet?: boolean } = {},
+    opts: {
+      retries?: number;
+      quiet?: boolean;
+      epoch?: number;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<void> {
     const segN = this.segmentFrames();
     const start = segmentStartFor(startIndex, segN);
     if (this.segmentCachedThrough(start, segN)) return Promise.resolve();
+    const epoch = opts.epoch ?? this.seekEpoch;
+    this.assertCurrent(epoch, opts.signal);
 
-    let p = this.segmentInflight.get(start);
-    if (!p) {
+    let entry = this.segmentInflight.get(start);
+    if (!entry || entry.epoch !== epoch) {
       // Sign a window ahead so boundary crossings don't wait on Master RTT.
       const signAhead: number[] = [];
       for (let i = 0; i <= PREFETCH_SEGMENTS; i++) {
         const s = start + i * segN;
-        if (s >= this.Available) break;
+        const total = this.manifest?.bundle.frame_count ?? this.Available;
+        if (s >= total) break;
+        if (this.Sparse && !this.isSparseSegmentReady(s)) continue;
+        if (!this.Sparse && s >= this.Available) break;
         signAhead.push(s);
       }
       const signP =
         this.api.preferSignedOss && signAhead.length
-          ? this.api.prefetchSignedSegmentUrls(this.jobId, signAhead).catch(() => {})
+          ? this.api
+              .prefetchSignedSegmentUrls(this.jobId, signAhead, opts.signal)
+              .catch((e) => {
+                if (isAbortError(e)) throw e;
+              })
           : Promise.resolve();
 
-      p = signP
+      const promise = signP
         .then(() =>
           this.api.fetchSegment(this.jobId, start, {
             retries: opts.retries,
+            signal: opts.signal,
             onWait: (segStart, attempt) => {
               if (opts.quiet) return;
               if (attempt === 0 || attempt % 4 === 0) {
@@ -663,24 +982,35 @@ export class SviewPlayer {
           }),
         )
         .then((buf) => {
+          this.assertCurrent(epoch, opts.signal);
           const parsed = parseSegment(buf);
           for (const [idx, frameBuf] of parsed.frames) {
+            this.assertCurrent(epoch, opts.signal);
             this.cache.set(idx, frameBuf);
           }
           this.trimFrameCache();
         })
         .finally(() => {
-          this.segmentInflight.delete(start);
+          if (this.segmentInflight.get(start)?.promise === promise) {
+            this.segmentInflight.delete(start);
+          }
         });
-      this.segmentInflight.set(start, p);
+      entry = { epoch, promise };
+      this.segmentInflight.set(start, entry);
     }
-    return p;
+    return entry.promise;
   }
 
-  private async getFrameBuf(index: number): Promise<ArrayBuffer> {
+  private async getFrameBuf(
+    index: number,
+    epoch = this.seekEpoch,
+    signal?: AbortSignal,
+  ): Promise<ArrayBuffer> {
+    this.assertCurrent(epoch, signal);
     const hit = this.cache.get(index);
     if (hit) return hit;
-    await this.ensureSegment(index);
+    await this.ensureSegment(index, { epoch, signal });
+    this.assertCurrent(epoch, signal);
     const after = this.cache.get(index);
     if (after) return after;
     throw new FramePendingError(index, 425);
@@ -691,24 +1021,37 @@ export class SviewPlayer {
     const segN = this.segmentFrames();
     const base = segmentStartFor(index, segN);
     const starts: number[] = [];
+    const total = this.manifest.bundle.frame_count;
     for (let s = 0; s <= PREFETCH_SEGMENTS; s++) {
       const start = base + s * segN;
-      if (start >= this.Available) break;
-      const fullReady = this.Available >= start + segN;
-      const finalPartial = this.Complete && this.Available > start;
+      if (start >= total) break;
+      if (this.Sparse && !this.isSparseSegmentReady(start)) continue;
+      if (!this.Sparse && start >= this.Available) break;
+      const fullReady = this.Sparse
+        ? this.isSparseSegmentReady(start)
+        : this.Available >= start + segN;
+      const finalPartial = this.Sparse
+        ? this.isSparseSegmentReady(start)
+        : this.Complete && this.Available > start;
       if (!fullReady && !finalPartial) break;
       starts.push(start);
     }
     if (starts.length && this.api.preferSignedOss) {
-      void this.api.prefetchSignedSegmentUrls(this.jobId, starts).catch(() => {
+      void this.api
+        .prefetchSignedSegmentUrls(this.jobId, starts, this.seekAbort?.signal)
+        .catch(() => {
         /* signed disabled → Master fallback inside fetchSegment */
-      });
+        });
     }
     for (const start of starts) {
       if (this.segmentCachedThrough(start, segN) || this.segmentInflight.has(start)) {
         continue;
       }
-      void this.ensureSegment(start, { quiet: true }).catch(() => {
+      void this.ensureSegment(start, {
+        quiet: true,
+        epoch: this.seekEpoch,
+        signal: this.seekAbort?.signal,
+      }).catch(() => {
         /* prefetch miss is fine */
       });
     }
@@ -725,6 +1068,7 @@ export class SviewPlayer {
     ].filter((v, i, a) => a.indexOf(v) === i);
     for (const idx of keys.slice(0, 8)) {
       if (idx >= this.Available) continue;
+      if (this.Sparse && !this.isSparseSegmentReady(idx)) continue;
       const buf = await this.getFrameBuf(idx);
       const parsed = parseBundle(buf);
       for (const ch of this.channelList()) {
@@ -743,9 +1087,13 @@ export class SviewPlayer {
     } catch {
       /* */
     }
+    const decoderEpoch = this.seekEpoch;
     const decoder = new VideoDecoder({
       output: (frame) => {
         try {
+          if (decoderEpoch !== this.seekEpoch || cam.epoch !== decoderEpoch) {
+            return;
+          }
           if (
             cam.canvas.width !== frame.displayWidth ||
             cam.canvas.height !== frame.displayHeight
@@ -778,7 +1126,7 @@ export class SviewPlayer {
         if (!cam.forceSoftware && cam.decodeErrors >= 2) {
           cam.forceSoftware = true;
           this.cb.onStatus?.(
-            `${ch.toUpperCase()} 硬解异常，降级软解… (${err.message})`,
+            `${streamLabel(ch)} 硬解异常，降级软解… (${err.message})`,
           );
           void this.resetDecoder(ch, cam, true).catch(() => {
             /* ensureConfigured later */
@@ -787,7 +1135,7 @@ export class SviewPlayer {
         }
 
         this.cb.onStatus?.(
-          `${ch.toUpperCase()} 解码异常，等待关键帧恢复… (${err.message})`,
+          `${streamLabel(ch)} 解码异常，等待关键帧恢复… (${err.message})`,
         );
         if (cam.decodeErrors >= 8) {
           this.cb.onError?.(
@@ -803,6 +1151,7 @@ export class SviewPlayer {
     cam.configured = true;
     cam.lastConfig = cfg;
     cam.needsKeyframe = true;
+    cam.epoch = decoderEpoch;
     const hw = cfg.hardwareAcceleration;
     if (hw === "prefer-software") cam.forceSoftware = true;
   }
@@ -879,8 +1228,8 @@ export class SviewPlayer {
 
     for (const ch of channels) {
       const sp = params[ch];
-      const cam = this.cams.get(ch)!;
-      if (!sp || cam.configured) continue;
+      const cam = this.cams.get(ch);
+      if (!sp || !cam || cam.configured) continue;
 
       const codec = codecFromSps(sp.sps);
       const description = buildAvcC(sp.sps, sp.pps);
@@ -919,7 +1268,8 @@ export class SviewPlayer {
   }
 
   private async recoverChannel(ch: Channel) {
-    const cam = this.cams.get(ch)!;
+    const cam = this.cams.get(ch);
+    if (!cam) return;
     if (cam.configured && cam.decoder) return;
     await this.resetDecoder(ch, cam, cam.forceSoftware || cam.decodeErrors >= 2);
   }
@@ -937,23 +1287,34 @@ export class SviewPlayer {
     });
   }
 
-  private async decodeFrame(index: number, render: boolean) {
+  private async decodeFrame(
+    index: number,
+    render: boolean,
+    epoch = this.seekEpoch,
+    signal?: AbortSignal,
+  ) {
+    this.assertCurrent(epoch, signal);
     if (![...this.cams.values()].some((c) => c.configured)) {
       await this.ensureConfigured();
     }
-    const buf = await this.getFrameBuf(index);
+    this.assertCurrent(epoch, signal);
+    const buf = await this.getFrameBuf(index, epoch, signal);
+    this.assertCurrent(epoch, signal);
     const parsed = parseBundle(buf);
     // Relative PTS — absolute monotonic ns confuses some HW decoders
     const tsUs = Math.round((index * 1_000_000) / this.fps);
 
     const waits: Promise<void>[] = [];
     for (const ch of this.channelList()) {
-      const cam = this.cams.get(ch)!;
+      this.assertCurrent(epoch, signal);
+      const cam = this.cams.get(ch);
+      if (!cam) continue;
       const au = parsed.streams[ch];
       if (!au?.length) continue;
       if (!cam.decoder || !cam.configured) {
         await this.recoverChannel(ch);
       }
+      this.assertCurrent(epoch, signal);
       if (!cam.decoder || cam.decoder.state !== "configured") continue;
 
       // Per-channel key detection — don't trust global header for chunk type.
@@ -987,12 +1348,12 @@ export class SviewPlayer {
         if (!cam.forceSoftware && cam.decodeErrors >= 2) {
           cam.forceSoftware = true;
           this.cb.onStatus?.(
-            `${ch.toUpperCase()} decode 失败，降级软解…`,
+            `${streamLabel(ch)} decode 失败，降级软解…`,
           );
           void this.resetDecoder(ch, cam, true);
         } else {
           this.cb.onStatus?.(
-            `${ch.toUpperCase()} decode 调用失败，将从关键帧恢复`,
+            `${streamLabel(ch)} decode 调用失败，将从关键帧恢复`,
           );
         }
       }
@@ -1000,6 +1361,7 @@ export class SviewPlayer {
     if (render && waits.length) {
       await Promise.all(waits);
     }
+    this.assertCurrent(epoch, signal);
     if (render) {
       this.index = index;
       this.cb.onFrame?.(index, parsed.header.timestamp_ns, parsed.imu);
@@ -1007,6 +1369,11 @@ export class SviewPlayer {
   }
 
   private async showFrame(index: number) {
-    await this.decodeFrame(index, true);
+    await this.decodeFrame(
+      index,
+      true,
+      this.seekEpoch,
+      this.seekAbort?.signal,
+    );
   }
 }

@@ -3,19 +3,31 @@ export type StreamMeta = {
   width: number;
   height: number;
   fps: number;
+  source_topic?: string;
+  source_codec?: string;
+  stored_codec?: string;
 };
 
 export type Manifest = {
   job_id: string;
   format: string;
+  publish_mode?: "progressive" | "sparse";
+  /** Latest sparse encode request accepted by the publisher. */
+  segment_epoch?: number;
+  /** Monotonic shared-cache publication revision. */
+  manifest_revision?: number;
   /** partial = still writing frames; done = complete */
   status: string;
   /** Optional OSS/CDN prefix for progressive play cache. */
   play_base?: string;
+  /** Seconds skipped from bag start (encode-from-T). */
+  origin_sec?: number;
   bundle: {
     frame_count: number;
     /** How many frames are on disk and fetchable (grows during progressive publish). */
     frames_available?: number;
+    /** Published sparse frame ranges using half-open [start, end) semantics. */
+    available_ranges?: [number, number][];
     gop_size: number;
     key_frame_indices: number[];
     timeline: {
@@ -35,7 +47,12 @@ export type BundleHeader = {
   key_frame: boolean;
   streams: Record<
     string,
-    { payload_offset: number; payload_length: number; is_null?: boolean }
+    {
+      payload_offset: number;
+      payload_length: number;
+      is_null?: boolean;
+      codec?: string;
+    }
   >;
   imu: { payload_offset: number; payload_length: number };
   events: { payload_offset: number; payload_length: number };
@@ -67,6 +84,19 @@ export type JobStatus = {
   percent?: number | null;
   cache_bytes?: number | null;
   last_access_at?: string | number | null;
+  origin_sec?: number | null;
+  publish_mode?: "progressive" | "sparse";
+  available_ranges?: [number, number][];
+  segments_ready_count?: number;
+  segment_epoch?: number;
+  encode_window?: [number, number] | null;
+  encode_status?: string | null;
+  encode_frontier?: number | null;
+  decode_start?: number | null;
+  input_frames?: number | null;
+  output_frames?: number | null;
+  cache_id?: string;
+  manifest_revision?: number;
 };
 
 export type JobStatsItem = {
@@ -87,15 +117,82 @@ export type JobStats = {
   jobs: JobStatsItem[];
 };
 
-/** Fixed four-up layout used by head-cam and Orin (mapped) outputs. */
+export type EncodeRequest = {
+  request_id: string;
+  job_id?: string;
+  status: string;
+  target_start?: number;
+  starts?: number[];
+  client_id?: string;
+  client_epoch?: number;
+  error?: string;
+};
+
+/** Head-cam four-up; teleop v2 uses Object.keys(manifest.streams) instead. */
 export const CHANNELS = ["rr", "fr", "rl", "fl"] as const;
-export type Channel = (typeof CHANNELS)[number];
+export type Channel = string;
+
+export function playChannels(m: Manifest | null | undefined): string[] {
+  if (!m?.streams) return [...CHANNELS];
+  const keys = Object.keys(m.streams);
+  if (!keys.length) return [...CHANNELS];
+  const format = (m.format || "").toLowerCase();
+  const v1Keys = CHANNELS.filter(
+    (ch) => `camera_${ch}` in m.streams || ch in m.streams,
+  );
+  if (format === "head_cam" || keys.every((k) => k.startsWith("camera_"))) {
+    return v1Keys.length ? v1Keys : [...CHANNELS];
+  }
+  if (v1Keys.length === keys.length && v1Keys.length > 0) {
+    return [...CHANNELS].filter((ch) => v1Keys.includes(ch));
+  }
+  return keys;
+}
+
+export function manifestFps(m: Manifest | null | undefined): number {
+  if (!m?.streams) return 30;
+  for (const ch of playChannels(m)) {
+    const s = m.streams[`camera_${ch}`] || m.streams[ch];
+    if (s && s.fps > 0) return s.fps;
+  }
+  for (const s of Object.values(m.streams)) {
+    if (s && s.fps > 0) return s.fps;
+  }
+  return 30;
+}
+
+export function streamLabel(key: string): string {
+  const low = key.toLowerCase();
+  if ((CHANNELS as readonly string[]).includes(low) && key.length <= 2) {
+    return key.toUpperCase();
+  }
+  return key;
+}
+
+export function canvasDomId(key: string): string {
+  return `cv-${key.replace(/[^A-Za-z0-9_-]+/g, "_")}`;
+}
 
 function joinUrl(base: string, path: string): string {
   const b = base.replace(/\/+$/, "");
   const p = path.startsWith("/") ? path : `/${path}`;
   if (!b) return p;
   return `${b}${p}`;
+}
+
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener(
+      "abort",
+      () => {
+        clearTimeout(timer);
+        reject(new DOMException("Aborted", "AbortError"));
+      },
+      { once: true },
+    );
+  });
 }
 
 export function framesAvailable(m: Manifest | null | undefined): number {
@@ -126,6 +223,16 @@ export class FramePendingError extends Error {
 export function isFramePendingError(e: unknown): e is FramePendingError {
   return e instanceof FramePendingError ||
     (!!e && typeof e === "object" && (e as Error).name === "FramePendingError");
+}
+
+class SignedMediaPendingError extends Error {
+  readonly httpStatus: number;
+
+  constructor(httpStatus: number) {
+    super(`signed media loading (${httpStatus})`);
+    this.name = "SignedMediaPendingError";
+    this.httpStatus = httpStatus;
+  }
 }
 
 export class SviewApi {
@@ -179,7 +286,14 @@ export class SviewApi {
     if (!this.preferSignedOss) return;
     console.warn(`[sview] signed OSS disabled (${reason}); falling back to Master`);
     this.preferSignedOss = false;
-    this.forceMasterProxy = true;
+    // A same-origin Vite/Nginx proxy can follow Master's OSS redirect server-side,
+    // avoiding bucket CORS without forcing the slower ?proxy=1 path.
+    try {
+      const apiOrigin = new URL(this.baseUrl || location.origin, location.href).origin;
+      this.forceMasterProxy = apiOrigin !== location.origin;
+    } catch {
+      this.forceMasterProxy = true;
+    }
     this.signedUrlCache.clear();
   }
 
@@ -191,6 +305,7 @@ export class SviewApi {
   async prefetchSignedSegmentUrls(
     jobId: string,
     starts: number[],
+    signal?: AbortSignal,
   ): Promise<void> {
     if (!this.preferSignedOss || starts.length === 0) return;
     const now = Date.now();
@@ -215,10 +330,13 @@ export class SviewApi {
         });
         const res = await fetch(
           joinUrl(this.baseUrl, `/api/jobs/${jobId}/signed-media?${q}`),
-          { cache: "no-store" },
+          { cache: "no-store", signal },
         );
         const data = await res.json().catch(() => ({}));
         if (!res.ok) {
+          if (res.status === 404 || res.status === 425) {
+            throw new SignedMediaPendingError(res.status);
+          }
           throw new Error(data.error || `signed-media ${res.status}`);
         }
         const expiresIn = Number(data.expires_in) || 7200;
@@ -241,7 +359,8 @@ export class SviewApi {
     // Coalesce concurrent callers: join in-flight, then retry need (may be empty).
     while (this.signedInflight) {
       await this.signedInflight.catch(() => undefined);
-      return this.prefetchSignedSegmentUrls(jobId, starts);
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      return this.prefetchSignedSegmentUrls(jobId, starts, signal);
     }
     this.signedInflight = run().finally(() => {
       this.signedInflight = null;
@@ -249,6 +368,8 @@ export class SviewApi {
     try {
       await this.signedInflight;
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
+      if (e instanceof SignedMediaPendingError) throw e;
       this.disableSignedOss(e instanceof Error ? e.message : "sign failed");
       throw e;
     }
@@ -257,20 +378,42 @@ export class SviewApi {
   private async fetchSegmentViaSignedOss(
     jobId: string,
     startIndex: number,
+    signal?: AbortSignal,
   ): Promise<
     | { ok: true; buf: ArrayBuffer }
     | { ok: false; status: number; retryable: boolean }
     | { ok: false; fatal: true }
   > {
     try {
-      await this.prefetchSignedSegmentUrls(jobId, [startIndex]);
-    } catch {
+      await this.prefetchSignedSegmentUrls(jobId, [startIndex], signal);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
+      if (e instanceof SignedMediaPendingError) {
+        return { ok: false, status: e.httpStatus, retryable: true };
+      }
       return { ok: false, fatal: true };
     }
     const hit = this.signedUrlCache.get(this.signedCacheKey(jobId, startIndex));
     if (!hit?.url) return { ok: false, fatal: true };
     try {
-      const res = await fetch(hit.url, { cache: "no-store", mode: "cors" });
+      let fetchUrl = hit.url;
+      try {
+        const apiOrigin = new URL(
+          this.baseUrl || location.origin,
+          location.href,
+        ).origin;
+        if (location.port === "5173" && apiOrigin === location.origin) {
+          const signed = new URL(hit.url);
+          fetchUrl = `${location.origin}/sview-oss${signed.pathname}${signed.search}`;
+        }
+      } catch {
+        /* use direct signed URL */
+      }
+      const res = await fetch(fetchUrl, {
+        cache: "no-store",
+        mode: "cors",
+        signal,
+      });
       if (res.ok) return { ok: true, buf: await res.arrayBuffer() };
       if (res.status === 404 || res.status === 425) {
         return { ok: false, status: res.status, retryable: true };
@@ -282,6 +425,7 @@ export class SviewApi {
       this.disableSignedOss(`OSS HTTP ${res.status}`);
       return { ok: false, fatal: true };
     } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") throw e;
       // Typical: CORS missing on bucket
       this.disableSignedOss(e instanceof Error ? e.message : "OSS fetch failed");
       return { ok: false, fatal: true };
@@ -297,11 +441,25 @@ export class SviewApi {
     }
   }
 
-  async submitJob(source: string, force = false): Promise<JobStatus> {
+  async submitJob(
+    source: string,
+    force = false,
+    opts: {
+      startSec?: number;
+      publishMode?: "progressive" | "sparse";
+      clientId?: string;
+    } = {},
+  ): Promise<JobStatus> {
+    const body: Record<string, unknown> = { source, force };
+    if (opts.publishMode) body.publish_mode = opts.publishMode;
+    if (opts.clientId) body.client_id = opts.clientId;
+    if (opts.startSec != null && opts.startSec > 0) {
+      body.start_sec = opts.startSec;
+    }
     const res = await fetch(joinUrl(this.baseUrl, "/api/jobs"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ source, force }),
+      body: JSON.stringify(body),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok && res.status !== 202) {
@@ -314,7 +472,7 @@ export class SviewApi {
     const res = await fetch(joinUrl(this.baseUrl, `/api/jobs/${jobId}`));
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
-      throw new Error(data.error || `job ${res.status}`);
+      throw new Error(data.error || data.status || `job ${res.status}`);
     }
     return data as JobStatus;
   }
@@ -531,25 +689,100 @@ export class SviewApi {
     }
   }
 
-  async fetchManifest(jobId: string): Promise<Manifest> {
+  async fetchManifest(
+    jobId: string,
+    opts: { retries?: number; signal?: AbortSignal } = {},
+  ): Promise<Manifest> {
     if (this.mediaBase) {
       try {
-        const res = await fetch(this.mediaUrl(`/manifest.json`), { cache: "no-store" });
+        const res = await fetch(this.mediaUrl(`/manifest.json`), {
+          cache: "no-store",
+          signal: opts.signal,
+        });
         if (res.ok) return await this.readJsonManifest(res);
         this.disableOssMedia(`manifest ${res.status}`);
       } catch (e) {
+        if (e instanceof DOMException && e.name === "AbortError") throw e;
         this.disableOssMedia(e instanceof Error ? e.message : "manifest fetch failed");
       }
     }
-    const res = await fetch(joinUrl(this.baseUrl, `/api/jobs/${jobId}/manifest.json`), {
-      cache: "no-store",
-      redirect: "follow",
-    });
-    if (!res.ok) {
-      throw new Error(`manifest ${res.status}: ${await res.text()}`);
+    const retries = Math.max(0, opts.retries ?? 5);
+    for (let attempt = 0; ; attempt++) {
+      const res = await fetch(joinUrl(this.baseUrl, `/api/jobs/${jobId}/manifest.json`), {
+        cache: "no-store",
+        redirect: "follow",
+        signal: opts.signal,
+      });
+      if (res.ok) {
+        // After a cross-origin 302, some browsers leave a non-JSON body — validate explicitly.
+        return await this.readJsonManifest(res);
+      }
+      const detail = await res.text();
+      if (res.status !== 425 || attempt >= retries) {
+        throw new Error(`manifest ${res.status}: ${detail}`);
+      }
+      const retryAfter = Number(res.headers.get("Retry-After"));
+      const delayMs = Number.isFinite(retryAfter) && retryAfter > 0
+        ? retryAfter * 1000
+        : 1000;
+      await abortableDelay(Math.min(5000, delayMs), opts.signal);
     }
-    // After a cross-origin 302, some browsers leave a non-JSON body — validate explicitly.
-    return await this.readJsonManifest(res);
+  }
+
+  async requestEncode(
+    jobId: string,
+    body: {
+      frame_index: number;
+      prefetch_segments: number;
+      client_epoch: number;
+      client_id: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<EncodeRequest & Record<string, unknown>> {
+    const res = await fetch(joinUrl(this.baseUrl, `/api/jobs/${jobId}/encode`), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      cache: "no-store",
+      signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok && res.status !== 202) {
+      throw new Error(
+        (data as { error?: string }).error || `encode ${res.status}`,
+      );
+    }
+    return data as EncodeRequest & Record<string, unknown>;
+  }
+
+  async getEncodeRequest(
+    jobId: string,
+    requestId: string,
+    signal?: AbortSignal,
+  ): Promise<EncodeRequest> {
+    const res = await fetch(
+      joinUrl(this.baseUrl, `/api/jobs/${jobId}/encode/${requestId}`),
+      { cache: "no-store", signal },
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `encode request ${res.status}`);
+    return data as EncodeRequest;
+  }
+
+  async cancelEncodeRequest(
+    jobId: string,
+    requestId: string,
+  ): Promise<EncodeRequest> {
+    const res = await fetch(
+      joinUrl(
+        this.baseUrl,
+        `/api/jobs/${jobId}/encode/${requestId}/cancel`,
+      ),
+      { method: "POST", cache: "no-store" },
+    );
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `cancel encode ${res.status}`);
+    return data as EncodeRequest;
   }
 
   async fetchFrame(
@@ -602,6 +835,7 @@ export class SviewApi {
   private async fetchSegmentViaMaster(
     jobId: string,
     name: string,
+    signal?: AbortSignal,
   ): Promise<{ ok: true; buf: ArrayBuffer } | { ok: false; status: number; retryable: boolean }> {
     const primary = joinUrl(this.baseUrl, `/api/jobs/${jobId}/segments/${name}`);
     const legacy = joinUrl(this.baseUrl, `/${jobId}/segments/${name}`);
@@ -611,13 +845,14 @@ export class SviewApi {
       url: string,
     ): Promise<{ ok: true; buf: ArrayBuffer } | { ok: false; status: number; retryable: boolean } | "network"> => {
       try {
-        const res = await fetch(url, { cache: "no-store" });
+        const res = await fetch(url, { cache: "no-store", signal });
         if (res.ok) return { ok: true, buf: await res.arrayBuffer() };
         if (res.status === 425 || res.status === 404) {
           return { ok: false, status: res.status, retryable: true };
         }
         return { ok: false, status: res.status, retryable: false };
       } catch {
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
         return "network";
       }
     };
@@ -658,6 +893,7 @@ export class SviewApi {
     opts: {
       retries?: number;
       onWait?: (startIndex: number, attempt: number, status: number) => void;
+      signal?: AbortSignal;
     } = {},
   ): Promise<ArrayBuffer> {
     const name = String(startIndex).padStart(6, "0") + ".bin";
@@ -670,7 +906,10 @@ export class SviewApi {
         const ossPath = this.mediaUrl(`/segments/${name}`);
         if (!ossPath.includes("-internal.")) {
           try {
-            const res = await fetch(ossPath, { cache: "no-store" });
+            const res = await fetch(ossPath, {
+              cache: "no-store",
+              signal: opts.signal,
+            });
             if (res.ok) return res.arrayBuffer();
             lastStatus = res.status;
             if (res.status === 403 || res.status === 401) {
@@ -679,10 +918,11 @@ export class SviewApi {
               this.disableOssMedia(`segment ${res.status}`);
             } else {
               opts.onWait?.(startIndex, attempt, lastStatus);
-              await new Promise((r) => setTimeout(r, 1000));
+              await abortableDelay(1000, opts.signal);
               continue;
             }
           } catch (e) {
+            if (e instanceof DOMException && e.name === "AbortError") throw e;
             this.disableOssMedia(e instanceof Error ? e.message : "segment fetch failed");
           }
         } else {
@@ -692,26 +932,30 @@ export class SviewApi {
 
       // 2) Presigned public OSS (browser direct — preferred)
       if (this.preferSignedOss) {
-        const signed = await this.fetchSegmentViaSignedOss(jobId, startIndex);
-        if ("fatal" in signed && signed.fatal) {
+        const signed = await this.fetchSegmentViaSignedOss(
+          jobId,
+          startIndex,
+          opts.signal,
+        );
+        if ("fatal" in signed) {
           // preferSignedOss already cleared; fall through to Master
         } else if (signed.ok) {
           return signed.buf;
         } else if (signed.retryable) {
           lastStatus = signed.status;
           opts.onWait?.(startIndex, attempt, lastStatus);
-          await new Promise((r) => setTimeout(r, 1000));
+          await abortableDelay(1000, opts.signal);
           continue;
         }
       }
 
       // 3) Master stream / 302 fallback
-      const got = await this.fetchSegmentViaMaster(jobId, name);
+      const got = await this.fetchSegmentViaMaster(jobId, name, opts.signal);
       if (got.ok) return got.buf;
       lastStatus = got.status;
       if (got.retryable) {
         opts.onWait?.(startIndex, attempt, lastStatus);
-        await new Promise((r) => setTimeout(r, 1000));
+        await abortableDelay(1000, opts.signal);
         continue;
       }
       throw new Error(`segment ${startIndex} ${lastStatus || "network"}`);

@@ -4,29 +4,25 @@
 
 ```text
 .
-├── sview_worker.py      # 主 Worker（CPU libx264 + NAL 拆帧，默认入口）
-├── sview_http.py          # HTTP：入队 / 状态 / 缓存文件服务
-├── job_status.py          # Redis 任务状态与队列
-├── path_map.py            # oss:// → 本地挂载路径
-├── bench_types.py         # 测试 type 1–8 定义（HTTP 运行时依赖）
-├── orin_images.py         # Orin ROS2 CompressedImage (JPEG) 解析
-├── sview_work_gpu.py      # GPU 备选 Worker（NVENC）
+├── sview/                 # SView 后端包
+│   ├── http/server.py     # Master HTTP：入队 / 状态 / 缓存
+│   ├── worker/cpu.py      # CPU Worker（libx264 + NAL 拆帧）
+│   ├── worker/gpu.py      # GPU 备选 Worker（NVENC）
+│   ├── ingest/            # MCAP protobuf / Orin ROS2 / HDF5
+│   ├── jobs/              # Redis 任务状态、bench type 1–8
+│   ├── cache/             # OSS player-bin GC / manifest 对齐
+│   └── path_map.py        # oss:// → 本地挂载路径
+├── sview_worker.py        # CLI 入口 → sview.worker.cpu
+├── sview_http.py          # CLI 入口 → sview.http.server
+├── sview_work_gpu.py      # CLI 入口 → sview.worker.gpu
 ├── Dockerfile             # CPU Worker + HTTP 镜像
 ├── legacy/
 │   └── server_cpu.py      # 旧 CPU Worker（无 NAL 拆帧），勿用于现网
 ├── scripts/               # 本地/线上压测客户端（不进镜像）
-│   ├── bench_online.py
-│   ├── bench_online_rounds.py
-│   └── bench_cpu_transcode.py
 ├── deploy/                # K8s 清单
-│   ├── deployment.yaml                    # 推荐：完整单副本 Deployment+Service
-│   ├── deployment-cpu-redis.yaml          # 旧单副本清单
-│   ├── deployment-cpu-redis-cluster.yaml  # 可选多副本粘滞
-│   ├── job-pvc.yaml
-│   ├── job-gpu.yaml
-│   └── secret-template.yaml
 ├── docs/                  # 接口与流程文档
 ├── frontend/              # WebCodecs 播放器
+├── handvis/               # 手部可视化（独立服务）
 ├── output/                # 本地跑测产物（可删，已 gitignore）
 └── requirements.txt
 ```

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """HDF5 teleop episodes (Astribot DAgger, etc.) → JPEG frames for the Orin encode path.
 
-Discovers image datasets (RGB arrays or per-frame JPEG/PNG bytes) and maps camera
-names onto SView channels FR/FL/RR/RL.
+Discovers image datasets (RGB arrays or per-frame JPEG/PNG bytes). Stream keys
+keep the camera name / dataset path; they are not forced onto FR/FL/RR/RL.
 
 Astribot files store cameras at `images_dict/<cam>_rgbd/color/count_0`. That leaf
 is often the pixel payload (vlen JPEG/PNG, packed RGB, or an RGB stack) rather
@@ -18,6 +18,8 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+from sview.ingest.stream_ids import bundle_stream_key
 
 log = logging.getLogger("sview.hdf5_images")
 
@@ -110,19 +112,59 @@ def _parent(name: str) -> str:
     return "/".join(parts[:-1])
 
 
-def _channel_for_name(name: str) -> Optional[str]:
+def _camera_token(name: str) -> Optional[str]:
+    """Known camera name token (left_wrist_rgbd, …), independent of FR/FL slots."""
     low = name.replace("\\", "/").lower()
     leaf = _leaf(name)
     visual = any(
         tok in low
         for tok in ("image", "rgb", "camera", "cam", "video", "color", "wrist")
     )
-    for token, ch in _CAM_NAME_TO_CH:
+    for token, _ch in _CAM_NAME_TO_CH:
         if token in ("left", "right", "head", "chest", "torso") and not visual:
             continue
         if leaf == token or low.endswith("/" + token) or f"/{token}/" in f"/{low}/":
+            return token
+    return None
+
+
+def _channel_for_name(name: str) -> Optional[str]:
+    token = _camera_token(name)
+    if not token:
+        return None
+    for tok, ch in _CAM_NAME_TO_CH:
+        if tok == token:
             return ch
     return None
+
+
+def _stream_key_for_dataset(name: str, dset) -> Optional[str]:
+    if _skip_non_image_path(name) or _is_index_array(dset):
+        return None
+    token = _camera_token(name)
+    if token:
+        return bundle_stream_key(token)
+    if _looks_like_image_dataset(name, dset):
+        return bundle_stream_key(_parent(name) or name)
+    return None
+
+
+def _looks_like_image_dataset(name: str, dset) -> bool:
+    if _skip_non_image_path(name):
+        return False
+    if _is_index_array(dset):
+        return False
+    shape = tuple(getattr(dset, "shape", ()) or ())
+    if len(shape) == 4 and _looks_hwc(shape[1:]):
+        return True
+    if len(shape) == 3 and _looks_hwc(shape):
+        return True
+    if _is_vlen_or_object(dset):
+        low = name.lower()
+        return any(
+            tok in low for tok in ("image", "rgb", "color", "camera", "jpeg", "jpg", "video")
+        )
+    return False
 
 
 def _skip_non_image_path(name: str) -> bool:
@@ -448,7 +490,7 @@ def parse_hdf5_image_streams(
     found: List[str] = []
 
     with h5py.File(p, "r") as h5:
-        by_ch_candidates: Dict[str, List[Tuple[str, object]]] = defaultdict(list)
+        by_key_candidates: Dict[str, List[Tuple[str, object]]] = defaultdict(list)
         by_group: Dict[Tuple[str, str], List[Tuple[str, object]]] = defaultdict(list)
 
         def _walk(group, prefix: str) -> None:
@@ -463,25 +505,25 @@ def parse_hdf5_image_streams(
                 found.append(f"{name}{shape}:{dt}")
                 if _skip_non_image_path(name):
                     continue
-                ch = _channel_for_name(name)
-                if not ch:
-                    continue
                 if _is_index_array(item):
                     log.debug("HDF5 skip index dataset %s shape=%s dtype=%s", name, shape, dt)
                     continue
-                by_ch_candidates[ch].append((name, item))
-                by_group[(ch, _parent(name))].append((name, item))
+                stream_key = _stream_key_for_dataset(name, item)
+                if not stream_key:
+                    continue
+                by_key_candidates[stream_key].append((name, item))
+                by_group[(stream_key, _parent(name))].append((name, item))
 
         _walk(h5, "")
 
-        if not by_ch_candidates:
+        if not by_key_candidates:
             raise ValueError(
                 f"No mapped camera image datasets in {p.name}; "
                 f"datasets={found[:80]}"
             )
 
         fps = 30
-        for ch, items in by_ch_candidates.items():
+        for ch, items in by_key_candidates.items():
             best: Optional[Tuple[int, str, List[bytes], int, int]] = None
 
             # Prefer one dataset that already holds a frame stack.
@@ -526,8 +568,10 @@ def parse_hdf5_image_streams(
                 "width": w or 640,
                 "height": h or 480,
                 "fps": fps,
-                "position": ch,
+                "position": name,
                 "codec": "jpeg",
+                "source_codec": "jpeg",
+                "stored_codec": "h264",
                 "source_topic": name,
             }
             log.info(

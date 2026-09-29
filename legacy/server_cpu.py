@@ -26,11 +26,15 @@ import redis
 from mcap_protobuf.reader import read_protobuf_messages
 import json
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 # ---------------------------------------------------------------------------
 #  Logging  (shared project log under cwd)
 # ---------------------------------------------------------------------------
 try:
-    from sview_logging import setup_logging
+    from sview.logging_setup import setup_logging
     log = setup_logging("legacy.server_cpu")
 except Exception:
     logging.basicConfig(
@@ -52,7 +56,7 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 REDIS_QUEUE_KEY = os.environ.get("REDIS_QUEUE_KEY", "player:queue")
 # -- Local mounts (K8s YAML mounts OSS prefixes here; see path_map.py) --
-from path_map import (
+from sview.path_map import (
     HEAD_CAM_MOUNT,
     ORIN_MOUNT,
     redis_path_to_local,
@@ -897,7 +901,7 @@ def run_redis_loop():
             log.info("Dequeued [%s]: %s  ->  %s", kind, redis_path, local_path)
 
             try:
-                from job_status import set_job_fields
+                from sview.jobs.job_status import set_job_fields
                 set_job_fields(r, job_id, status="processing", source=redis_path, error="")
             except Exception:
                 log.exception("Failed to set processing status for %s", job_id)
@@ -914,7 +918,7 @@ def run_redis_loop():
                 except Exception:
                     pass
                 try:
-                    from job_status import set_job_fields
+                    from sview.jobs.job_status import set_job_fields
                     set_job_fields(
                         r, job_id, status="ready", source=redis_path,
                         frame_count=frame_count, error="",
@@ -923,7 +927,7 @@ def run_redis_loop():
                     log.exception("Failed to set ready status for %s", job_id)
             except Exception as exc:
                 try:
-                    from job_status import set_job_fields
+                    from sview.jobs.job_status import set_job_fields
                     set_job_fields(r, job_id, status="failed", source=redis_path, error=str(exc)[:500])
                 except Exception:
                     pass
@@ -952,7 +956,7 @@ def run_redis_loop():
 
 def _start_http_server():
     """Serve LOCAL_OUTPUT_DIR on HTTP_HOST:HTTP_PORT (see sview_http.py)."""
-    from sview_http import start_sview_http_server
+    from sview.http.server import start_sview_http_server
     return start_sview_http_server(LOCAL_OUTPUT_DIR, host=HTTP_HOST, port=HTTP_PORT)
 
 

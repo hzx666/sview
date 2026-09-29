@@ -5,9 +5,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mcap_protobuf_compat import headcam_frame_count_from_channel_counts
-from sview_http import _optional_frame_count
-from sview_worker import _progressive_frame_count
+from sview.ingest.mcap_protobuf_compat import headcam_frame_count_from_channel_counts
+from sview.http.server import _optional_frame_count
+from sview.worker.cpu import _progressive_frame_count
 
 
 def test_headcam_frame_count_from_channel_counts():

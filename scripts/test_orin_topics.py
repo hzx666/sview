@@ -5,9 +5,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from orin_images import (
+from sview.ingest.orin_images import (
+    _harvest_channel_ok,
     _looks_like_orin_topic,
     _parse_camera_map,
+    _ros_image_to_jpeg,
+    _schema_is_raw_image,
+    _stable_assign_topics,
     _topic_to_channel,
     orin_frame_count_from_channel_counts,
 )
@@ -85,7 +89,40 @@ def test_orin_frame_count_from_channel_counts():
     assert orin_frame_count_from_channel_counts({}, "h264") is None
 
 
+def test_unknown_teleop_topics_keep_names():
+    mapping = _stable_assign_topics(["/frontvideostream", "/wrist/image"])
+    assert mapping["/frontvideostream"] == "frontvideostream"
+    assert mapping["/wrist/image"] == "wrist/image"
+    five = _stable_assign_topics([f"/cam_{i}/image" for i in range(5)])
+    assert len(five) == 5
+    assert set(five.values()) == {f"cam_{i}/image" for i in range(5)}
+
+    assert _schema_is_raw_image("sensor_msgs/msg/Image")
+    assert _schema_is_raw_image("sensor_msgs/Image")
+    assert not _schema_is_raw_image("sensor_msgs/msg/CompressedImage")
+    assert _harvest_channel_ok("/whatever", "sensor_msgs/msg/Image")
+    assert _harvest_channel_ok("/ut/cam", "foxglove.CompressedVideo")
+    assert not _harvest_channel_ok("/imu/sample", "sensor_msgs/msg/Image")
+    assert not _harvest_channel_ok("/camera/RR/video", "headcam.Video")
+    assert not _harvest_channel_ok("/master/joint_left", "sensor_msgs/msg/JointState")
+
+    unitree = {"/frontvideostream": 100, "/joint_states": 5000}
+    assert orin_frame_count_from_channel_counts(unitree, "jpeg") == 100
+
+    class Msg:
+        pass
+
+    msg = Msg()
+    msg.encoding = "rgb8"
+    msg.width = 8
+    msg.height = 8
+    msg.data = bytes([255, 0, 0] * 64)
+    jpeg = _ros_image_to_jpeg(msg)
+    assert jpeg and jpeg[:2] == b"\xff\xd8"
+
+
 if __name__ == "__main__":
     test_agilex_image_raw_topics()
     test_orin_frame_count_from_channel_counts()
+    test_unknown_teleop_topics_keep_names()
     print("ok")

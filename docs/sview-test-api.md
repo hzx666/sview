@@ -123,7 +123,7 @@
 1. **HTTP 与 worker（`sview_worker.py`）必须同一版本一起部署。**  
    - 测试队列项是 **JSON**；旧 worker 无法正确解析。  
    - 生产任务仍是 **纯路径字符串**，兼容旧行为。  
-2. 镜像需包含 `bench_types.py`（见根目录 `Dockerfile` COPY 列表）。  
+2. 镜像需包含 `sview/` 包（见根目录 `Dockerfile` COPY）。  
 3. **队列名必须一致：**
 
 ```bash

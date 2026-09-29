@@ -101,7 +101,7 @@ def list_bench_types() -> list[dict[str, Any]]:
 
 def bench_job_id(source: str, type_id: int) -> str:
     """Stable cache id per (source, type) so scenarios do not collide."""
-    from job_status import job_id_from_source
+    from sview.jobs.job_status import job_id_from_source
 
     base = job_id_from_source(source)
     return f"{base}__t{int(type_id)}"

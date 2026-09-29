@@ -48,7 +48,7 @@ spec:
             - name: CACHE_GC_INTERVAL_SEC
               value: "300"
             - name: CACHE_PIN_SEC
-              value: "600"
+              value: "1800"
             - name: SVIEW_CLUSTER
               value: "0"
             - name: HEAD_CAM_MOUNT
@@ -104,6 +104,9 @@ spec:
               value: "8080"
             - name: HTTP_ENABLED
               value: "1"
+            # Must match Worker; also published as manifest.bundle.gop_size.
+            - name: SEGMENT_FRAMES
+              value: "30"
             # Upload/proxy use OSS_ENDPOINT (internal). Browser 302 uses public sign
             # (OSS_PUBLIC_ENDPOINT). Verify: curl /api/debug/oss → sample_sign_host
             # must be *.oss-cn-shanghai.aliyuncs.com without -internal.

@@ -23,7 +23,7 @@ OSS_ENDPOINT=https://oss-cn-shanghai-internal.aliyuncs.com
 CACHE_MAX_BYTES=536870912000   # ~500GiB
 CACHE_IDLE_TTL_SEC=14400       # 4h idle
 CACHE_GC_INTERVAL_SEC=300
-CACHE_PIN_SEC=600
+CACHE_PIN_SEC=1800             # 30min pin
 ```
 
 对象布局：

@@ -18,7 +18,7 @@ import logging
 import re
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterator, Optional, Union
+from typing import Iterable, Iterator, Optional, Union
 
 from mcap.reader import make_reader
 from mcap.records import Schema
@@ -272,14 +272,28 @@ class TolerantProtobufDecoderFactory(DecoderFactory):
 
 def read_protobuf_messages_compat(
     source: Union[str, Path],
+    start_time_ns: Optional[int] = None,
+    end_time_ns: Optional[int] = None,
+    topics: Optional[Iterable[str]] = None,
 ) -> Iterator[McapProtobufMessage]:
     """Yield protobuf messages; skip other encodings instead of raising."""
     path = str(source)
     factory = TolerantProtobufDecoderFactory()
     skipped_encodings: dict[str, int] = {}
+    iter_kw = {}
+    if start_time_ns is not None and int(start_time_ns) > 0:
+        iter_kw["start_time"] = int(start_time_ns)
+    if end_time_ns is not None and int(end_time_ns) > 0:
+        iter_kw["end_time"] = int(end_time_ns)
+    if topics is not None:
+        iter_kw["topics"] = list(topics)
     with open(path, "rb") as fh:
         reader = make_reader(fh)
-        for schema, channel, message in reader.iter_messages():
+        try:
+            iterator = reader.iter_messages(**iter_kw)
+        except TypeError:
+            iterator = reader.iter_messages()
+        for schema, channel, message in iterator:
             encoding = channel.message_encoding if channel else ""
             decoder = factory.decoder_for(encoding, schema)
             if decoder is None:

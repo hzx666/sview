@@ -68,22 +68,9 @@ COPY requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-# Runtime modules only (bench clients live in scripts/, not in the image)
-# path_map.py: head_cam + teleoperation Orin/Agilex/Astribot/Franka/Unitree
-# hdf5_images.py: Astribot DAgger .hdf5 camera streams (images_dict/*/color)
-# mcap_protobuf_compat.py: SSIEGO protobuf mixed-encoding bags
-COPY path_map.py \
-     job_status.py \
-     bench_types.py \
-     orin_images.py \
-     hdf5_images.py \
-     mcap_protobuf_compat.py \
-     sview_logging.py \
-     sview_http.py \
-     sview_worker.py \
-     sview_work_gpu.py \
-     oss_cache_gc.py \
-     ./
+# Runtime: sview package + CLI shims (bench clients live in scripts/, not in the image)
+COPY sview/ ./sview/
+COPY sview_worker.py sview_http.py sview_work_gpu.py ./
 
 # Data / cache mount points (K8s binds OSS PVCs here)
 RUN mkdir -p /head-data /teleoperation /orin-data /cache /tmp/sview_worker

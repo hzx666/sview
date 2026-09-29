@@ -51,6 +51,16 @@ export default defineConfig(({ mode }) => {
       port: 5173,
       strictPort: true,
       proxy: {
+        // Browser cannot read the private bucket directly when Bucket CORS is
+        // missing. Keep the signed query string and proxy only in local dev.
+        "/sview-oss": {
+          target: "https://ss-oss-data-platform.oss-cn-shanghai.aliyuncs.com",
+          changeOrigin: true,
+          secure: true,
+          rewrite: (p) => p.replace(/^\/sview-oss/, "") || "/",
+          timeout: 0,
+          proxyTimeout: 0,
+        },
         // Use Base URL: http://127.0.0.1:5173/sview
         "/sview": {
           target: proxyTarget,

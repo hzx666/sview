@@ -23,8 +23,8 @@ if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
 from bench_online import run_type, write_report
-from bench_types import BENCH_TYPES, list_bench_types
-from sview_logging import setup_logging
+from sview.jobs.bench_types import BENCH_TYPES, list_bench_types
+from sview.logging_setup import setup_logging
 
 log = setup_logging("bench_online_rounds")
 

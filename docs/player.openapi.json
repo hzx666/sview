@@ -619,6 +619,146 @@
         "security": []
       }
     },
+    "/api/jobs/{job_id}/encode": {
+      "post": {
+        "summary": "按需转码 sparse segment",
+        "operationId": "encodeSparseWindow",
+        "tags": [
+          "jobs"
+        ],
+        "description": "仅适用于 publish_mode=sparse。按全局 frame_index 请求目标段及后续预取段；重复请求会去重。",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._-]{1,200}$"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "frame_index"
+                ],
+                "properties": {
+                  "frame_index": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "prefetch_segments": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 16,
+                    "default": 2
+                  },
+                  "client_epoch": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "client_id": {
+                    "type": "string",
+                    "description": "浏览器会话标识；用于请求隔离，不影响共享缓存"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "目标段已经就绪"
+          },
+          "202": {
+            "description": "段任务已入队或正在处理"
+          },
+          "409": {
+            "description": "任务不是 sparse 模式"
+          },
+          "416": {
+            "description": "frame_index 超出全片范围"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/encode/{request_id}": {
+      "get": {
+        "summary": "查询单次 sparse encode 请求",
+        "tags": [
+          "jobs"
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "请求状态"
+          },
+          "404": {
+            "description": "请求不存在或已过期"
+          }
+        },
+        "security": []
+      }
+    },
+    "/api/jobs/{job_id}/encode/{request_id}/cancel": {
+      "post": {
+        "summary": "取消当前用户对 sparse segment 的订阅",
+        "description": "不会删除共享缓存，也不会中断其他用户仍需要的转码。",
+        "tags": [
+          "jobs"
+        ],
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "request_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "订阅已取消"
+          },
+          "404": {
+            "description": "请求不存在或已过期"
+          }
+        },
+        "security": []
+      }
+    },
     "/api/jobs/{job_id}/signed-media": {
       "get": {
         "summary": "批量签发公网 OSS 播放 URL",
@@ -627,7 +767,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "批量为 `player-bin/{job_id}/segments/*.bin` 签发公网 GET URL。OSS 无逐帧 frames。单次最多 32 条。会 touch。超出 frames_available / 未按段对齐的 starts 不签发，放入 skipped。OSS list 失败为 425 text/plain。kind=frames 为 400 text/plain。参数非法为 400 text/plain；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
+        "description": "批量为 `player-bin/{job_id}/segments/*.bin` 签发公网 GET URL。OSS 无逐帧 frames。单次最多 32 条。会 touch。progressive 模式超出 frames_available、sparse 模式不在 available_ranges，或未按段对齐的 starts 不签发并放入 skipped。OSS list 失败为 425 text/plain。kind=frames 为 400 text/plain。参数非法为 400 text/plain；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
         "parameters": [
           {
             "name": "job_id",
@@ -2197,6 +2337,67 @@
           "cache_status": {
             "type": "string",
             "nullable": true
+          },
+          "cache_id": {
+            "type": "string",
+            "description": "源版本与编码 profile 对应的共享缓存标识"
+          },
+          "publish_mode": {
+            "type": "string",
+            "enum": [
+              "progressive",
+              "sparse"
+            ]
+          },
+          "available_ranges": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "minItems": 2,
+              "maxItems": 2,
+              "items": {
+                "type": "integer"
+              }
+            }
+          },
+          "segments_ready_count": {
+            "type": "integer"
+          },
+          "segment_epoch": {
+            "type": "integer"
+          },
+          "manifest_revision": {
+            "type": "integer",
+            "description": "共享 manifest 的单调递增发布版本"
+          },
+          "encode_window": {
+            "type": "array",
+            "nullable": true,
+            "minItems": 2,
+            "maxItems": 2,
+            "items": {
+              "type": "integer"
+            }
+          },
+          "encode_status": {
+            "type": "string",
+            "nullable": true,
+            "description": "reading_mcap_index、locating、decoding、encoding、idle、failed、unsupported"
+          },
+          "decode_start": {
+            "type": "integer",
+            "nullable": true,
+            "description": "源 GOP 解码起点的全局帧号"
+          },
+          "input_frames": {
+            "type": "integer",
+            "nullable": true,
+            "description": "本次已解码的源帧数"
+          },
+          "output_frames": {
+            "type": "integer",
+            "nullable": true,
+            "description": "目标 segment 已编码帧数"
           }
         },
         "description": "公开任务字段（`_public_job_payload` 白名单）。空字符串会被丢掉。`kind`/`video_url`：HandVis 提交响应与 SSE 会带；GET /api/jobs/{id} 当前可能省略。"
@@ -2444,6 +2645,19 @@
             "type": "string",
             "nullable": true
           },
+          "publish_mode": {
+            "type": "string",
+            "enum": [
+              "progressive",
+              "sparse"
+            ]
+          },
+          "segment_epoch": {
+            "type": "integer"
+          },
+          "manifest_revision": {
+            "type": "integer"
+          },
           "bundle": {
             "type": "object",
             "properties": {
@@ -2452,6 +2666,18 @@
               },
               "frames_available": {
                 "type": "number"
+              },
+              "available_ranges": {
+                "type": "array",
+                "description": "sparse 模式已发布的半开帧区间",
+                "items": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "items": {
+                    "type": "integer"
+                  }
+                }
               },
               "gop_size": {
                 "type": "number",

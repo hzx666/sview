@@ -5,7 +5,7 @@ Env:
   CACHE_MAX_BYTES=536870912000   soft cap (~500 GiB)
   CACHE_IDLE_TTL_SEC=14400       delete when last_access older than this
   CACHE_GC_INTERVAL_SEC=300      master loop interval
-  CACHE_PIN_SEC=600              protect recently touched / playable jobs
+  CACHE_PIN_SEC=1800             protect recently touched / playable jobs (30m)
   OSS_CACHE_PREFIX=player-bin
   OSS_BUCKET / OSS_ENDPOINT / OSS_ACCESS_KEY_*
 """
@@ -26,7 +26,7 @@ CACHE_MAX_BYTES = max(
 )
 CACHE_IDLE_TTL_SEC = max(60, int(os.environ.get("CACHE_IDLE_TTL_SEC", "14400") or "14400"))
 CACHE_GC_INTERVAL_SEC = max(30, int(os.environ.get("CACHE_GC_INTERVAL_SEC", "300") or "300"))
-CACHE_PIN_SEC = max(0, int(os.environ.get("CACHE_PIN_SEC", "600") or "600"))
+CACHE_PIN_SEC = max(0, int(os.environ.get("CACHE_PIN_SEC", "1800") or "1800"))
 OSS_CACHE_PREFIX = (os.environ.get("OSS_CACHE_PREFIX", "player-bin") or "player-bin").strip("/")
 OSS_BUCKET = os.environ.get("OSS_BUCKET", "ss-oss-data-platform")
 _oss_endpoint = os.environ.get("OSS_ENDPOINT", "https://oss-cn-shanghai.aliyuncs.com")
@@ -127,6 +127,80 @@ def contiguous_frames_from_starts(
     return int(avail)
 
 
+def merge_available_ranges(
+    ranges: Any,
+    *,
+    frame_count: Optional[int] = None,
+) -> list[list[int]]:
+    """Normalize and merge half-open frame ranges."""
+    cleaned: list[tuple[int, int]] = []
+    try:
+        parsed_limit = int(frame_count) if frame_count is not None else None
+    except (TypeError, ValueError):
+        parsed_limit = None
+    limit = parsed_limit if parsed_limit is not None and parsed_limit >= 0 else None
+    for item in ranges or []:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            continue
+        try:
+            start, end = int(item[0]), int(item[1])
+        except (TypeError, ValueError):
+            continue
+        start = max(0, start)
+        if limit is not None:
+            start, end = min(start, limit), min(end, limit)
+        if end <= start:
+            continue
+        cleaned.append((start, end))
+    cleaned.sort()
+    merged: list[list[int]] = []
+    for start, end in cleaned:
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return merged
+
+
+def available_ranges_from_starts(
+    starts: set[int],
+    *,
+    segment_frames: int = 30,
+    frame_count: Optional[int] = None,
+) -> list[list[int]]:
+    """Build merged half-open ranges from physically present segment objects."""
+    seg_n = max(1, int(segment_frames or 30))
+    ranges = []
+    for start in sorted(starts or set()):
+        try:
+            s = int(start)
+        except (TypeError, ValueError):
+            continue
+        if s < 0 or s % seg_n:
+            continue
+        end = s + seg_n
+        if frame_count is not None:
+            end = min(end, max(0, int(frame_count)))
+        if end > s:
+            ranges.append([s, end])
+    return merge_available_ranges(ranges, frame_count=frame_count)
+
+
+def contiguous_prefix_from_ranges(ranges: Any) -> int:
+    """Return the covered frame count starting exactly at frame zero."""
+    merged = merge_available_ranges(ranges)
+    if not merged or merged[0][0] != 0:
+        return 0
+    return int(merged[0][1])
+
+
+def frame_range_ready(ranges: Any, start: int, end: Optional[int] = None) -> bool:
+    """Whether one half-open frame interval is fully covered."""
+    start = int(start)
+    end = int(end if end is not None else start + 1)
+    return any(int(a) <= start and int(b) >= end for a, b in merge_available_ranges(ranges))
+
+
 def contiguous_oss_frames(
     job_id: str,
     *,
@@ -147,6 +221,7 @@ def filter_playable_segment_starts(
     *,
     frames_available: Optional[int],
     segment_frames: int = 30,
+    available_ranges: Any = None,
 ) -> tuple[list[int], list[dict[str, Any]]]:
     """Keep OSS segment starts that exist for the advertised playable prefix.
 
@@ -167,7 +242,11 @@ def filter_playable_segment_starts(
             skipped.append({"start": idx, "reason": "negative"})
         elif (idx % seg_n) != 0:
             skipped.append({"start": idx, "reason": "unaligned"})
-        elif frames_available is not None and idx >= int(frames_available):
+        elif available_ranges is not None and not frame_range_ready(
+            available_ranges, idx, idx + 1
+        ):
+            skipped.append({"start": idx, "reason": "not_ready"})
+        elif available_ranges is None and frames_available is not None and idx >= int(frames_available):
             skipped.append({"start": idx, "reason": "not_ready"})
         else:
             kept.append(idx)
@@ -190,7 +269,7 @@ def purge_job_play_cache(
 
     Local /cache/{job_id} should still be removed by the caller (Master/Worker).
     """
-    from job_status import get_job_fields, remove_cache_job, set_job_fields
+    from sview.jobs.job_status import get_job_fields, remove_cache_job, set_job_fields
 
     fields = get_job_fields(r, job_id) if r is not None else {}
     nbytes = _safe_int(fields.get("cache_bytes"), 0)
@@ -277,6 +356,25 @@ def align_manifest_to_oss(
         return manifest
     manifest.pop("cache_align_failed", None)
 
+    publish_mode = str(manifest.get("publish_mode") or "progressive").lower()
+    frame_count = _safe_int(bundle.get("frame_count"), 0) or None
+    physical_ranges = available_ranges_from_starts(
+        starts,
+        segment_frames=seg_n,
+        frame_count=frame_count,
+    )
+    if publish_mode == "sparse":
+        bundle["available_ranges"] = physical_ranges
+        bundle["frames_available"] = contiguous_prefix_from_ranges(physical_ranges)
+        manifest["bundle"] = bundle
+        manifest["cache_aligned"] = True
+        manifest["cache_align_reason"] = "oss_sparse_ranges"
+        if frame_count and bundle["frames_available"] >= frame_count:
+            manifest["status"] = "done"
+        else:
+            manifest["status"] = "partial"
+        return manifest
+
     aligned = contiguous_frames_from_starts(
         starts, segment_frames=seg_n, claimed=claimed_i
     )
@@ -330,7 +428,7 @@ def _is_protected(fields: dict, now: float) -> bool:
 
 def run_gc_once(r) -> dict:
     """Evict idle jobs then LRU until under CACHE_MAX_BYTES."""
-    from job_status import (
+    from sview.jobs.job_status import (
         get_job_fields,
         list_cache_jobs,
     )

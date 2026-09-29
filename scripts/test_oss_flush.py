@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import sview_worker as sw
+import sview.worker.cpu as sw
 
 
 def _man(frames_available: int) -> dict:

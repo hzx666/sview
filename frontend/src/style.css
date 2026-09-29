@@ -239,6 +239,18 @@ body {
   animation: fade-in 0.8s ease-out 0.15s both;
 }
 
+.grid[data-n="1"] {
+  grid-template-columns: 1fr;
+}
+
+.grid[data-n="3"] {
+  grid-template-columns: 1fr 1fr;
+}
+
+.grid:not([data-n="1"]):not([data-n="2"]):not([data-n="4"]) {
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr));
+}
+
 .cam {
   position: relative;
   aspect-ratio: 1;

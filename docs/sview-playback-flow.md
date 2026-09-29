@@ -69,8 +69,8 @@ POST /api/jobs  { source: "oss://.../*.mcap" }
 
 关注字段：`status`、`playable`、`frames_done`、`frame_count`、`percent`、`play_base`、`error`。
 
-- SSE 单次最长约 300s，未完成应重连。
-- 对接方可在 SSE 失败后退避轮询 `GET /api/jobs/{job_id}`。本仓库演示页默认 SSE-only（失败直接报错，便于查代理）。
+- SSE 单次最长约 300s，未完成可重连或退避轮询。
+- 本仓库演示页默认在 SSE 失败后退避轮询 `GET /api/jobs/{job_id}`。
 
 ### 3. 拉播放清单
 

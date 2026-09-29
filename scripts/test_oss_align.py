@@ -5,10 +5,14 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from oss_cache_gc import (
+from sview.cache.oss_cache_gc import (
     align_manifest_to_oss,
+    available_ranges_from_starts,
+    contiguous_prefix_from_ranges,
     contiguous_frames_from_starts,
+    frame_range_ready,
     filter_playable_segment_starts,
+    merge_available_ranges,
     oss_segment_hole,
 )
 
@@ -51,7 +55,7 @@ def test_align_list_failure_does_not_pass_through():
     def _none(_job_id):
         return None
 
-    import oss_cache_gc as gc
+    import sview.cache.oss_cache_gc as gc
 
     orig = gc.list_oss_segment_starts
     gc.list_oss_segment_starts = _none
@@ -77,9 +81,59 @@ def test_filter_signed_starts_drops_tail_and_frames_index():
     assert reasons[360] == "not_ready"
 
 
+def test_sparse_ranges_and_signed_filter():
+    ranges = available_ranges_from_starts(
+        {0, 30, 900, 930},
+        segment_frames=30,
+        frame_count=1000,
+    )
+    assert ranges == [[0, 60], [900, 960]]
+    assert merge_available_ranges([[30, 60], [0, 30], [930, 960], [900, 930]]) == ranges
+    assert contiguous_prefix_from_ranges(ranges) == 60
+    assert frame_range_ready(ranges, 915, 916)
+    assert not frame_range_ready(ranges, 100, 101)
+    kept, skipped = filter_playable_segment_starts(
+        [0, 60, 900, 930],
+        frames_available=60,
+        available_ranges=ranges,
+        segment_frames=30,
+    )
+    assert kept == [0, 900, 930]
+    assert skipped == [{"start": 60, "reason": "not_ready"}]
+
+
+def test_sparse_align_preserves_holes():
+    import sview.cache.oss_cache_gc as gc
+
+    original = gc.list_oss_segment_starts
+    gc.list_oss_segment_starts = lambda _job_id: {0, 900}
+    try:
+        out = align_manifest_to_oss(
+            "sparse",
+            {
+                "publish_mode": "sparse",
+                "status": "partial",
+                "bundle": {
+                    "frame_count": 1000,
+                    "frames_available": 0,
+                    "gop_size": 30,
+                    "available_ranges": [],
+                },
+            },
+            segment_frames=30,
+        )
+    finally:
+        gc.list_oss_segment_starts = original
+    assert out["bundle"]["available_ranges"] == [[0, 30], [900, 930]]
+    assert out["bundle"]["frames_available"] == 30
+    assert out["status"] == "partial"
+
+
 if __name__ == "__main__":
     test_contiguous()
     test_align_hole()
     test_align_list_failure_does_not_pass_through()
     test_filter_signed_starts_drops_tail_and_frames_index()
+    test_sparse_ranges_and_signed_filter()
+    test_sparse_align_preserves_holes()
     print("ok")

@@ -1,6 +1,6 @@
 import "./style.css";
-import { CHANNELS, SviewApi, type Channel } from "./api";
-import { SviewPlayer } from "./player";
+import { CHANNELS, SviewApi, canvasDomId, playChannels, streamLabel } from "./api";
+import { sharedClientId, SviewPlayer } from "./player";
 
 const params = new URLSearchParams(location.search);
 // Prefer Vite proxy so Master→OSS 302 is followed in Node (no browser CORS).
@@ -13,6 +13,10 @@ const defaultJob = params.get("job") ?? "";
 const defaultForce = ["1", "true", "yes"].includes(
   (params.get("force") ?? "").toLowerCase(),
 );
+const defaultStartSec = params.get("start_sec") ?? "";
+const defaultSparse =
+  params.get("publish_mode") === "sparse" ||
+  ["1", "true", "yes"].includes((params.get("sparse") ?? "").toLowerCase());
 
 const app = document.querySelector<HTMLDivElement>("#app")!;
 
@@ -25,7 +29,7 @@ app.innerHTML = `
     <p class="hint">
       提交 mcap → Master 入队 → Worker 转码 → OSS player-bin。媒体默认
       <strong>签名直连公网 OSS</strong>（API 仍走 Base URL）。CORS 失败会回退 Master。
-      调试：<code>?media=proxy</code> 强制走 Master；<code>?media=signed</code> 强制签名 OSS。
+      调试：<code>?media=proxy</code> 强制走 Master；<code>?start_sec=3000</code> 从 50 分钟切开转。
     </p>
     <div class="controls">
       <label class="grow">
@@ -41,6 +45,14 @@ app.innerHTML = `
       <label class="check" title="取消进行中的任务、清 play 缓存后重新入队">
         <input id="force" type="checkbox"${defaultForce ? " checked" : ""} />
         强制重跑
+      </label>
+      <label class="check" title="同一 Job 按 seek 位置独立转码并发布稀疏段">
+        <input id="sparse" type="checkbox"${defaultSparse ? " checked" : ""} />
+        稀疏按需 Seek
+      </label>
+      <label title="从袋子开头跳过的秒数，用于直接转后半段">
+        起点(秒)
+        <input id="start-sec" spellcheck="false" value="${defaultStartSec}" placeholder="0" />
       </label>
       <button class="btn" id="submit" type="button">提交并播放</button>
     </div>
@@ -60,11 +72,11 @@ app.innerHTML = `
     <div class="timing" id="timing">耗时：—</div>
   </header>
   <main class="stage">
-    <div class="grid" id="grid">
+    <div class="grid" id="grid" data-n="${CHANNELS.length}">
       ${CHANNELS.map(
         (ch) => `
         <div class="cam" data-ch="${ch}">
-          <canvas id="cv-${ch}"></canvas>
+          <canvas id="${canvasDomId(ch)}"></canvas>
           <span class="label">${ch.toUpperCase()}</span>
         </div>`,
       ).join("")}
@@ -85,6 +97,8 @@ const el = {
   base: app.querySelector<HTMLInputElement>("#base")!,
   source: app.querySelector<HTMLInputElement>("#source")!,
   force: app.querySelector<HTMLInputElement>("#force")!,
+  sparse: app.querySelector<HTMLInputElement>("#sparse")!,
+  startSec: app.querySelector<HTMLInputElement>("#start-sec")!,
   job: app.querySelector<HTMLInputElement>("#job")!,
   submit: app.querySelector<HTMLButtonElement>("#submit")!,
   load: app.querySelector<HTMLButtonElement>("#load")!,
@@ -185,11 +199,44 @@ function watchUntilFullyReady(api: SviewApi, jobId: string) {
   })();
 }
 
-const canvases = Object.fromEntries(
-  CHANNELS.map((ch) => [ch, app.querySelector<HTMLCanvasElement>(`#cv-${ch}`)!]),
-) as Record<Channel, HTMLCanvasElement>;
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
 
-const player = new SviewPlayer(canvases, {
+function canvasesFromGrid(channels: string[]): Record<string, HTMLCanvasElement> {
+  return Object.fromEntries(
+    channels.map((ch) => {
+      const elCv = app.querySelector<HTMLCanvasElement>(`#${canvasDomId(ch)}`);
+      if (!elCv) throw new Error(`missing canvas for ${ch}`);
+      return [ch, elCv];
+    }),
+  );
+}
+
+function rebuildGrid(channels: string[]) {
+  const grid = app.querySelector<HTMLDivElement>("#grid");
+  if (!grid) return;
+  const ids = channels.length ? channels : [...CHANNELS];
+  grid.dataset.n = String(ids.length);
+  grid.innerHTML = ids
+    .map(
+      (ch) => `
+        <div class="cam" data-ch="${escapeHtml(ch)}">
+          <canvas id="${canvasDomId(ch)}"></canvas>
+          <span class="label">${escapeHtml(streamLabel(ch))}</span>
+        </div>`,
+    )
+    .join("");
+  player.setCanvases(canvasesFromGrid(ids));
+}
+
+let lastChannelSig = CHANNELS.join("\0");
+
+const player = new SviewPlayer(canvasesFromGrid([...CHANNELS]), {
   onStatus: (t) => {
     el.status.classList.remove("error");
     el.status.textContent = t;
@@ -206,14 +253,24 @@ const player = new SviewPlayer(canvases, {
     console.error(e);
   },
   onManifest: (m) => {
+    const chs = playChannels(m);
+    const sig = chs.join("\0");
+    if (sig !== lastChannelSig) {
+      lastChannelSig = sig;
+      rebuildGrid(chs);
+    }
     const total = m.bundle.frame_count ?? 1;
     el.seek.max = String(Math.max(0, total - 1));
   },
   onFrame: (index, tsNs, imu) => {
+    if (seekHold != null) return;
     if (index === 0) markFirstFrame();
     const m = player.Manifest;
     const total = m?.bundle.frame_count ?? 0;
-    const avail = m?.bundle.frames_available ?? total;
+    const avail =
+      m?.publish_mode === "sparse"
+        ? total
+        : m?.bundle.frames_available ?? total;
     const dur = m?.bundle.timeline?.duration_sec;
     el.seek.value = String(index);
     const durTxt =
@@ -249,7 +306,20 @@ function syncUrl(base: string, job: string, source: string) {
   if (source) url.searchParams.set("source", source);
   if (el.force.checked) url.searchParams.set("force", "1");
   else url.searchParams.delete("force");
+  if (el.sparse.checked) url.searchParams.set("publish_mode", "sparse");
+  else url.searchParams.delete("publish_mode");
+  const startSec = readStartSec();
+  if (!el.sparse.checked && startSec > 0) {
+    url.searchParams.set("start_sec", String(startSec));
+  }
+  else url.searchParams.delete("start_sec");
   history.replaceState(null, "", url);
+}
+
+function readStartSec(): number {
+  const n = Number(el.startSec.value.trim());
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return n;
 }
 
 function currentApi(): SviewApi {
@@ -294,6 +364,8 @@ async function loadJob(base: string, jobId: string, mediaBase?: string) {
   el.seek.value = "0";
   el.job.value = jobId;
   setTransportEnabled(true);
+  el.status.classList.remove("error");
+  el.status.textContent = `${jobId} · 已缓冲，可播放`;
 }
 
 let touchTimer = 0;
@@ -332,6 +404,20 @@ el.force.addEventListener("change", () => {
     /* ignore */
   }
 });
+
+el.sparse.addEventListener("change", () => {
+  el.startSec.disabled = el.sparse.checked;
+  try {
+    syncUrl(
+      el.base.value.trim().replace(/\/+$/, ""),
+      el.job.value.trim(),
+      el.source.value.trim(),
+    );
+  } catch {
+    /* ignore */
+  }
+});
+el.startSec.disabled = el.sparse.checked;
 
 el.refreshStats.addEventListener("click", () => {
   void refreshQueueStats();
@@ -375,8 +461,28 @@ el.submit.addEventListener("click", async () => {
 
     const api = new SviewApi(base);
     const force = el.force.checked;
-    el.status.textContent = force ? "强制提交任务…" : "提交任务…";
-    const created = await api.submitJob(source, force);
+    const startSec = readStartSec();
+    const publishMode = el.sparse.checked ? "sparse" : "progressive";
+    el.status.textContent = publishMode === "sparse"
+      ? "提交稀疏按需任务…"
+      : startSec > 0
+      ? `从 ${startSec}s 切开提交…`
+      : force
+        ? "强制提交任务…"
+        : "提交任务…";
+    const created = await api.submitJob(source, force, {
+      startSec: publishMode === "sparse" ? 0 : startSec,
+      publishMode,
+      clientId: publishMode === "sparse" ? sharedClientId() : undefined,
+    });
+    if (publishMode === "sparse") {
+      await api.requestEncode(created.job_id, {
+        frame_index: 0,
+        prefetch_segments: 3,
+        client_epoch: 0,
+        client_id: sharedClientId(),
+      });
+    }
     el.job.value = created.job_id;
     syncUrl(base, created.job_id, source);
     void refreshQueueStats();
@@ -388,6 +494,7 @@ el.submit.addEventListener("click", async () => {
       // Media via Master (302 → signed OSS when private bucket). Avoid browser 403 on play_base.
       await loadJob(base, created.job_id);
       startTouchLoop(api, created.job_id);
+      player.play();
       return;
     }
 
@@ -396,7 +503,9 @@ el.submit.addEventListener("click", async () => {
       intervalMs: 800,
       timeoutMs: 15 * 60 * 1000,
       // Start only after ~5s of published frames so playhead is not glued to the frontier.
-      minFrames: 150,
+      // Sparse segments are independently decodable; one published frame range
+      // is enough to load, while progressive keeps its larger safety lead.
+      minFrames: publishMode === "sparse" ? 1 : 150,
       preferSse: true,
       allowPollFallback: true,
       onTick: (s) => {
@@ -414,6 +523,10 @@ el.submit.addEventListener("click", async () => {
         }
         if (s.playable) prog += " · playable";
         if (s.play_base) prog += " · oss";
+        if (s.encode_status) {
+          prog += ` · ${s.encode_status}`;
+          if (s.output_frames != null) prog += ` ${s.output_frames}`;
+        }
         const elapsed = formatSec(performance.now() - timingStart);
         el.status.textContent = `job=${s.job_id} status=${s.status}${prog} · 已等待 ${elapsed}`;
       },
@@ -431,9 +544,7 @@ el.submit.addEventListener("click", async () => {
     el.status.textContent = `${label}，加载播放器…`;
     await loadJob(base, ready.job_id);
     startTouchLoop(api, ready.job_id);
-    if (ready.status !== "ready" && !ready.cached) {
-      player.play();
-    }
+    player.play();
   } catch (e) {
     timingArmed = false;
     el.status.classList.add("error");
@@ -468,7 +579,10 @@ el.load.addEventListener("click", async () => {
   }
 });
 
-el.play.addEventListener("click", () => player.play());
+el.play.addEventListener("click", () => {
+  clearSeekHold();
+  player.play();
+});
 el.pause.addEventListener("click", () => player.pause());
 
 void refreshQueueStats();
@@ -477,12 +591,72 @@ window.setInterval(() => {
 }, 5000);
 
 let seekTimer = 0;
+let seekRequestEpoch = 0;
+/** Frame the user asked for while it is still being encoded. Slider stays here. */
+let seekHold: number | null = null;
+let seekHoldTimer = 0;
+
+function clearSeekHold() {
+  seekRequestEpoch += 1;
+  seekHold = null;
+  if (seekHoldTimer) {
+    window.clearInterval(seekHoldTimer);
+    seekHoldTimer = 0;
+  }
+}
+
+function holdSeek(idx: number) {
+  if (player.Sparse) return;
+  seekHold = idx;
+  el.seek.value = String(idx);
+  const avail = Math.max(0, player.Available - 1);
+  el.status.classList.remove("error");
+  el.status.textContent = `第 ${idx} 帧还没转完，当前可播到 ${avail}。转到这一帧再跳过去`;
+  if (seekHoldTimer) return;
+  seekHoldTimer = window.setInterval(() => {
+    const target = seekHold;
+    if (target == null) {
+      clearSeekHold();
+      return;
+    }
+    void player
+      .refreshManifest()
+      .then(async () => {
+        if (seekHold !== target) return;
+        if (target > Math.max(0, player.Available - 1)) {
+          el.seek.value = String(target);
+          el.status.classList.remove("error");
+          el.status.textContent =
+            `第 ${target} 帧还没转完，当前可播到 ${Math.max(0, player.Available - 1)}。转到这一帧再跳过去`;
+          return;
+        }
+        clearSeekHold();
+        await player.seek(target);
+      })
+      .catch((e) => {
+        el.status.classList.add("error");
+        el.status.textContent = e instanceof Error ? e.message : String(e);
+      });
+  }, 1000);
+}
+
 el.seek.addEventListener("input", () => {
   const idx = Number(el.seek.value);
+  const requestEpoch = ++seekRequestEpoch;
+  seekHold = null;
+  if (seekHoldTimer) {
+    window.clearInterval(seekHoldTimer);
+    seekHoldTimer = 0;
+  }
   el.meta.textContent = `→ ${idx}`;
   window.clearTimeout(seekTimer);
   seekTimer = window.setTimeout(() => {
-    void player.seek(idx).catch((e) => {
+    if (requestEpoch !== seekRequestEpoch) return;
+    void player.seek(idx).then((ok) => {
+      if (requestEpoch !== seekRequestEpoch) return;
+      if (!ok && !player.Sparse) holdSeek(idx);
+    }).catch((e) => {
+      if (requestEpoch !== seekRequestEpoch) return;
       el.status.classList.add("error");
       el.status.textContent = e instanceof Error ? e.message : String(e);
     });

@@ -21,6 +21,7 @@ CORS：Master 已放行跨域。私有 Bucket 时媒体仍建议走 Master（见
 | `GET` | `/api/jobs/stats` | 队列深度与处理中任务 |
 | `POST` | `/api/jobs/{job_id}/cancel` | 取消任务 |
 | `POST` | `/api/jobs/{job_id}/touch` | 刷新访问时间（防 GC） |
+| `POST` | `/api/jobs/{job_id}/encode` | sparse 模式按需请求目标 segment |
 | `GET` | `/api/jobs/{job_id}` | 查正式任务状态（会 touch） |
 | `GET` | `/api/jobs/{job_id}/events` | SSE 进度（推荐替代密轮询） |
 | `GET` | `/api/jobs/{job_id}/signed-media` | 批量签发公网 OSS 播放 URL（浏览器直连） |
@@ -91,14 +92,27 @@ Frontend ──API / SSE / touch──► Master :8080
 |------|------|------|------|
 | `source` | string | 是 | 完整 `oss://.../*.mcap`（不要传 `.mp4`） |
 | `force` | boolean | 否 | `true` 强制重跑，默认 `false` |
+| `start_sec` | number | 否 | 从源文件开头跳过的秒数；大于 0 时任务 ID 会追加 `_o{秒}` |
+| `publish_mode` | string | 否 | `progressive`（默认）或 `sparse`；sparse 保留全局时间轴并按需转 segment，暂不支持 HDF5 |
 
 ```json
 {
-  "source": "oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/260706/001U_device/SSIEGO_Cam_001U_20260706_101930_342.mcap"
+  "source": "oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/260706/001U_device/SSIEGO_Cam_001U_20260706_101930_342.mcap",
+  "start_sec": 3000
 }
 ```
 
-`job_id` = 文件名去掉 `.mcap`（无扩展名、无路径）。
+默认 `job_id` = 文件名去掉 `.mcap`（无扩展名、无路径）；设置
+`start_sec > 0` 时为 `{job_id}_o{规范化秒数}`，应始终使用提交响应里的 `job_id`。
+`publish_mode=sparse` 与 `start_sec` 不能同时使用。
+Sparse 模式的 `job_id/cache_id` 会追加源 URI、文件版本和编码 profile 的
+短哈希。同一源版本与编码配置的所有用户共用同一 manifest 和 segment；
+同名但不同路径的文件不会误共享。
+Sparse 首次定位只读取 MCAP Footer、ChunkIndex 和 MessageIndex，用帧数生成
+帧段表。每一帧只属于表里的一段。建表不读取视频 payload。源文件必须包含
+ChunkIndex/MessageIndex；
+缺少原生索引时任务返回 `encode_status=unsupported`，应改用 progressive
+或先使用 MCAP 工具重建索引。
 
 **返回：**
 
@@ -239,8 +253,8 @@ Redis 不可用时 `503`。
 **前端策略：**
 
 1. 连 `GET .../events`；以 `frames_done ≥ 150` 或 `ready` 为起播条件（不要只看 `playable`，约 30 帧就会亮）  
-2. 单次 SSE 有服务端最长时长（约 300s）；未完成应重连  
-3. SSE 失败时可退避轮询 `GET /api/jobs/{id}`。本仓库演示页默认 SSE-only（`allowPollFallback=false`，便于排查代理）  
+2. 单次 SSE 有服务端最长时长（约 300s）；未完成可重连或回退轮询
+3. SSE 失败时可退避轮询 `GET /api/jobs/{id}`。本仓库演示页默认开启轮询回退（`allowPollFallback=true`）
 
 ---
 
@@ -254,7 +268,45 @@ Redis 不可用时 `503`。
 
 ---
 
-## 3e. `GET /api/jobs/{job_id}/signed-media`
+## 3e. `POST /api/jobs/{job_id}/encode`
+
+**作用：** 仅用于 `publish_mode=sparse` 的任务。请求目标全局帧所在 segment
+及后续预取段；重复请求通过 Redis 段锁去重。
+
+```json
+{
+  "frame_index": 900,
+  "prefetch_segments": 8,
+  "client_epoch": 12,
+  "client_id": "browser-session-uuid"
+}
+```
+
+- 已发布目标段：`200`，并继续把播放位置之后尚未缓存的段排进编码队列。
+- 目标段尚未发布：`202`，从该段开始编码。当前段可播后播放继续，后续段按同一方向接着编码。
+- 同一个播放窗口只启动一条编码线程。seek 只改这条线程的 `encode_frontier`，
+  不额外开线程。另一个浏览器窗口使用不同的 `client_id`，才会再启动一条线程。
+- 新的 seek 会把这条线程转到目标段，并从这个段继续往后编码。
+- 非 sparse Job：`409`；超过全片范围：`416`。
+- `encode_status` 可能为 `reading_mcap_index`、`locating`、`decoding`、
+  `encoding`、`idle`、`failed` 或 `unsupported`。
+- `decode_start` 是帧段表里该段的起点，不通过解开视频 payload 查找。
+  `output_frames` 只统计目标 segment 已编码帧数。同一 Job 同时只编码一个
+  segment，连续播放段优先于后续预取段。没有 seek 时前沿从第 0 段一直往后；
+  seek 之后前沿改到当前帧所在段，已有段立即播放，没有的段从这里开始边转边播。
+
+段任务只在 segment PUT 成功后更新 manifest，因此前端必须以
+`bundle.available_ranges` 判断目标段是否可读。
+多个请求命中同一 segment 时只会入队一次；每个 `request_id` 独立等待，
+最终读取同一份 OSS 缓存。
+
+- `GET /api/jobs/{job_id}/encode/{request_id}`：查询本次请求状态。
+- `POST /api/jobs/{job_id}/encode/{request_id}/cancel`：仅取消当前用户的
+  订阅，不删除共享 segment，也不中断其他用户需要的转码。
+
+---
+
+## 3f. `GET /api/jobs/{job_id}/signed-media`
 
 **作用：** 批量为 `player-bin/{job_id}/segments/*.bin` 签发**公网** GET URL，供浏览器直连 OSS（去掉 Master 中转大包）。
 
@@ -305,15 +357,19 @@ OSS 播放缓存只有打包段，没有逐帧 `frames/*.bin`。`kind=frames` �
 | `job_id` | string | 任务 ID |
 | `format` | string | 如 `head_cam` |
 | `status` | string | `partial` 仍在写帧；`done` 全部完成 |
+| `publish_mode` | string | `progressive` 或 `sparse`；省略时按 progressive |
 | `play_base` | string | 可选，OSS 播放前缀 |
 | `bundle.frame_count` | number | 全片总帧数（进度条最大值） |
 | `bundle.frames_available` | number | 当前可请求帧数，合法索引 `0 .. frames_available-1` |
+| `bundle.available_ranges` | `[number,number][]` | sparse 模式已原子发布的半开帧区间；例如 `[[0,150],[900,960]]` |
 | `bundle.gop_size` | number | 约 30 |
 | `bundle.key_frame_indices` | number[] | 关键帧索引 |
 | `bundle.timeline.*` | | `start_ns` / `end_ns` / `duration_sec` |
 | `streams.camera_rr/fr/rl/fl` | object | `{ position, width, height, fps }` |
 
-边转边播时约每秒刷新；`status=done` 且 `frames_available === frame_count` 后可停刷。
+progressive 模式继续使用 `frames_available` 连续前缀。sparse 模式可在
+`frames_available=0` 时存在远端可播段，必须查询 `available_ranges`。
+`status=done` 仅表示全片所有 segment 都已发布。
 
 ---
 
@@ -375,7 +431,9 @@ header_len(uint32 LE) + header_json(UTF-8) + payload_len(uint32 LE) + payload
 
 ## 5b. `GET /api/jobs/{job_id}/frames/{name}`
 
-**作用：** 拉单帧二进制（四路 H.264 + IMU）。兼容保留；新播放器用 segments。同样支持 `?proxy=1`。
+**作用：** 拉单帧二进制（四路 H.264 + IMU）。兼容保留；新播放器用
+segments。该路径只读取 Master/owner Pod 的本地帧，不从 OSS 回源，
+`?proxy=1` 不改变其行为。
 
 **路径参数：**
 

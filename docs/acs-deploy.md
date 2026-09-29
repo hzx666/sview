@@ -255,7 +255,7 @@ RAM 用户至少：`oss:PutObject` / `GetObject` / `DeleteObject` / `ListObjects
 oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/<相对 /head-data 的路径>.mcap
 ```
 
-路径必须能映射到 PVC 上的真实文件（见 `path_map.py`）。
+路径必须能映射到 PVC 上的真实文件（见 `sview/path_map.py`）。
 
 ---
 
@@ -287,7 +287,7 @@ OSS 控制台确认：`player-bin/<job_id>/manifest.json`、`segments/000000.bin
 
 | 现象 | 排查 |
 |------|------|
-| 入队 503 / Redis HSET 错 | Redis 版本过旧；代码需含 `job_status.set_job_fields` 多字段兼容 |
+| 入队 503 / Redis HSET 错 | Redis 版本过旧；代码需含 `sview.jobs.job_status.set_job_fields` 多字段兼容 |
 | `source not found on local mount` | PVC/路径映射不对；核对 `HEAD_CAM_MOUNT` 与 OSS URI |
 | Worker 不消费 | `REDIS_QUEUE_KEY` 不一致；看 Worker 日志是否连上 Redis |
 | 前端 manifest「无法解析」 | 确认镜像含「manifest 不 302」修复；Master 直接返回 JSON |

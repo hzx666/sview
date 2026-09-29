@@ -1,0 +1,539 @@
+#!/usr/bin/env python3
+"""Encode-from-T origin helpers and queue JSON."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sview.jobs.job_status import (
+    REDIS_QUEUE_KEY,
+    cancel_encode_request,
+    complete_segment_requests,
+    create_encode_request,
+    enqueue_segment_window,
+    enqueue_sparse_job,
+    get_encode_request,
+    job_id_from_source,
+    parse_queue_item,
+    sparse_cache_job_id,
+)
+from sview.jobs.origin import (
+    cut_log_time_ns,
+    estimate_remaining_frames,
+    origin_job_id,
+    parse_start_sec,
+)
+
+
+def test_parse_and_job_id():
+    assert parse_start_sec(None) == 0
+    assert parse_start_sec("-1") == 0
+    assert parse_start_sec("3000") == 3000
+    assert origin_job_id("bag", 0) == "bag"
+    assert origin_job_id("bag", 3000) == "bag_o3000"
+    assert origin_job_id("bag", 2999.6) == "bag_o3000"
+    stem = job_id_from_source("oss://b/teleoperation/Unitree/foo.mcap")
+    assert origin_job_id(stem, 50) == f"{stem}_o50"
+
+
+def test_remaining_frames():
+    # 1 hour bag, jump to 50 min → ~10 min left
+    t0 = 1_000_000_000
+    t1 = t0 + 3600 * 1_000_000_000
+    n = estimate_remaining_frames(108_000, 3000, t0, t1, fps=30)
+    assert n is not None
+    assert 17_000 < n < 19_500
+    assert estimate_remaining_frames(100, 0, t0, t1) == 100
+    assert estimate_remaining_frames(900, 10, None, None, fps=30) == 600
+
+
+def test_queue_json_origin():
+    item = parse_queue_item(
+        '{"v":1,"kind":"job","source":"oss://b/a.mcap","job_id":"a_o3000","origin_sec":3000}'
+    )
+    assert item["kind"] == "job"
+    assert item["job_id"] == "a_o3000"
+    assert item["origin_sec"] == 3000
+    plain = parse_queue_item("oss://b/a.mcap")
+    assert plain["kind"] == "job"
+    assert plain["origin_sec"] == 0
+    bench = parse_queue_item('{"v":1,"kind":"bench","source":"oss://b/a.mcap","bench_type":3}')
+    assert bench["kind"] == "bench"
+
+
+def test_sparse_queue_item_and_priority_dedupe():
+    class FakeRedis:
+        def __init__(self):
+            self.hashes = {"sview:job:j": {"frame_count": "100"}}
+            self.values = {}
+            self.lists = {}
+            self.sets = {}
+
+        def hgetall(self, key):
+            return self.hashes.get(key, {})
+
+        def hincrby(self, key, field, amount):
+            row = self.hashes.setdefault(key, {})
+            value = int(row.get(field, 0)) + amount
+            row[field] = str(value)
+            return value
+
+        def hset(self, key, *args, mapping=None):
+            row = self.hashes.setdefault(key, {})
+            if mapping is not None:
+                row.update(mapping)
+            elif len(args) == 2:
+                row[args[0]] = args[1]
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def lpush(self, key, value):
+            self.lists.setdefault(key, []).insert(0, value)
+
+        def expire(self, key, ttl):
+            return True
+
+        def smembers(self, key):
+            return self.sets.get(key, set())
+
+        def sadd(self, key, value):
+            self.sets.setdefault(key, set()).add(value)
+
+        def srem(self, key, value):
+            self.sets.setdefault(key, set()).discard(value)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+            self.hashes.pop(key, None)
+            self.sets.pop(key, None)
+
+        def scan(self, cursor=0, match=None, count=100):
+            return 0, []
+
+    redis = FakeRedis()
+    queued = enqueue_segment_window(
+        redis,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=35,
+        prefetch_segments=3,
+        segment_frames=30,
+        client_epoch=7,
+    )
+    assert queued == [30, 60, 90]
+    items = [parse_queue_item(raw) for raw in redis.lists[REDIS_QUEUE_KEY]]
+    assert [item["seg_start"] for item in items] == [30, 60, 90]
+    assert items[0]["priority"] == 0
+    assert items[1]["priority"] == 1
+    assert items[0]["kind"] == "segment"
+    assert items[0]["client_epoch"] == 7
+    assert enqueue_segment_window(
+        redis,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=35,
+        prefetch_segments=3,
+        segment_frames=30,
+    ) == []
+
+    req_a = create_encode_request(
+        redis,
+        "j",
+        client_id="a",
+        client_epoch=1,
+        target_start=0,
+        starts=[0],
+    )
+    req_b = create_encode_request(
+        redis,
+        "j",
+        client_id="b",
+        client_epoch=4,
+        target_start=0,
+        starts=[0],
+    )
+    first = enqueue_segment_window(
+        redis,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=0,
+        prefetch_segments=1,
+        request_id=req_a,
+        client_id="a",
+    )
+    second = enqueue_segment_window(
+        redis,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=0,
+        prefetch_segments=1,
+        request_id=req_b,
+        client_id="b",
+    )
+    assert first == [0]
+    assert second == []
+    complete_segment_requests(redis, "j", 0)
+    assert get_encode_request(redis, "j", req_a)["status"] == "ready"
+    assert get_encode_request(redis, "j", req_b)["status"] == "ready"
+
+    req_c = create_encode_request(
+        redis,
+        "j",
+        client_id="c",
+        client_epoch=2,
+        target_start=0,
+        starts=[0],
+    )
+    enqueue_segment_window(
+        redis,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=0,
+        prefetch_segments=1,
+        request_id=req_c,
+    )
+    assert cancel_encode_request(redis, "j", req_c)
+    assert get_encode_request(redis, "j", req_c)["status"] == "cancelled"
+
+    stale = FakeRedis()
+    stale.hashes["sview:job:j"].update(
+        {
+            "source": "oss://b/a.mcap",
+            "status": "processing",
+            "publish_mode": "sparse",
+            "available_ranges": "[]",
+            "cancel": "0",
+        }
+    )
+    stale.values["sview:segment:pending:j:0"] = "old"
+    stale.values["sview:segment:lock:j:0"] = "dead-worker"
+    jid, recovered = enqueue_sparse_job(
+        stale,
+        "oss://b/a.mcap",
+        job_id="j",
+        segment_frames=30,
+    )
+    assert jid == "j" and recovered
+    assert stale.lists.get(REDIS_QUEUE_KEY, []) == []
+
+
+def test_one_window_reuses_one_encode_session():
+    from sview.jobs.job_status import ensure_sparse_session, set_client_frontier
+
+    class Store:
+        def __init__(self):
+            self.hashes = {}
+            self.values = {}
+            self.lists = {}
+
+        def hgetall(self, key):
+            return self.hashes.get(key, {})
+
+        def hset(self, key, *args, mapping=None):
+            row = self.hashes.setdefault(key, {})
+            if mapping is not None:
+                row.update(mapping)
+            elif len(args) == 2:
+                row[args[0]] = args[1]
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def lpush(self, key, value):
+            self.lists.setdefault(key, []).insert(0, value)
+
+    redis = Store()
+    assert set_client_frontier(redis, "j", "window-a", 95, segment_frames=30) == 90
+    assert ensure_sparse_session(
+        redis, "j", "oss://b/a.mcap", "window-a", segment_frames=30
+    )
+    assert not ensure_sparse_session(
+        redis, "j", "oss://b/a.mcap", "window-a", segment_frames=30
+    )
+    assert set_client_frontier(redis, "j", "window-a", 5040, segment_frames=30) == 5040
+    assert len(redis.lists[REDIS_QUEUE_KEY]) == 1
+    item = parse_queue_item(redis.lists[REDIS_QUEUE_KEY][0])
+    assert item["kind"] == "sparse_session"
+    assert item["client_id"] == "window-a"
+    assert ensure_sparse_session(
+        redis, "j", "oss://b/a.mcap", "window-b", segment_frames=30
+    )
+    assert len(redis.lists[REDIS_QUEUE_KEY]) == 2
+
+
+def test_one_active_segment_per_job():
+    from sview.jobs.job_status import claim_job_segment, release_job_segment
+
+    class Store:
+        def __init__(self):
+            self.values = {}
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def delete(self, key):
+            self.values.pop(key, None)
+
+    redis = Store()
+    assert claim_job_segment(redis, "j", 180, "worker-a")
+    assert not claim_job_segment(redis, "j", 210, "worker-b")
+    release_job_segment(redis, "j", "worker-b")
+    assert not claim_job_segment(redis, "j", 210, "worker-b")
+    release_job_segment(redis, "j", "worker-a")
+    assert claim_job_segment(redis, "j", 210, "worker-b")
+
+
+def test_targeted_encode_drops_warmup_pictures():
+    from sview.worker.cpu import _drop_leading_annexb_pictures
+
+    def picture(index: int, key: bool) -> bytes:
+        nal_type = 5 if key else 1
+        return b"\x00\x00\x00\x01" + bytes([nal_type, index])
+
+    blob = b"".join(picture(index, index == 0) for index in range(4))
+    kept = _drop_leading_annexb_pictures(blob, 2)
+    assert kept.startswith(b"\x00\x00\x00\x01\x01\x02")
+    assert _drop_leading_annexb_pictures(blob, 0) == blob
+
+
+def test_forward_encode_follows_playhead_and_seek():
+    from sview.jobs.job_status import enqueue_forward_from
+
+    class Store:
+        def __init__(self):
+            self.hashes = {}
+            self.values = {}
+            self.lists = {}
+            self.sets = {}
+
+        def hgetall(self, key):
+            return self.hashes.get(key, {})
+
+        def hincrby(self, key, field, amount):
+            row = self.hashes.setdefault(key, {})
+            value = int(row.get(field, 0)) + amount
+            row[field] = str(value)
+            return value
+
+        def hset(self, key, *args, mapping=None):
+            row = self.hashes.setdefault(key, {})
+            if mapping is not None:
+                row.update(mapping)
+            elif len(args) == 2:
+                row[args[0]] = args[1]
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def lpush(self, key, value):
+            self.lists.setdefault(key, []).insert(0, value)
+
+        def expire(self, key, ttl):
+            return True
+
+        def sadd(self, key, value):
+            self.sets.setdefault(key, set()).add(value)
+
+    redis = Store()
+    redis.hashes["sview:job:j"] = {
+        "available_ranges": "[[0,30]]",
+        "frame_count": "300",
+        "encode_status": "idle",
+    }
+    queued = enqueue_forward_from(
+        redis,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=0,
+        window=2,
+        set_frontier=True,
+    )
+    assert queued == [30, 60]
+    assert redis.hashes["sview:job:j"]["encode_frontier"] == "0"
+    items = [parse_queue_item(raw) for raw in redis.lists[REDIS_QUEUE_KEY]]
+    assert [item["seg_start"] for item in items] == [30, 60]
+
+    seek = Store()
+    seek.hashes["sview:job:j"] = {
+        "available_ranges": "[[90,120]]",
+        "frame_count": "300",
+        "encode_status": "idle",
+    }
+    queued = enqueue_forward_from(
+        seek,
+        "j",
+        "oss://b/a.mcap",
+        frame_index=95,
+        window=2,
+        set_frontier=True,
+    )
+    assert queued == [120, 150]
+    assert seek.hashes["sview:job:j"]["encode_frontier"] == "90"
+
+
+def test_cut_missing_file():
+    assert cut_log_time_ns("/no/such.mcap", 10) is None
+
+
+def test_sparse_cache_identity_is_shared_and_collision_safe():
+    source = "oss://bucket/a/path/shared.mcap"
+    first = sparse_cache_job_id(source)
+    assert first == sparse_cache_job_id(source)
+    assert first != sparse_cache_job_id("oss://bucket/other/path/shared.mcap")
+    assert first.startswith("shared_c")
+
+
+def test_queue_stats_show_session_and_waiting_job():
+    import json as _json
+
+    from sview.jobs.job_status import (
+        JOB_KEY_PREFIX,
+        REDIS_QUEUE_KEY,
+        WORKER_KEY_PREFIX,
+        collect_job_stats,
+    )
+
+    class Store:
+        def __init__(self):
+            self.values = {}
+            self.hashes = {}
+            self.lists = {REDIS_QUEUE_KEY: []}
+
+        def llen(self, key):
+            return len(self.lists.get(key, []))
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, ex=None):
+            self.values[key] = value
+            return True
+
+        def hgetall(self, key):
+            return self.hashes.get(key, {})
+
+        def scan(self, cursor=0, match=None, count=100):
+            keys = list(self.values) + list(self.hashes)
+            if match and match.endswith("*"):
+                prefix = match[:-1]
+                keys = [key for key in keys if str(key).startswith(prefix)]
+            return 0, keys
+
+    redis = Store()
+    running = "SSIEGO_running"
+    waiting = "SSIEGO_waiting"
+    redis.hashes[f"{JOB_KEY_PREFIX}{running}"] = {
+        "status": "processing",
+        "source": "oss://bucket/running.mcap",
+        "frames_done": "30",
+        "playable": "1",
+    }
+    redis.hashes[f"{JOB_KEY_PREFIX}{waiting}"] = {
+        "status": "queued",
+        "source": "oss://bucket/waiting.mcap",
+        "frames_done": "0",
+    }
+    redis.values[f"{WORKER_KEY_PREFIX}pod-1"] = _json.dumps(
+        {
+            "worker_id": "pod-1",
+            "pod_ip": "10.0.0.8",
+            "processing": 1,
+            "jobs": [f"{running}:client:window-a"],
+        }
+    )
+    stats = collect_job_stats(redis)
+    by_id = {item["job_id"]: item for item in stats["jobs"]}
+    assert stats["queued"] == 1
+    assert stats["processing"] == 1
+    assert by_id[running]["status"] == "processing"
+    assert by_id[running]["clients"] == ["window-a"]
+    assert by_id[waiting]["status"] == "queued"
+
+
+def test_second_window_skips_segment_owned_by_the_first():
+    from sview.worker.cpu import _next_session_segment
+
+    ranges = [[0, 60]]
+    nxt, blocked, skipped = _next_session_segment(
+        0,
+        120,
+        ranges,
+        30,
+        locked_fn=lambda seg: seg == 60,
+        cooling_fn=lambda seg: False,
+    )
+    assert nxt == 90
+    assert blocked is True
+    assert skipped == [60]
+
+    nxt, blocked, skipped = _next_session_segment(
+        60,
+        120,
+        ranges,
+        30,
+        locked_fn=lambda seg: False,
+        cooling_fn=lambda seg: seg == 60,
+    )
+    assert nxt == 90
+    assert blocked is True
+    assert skipped == []
+
+    nxt, blocked, skipped = _next_session_segment(
+        0,
+        120,
+        ranges,
+        30,
+        locked_fn=lambda seg: False,
+        cooling_fn=lambda seg: False,
+    )
+    assert nxt == 60
+    assert blocked is False
+    assert skipped == []
+
+    from sview.worker.cpu import FairEncodeGate
+
+    gate = FairEncodeGate(1, job_max=1, playable_max=1, foreground_reserve=0)
+    gate.acquire("job")
+    try:
+        gate.acquire("job", timeout=0.3)
+        raise AssertionError("encode gate wait should time out")
+    except TimeoutError:
+        pass
+    gate.release("job")
+    gate.acquire("job", timeout=0.3)
+    gate.release("job")
+
+
+if __name__ == "__main__":
+    test_parse_and_job_id()
+    test_remaining_frames()
+    test_queue_json_origin()
+    test_sparse_queue_item_and_priority_dedupe()
+    test_one_window_reuses_one_encode_session()
+    test_one_active_segment_per_job()
+    test_targeted_encode_drops_warmup_pictures()
+    test_forward_encode_follows_playhead_and_seek()
+    test_cut_missing_file()
+    test_sparse_cache_identity_is_shared_and_collision_safe()
+    test_queue_stats_show_session_and_waiting_job()
+    test_second_window_skips_segment_owned_by_the_first()
+    print("ok")

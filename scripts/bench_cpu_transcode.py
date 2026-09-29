@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sview_logging import setup_logging
+from sview.logging_setup import setup_logging
 
 log = setup_logging("bench_cpu_transcode")
 
@@ -79,7 +79,7 @@ CASES = [
         "force": cfg["force_reencode"],
         "notes": cfg["notes"],
     }
-    for tid, cfg in __import__("bench_types").BENCH_TYPES.items()
+    for tid, cfg in __import__("sview.jobs.bench_types", fromlist=["BENCH_TYPES"]).BENCH_TYPES.items()
 ]
 
 
@@ -108,7 +108,7 @@ def run_one_inprocess(cfg: dict) -> CaseResult:
         os.environ[k] = str(v)
 
     # Fresh import each subprocess invocation.
-    import sview_worker as mod
+    import sview.worker.cpu as mod
 
     mod.TRANSCODE_SIZE = int(cfg["size"])
     mod.TRANSCODE_WIDTH = 0

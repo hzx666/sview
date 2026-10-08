@@ -469,7 +469,42 @@ def test_queue_stats_show_session_and_waiting_job():
     assert by_id[waiting]["status"] == "queued"
 
 
-def test_second_window_skips_segment_owned_by_the_first():
+def test_forward_run_reuses_only_the_next_frame():
+    from sview.worker.cpu import _same_forward_cursor
+
+    assert _same_forward_cursor(240, 240)
+    assert not _same_forward_cursor(240, 270)
+    assert not _same_forward_cursor(None, 240)
+
+
+def test_playhead_behind_the_hole_does_not_drop_the_run():
+    from sview.worker.cpu import (
+        _forward_read_floor,
+        _frontier_left_forward_run,
+        _headcam_forward_topic,
+    )
+
+    ranges = [[0, 1350]]
+    assert not _frontier_left_forward_run(0, 1350, 36001, ranges, 30)
+    assert not _frontier_left_forward_run(1320, 1350, 36001, ranges, 30)
+    assert not _frontier_left_forward_run(1350, 1350, 36001, ranges, 30)
+    assert _frontier_left_forward_run(0, 21660, 36001, ranges, 30)
+    assert _frontier_left_forward_run(21660, 1350, 36001, ranges, 30)
+    assert not _frontier_left_forward_run(
+        1350, 1350, 36001, [[0, 1410]], 30, reading=1410,
+    )
+    assert _frontier_left_forward_run(
+        28860, 1380, 36001, [[0, 1380]], 30, reading=1380,
+    )
+    assert _forward_read_floor({"RR": 0, "FR": 80, "FL": 50}) == 50
+    assert _forward_read_floor({"RR": 0}) == 0
+    assert _headcam_forward_topic("/imu/sample")
+    assert _headcam_forward_topic("/camera/RR/video")
+    assert _headcam_forward_topic("/camera/FL/meta")
+    assert not _headcam_forward_topic("/lidar/points")
+
+
+def test_session_waits_on_the_first_missing_segment():
     from sview.worker.cpu import _next_session_segment
 
     ranges = [[0, 60]]
@@ -481,7 +516,7 @@ def test_second_window_skips_segment_owned_by_the_first():
         locked_fn=lambda seg: seg == 60,
         cooling_fn=lambda seg: False,
     )
-    assert nxt == 90
+    assert nxt is None
     assert blocked is True
     assert skipped == [60]
 
@@ -493,7 +528,7 @@ def test_second_window_skips_segment_owned_by_the_first():
         locked_fn=lambda seg: False,
         cooling_fn=lambda seg: seg == 60,
     )
-    assert nxt == 90
+    assert nxt is None
     assert blocked is True
     assert skipped == []
 
@@ -522,6 +557,30 @@ def test_second_window_skips_segment_owned_by_the_first():
     gate.acquire("job", timeout=0.3)
     gate.release("job")
 
+    from sview.worker import cpu as cpu_mod
+
+    tight = cpu_mod.FairEncodeGate(2, job_max=2, playable_max=2, foreground_reserve=0)
+    previous = cpu_mod.encode_gate
+    cpu_mod.encode_gate = tight
+    encoders = []
+    try:
+        encoders = [
+            cpu_mod.LiveX264Encoder.annexb(
+                codec="h264",
+                scale_w=16,
+                scale_h=16,
+                job_id="same-segment",
+            )
+            for _ in range(4)
+        ]
+        for enc in encoders:
+            enc._hold_slot()
+        assert sum(1 for enc in encoders if enc._acquired) == 2
+    finally:
+        for enc in encoders:
+            enc._release()
+        cpu_mod.encode_gate = previous
+
 
 if __name__ == "__main__":
     test_parse_and_job_id()
@@ -535,5 +594,7 @@ if __name__ == "__main__":
     test_cut_missing_file()
     test_sparse_cache_identity_is_shared_and_collision_safe()
     test_queue_stats_show_session_and_waiting_job()
-    test_second_window_skips_segment_owned_by_the_first()
+    test_forward_run_reuses_only_the_next_frame()
+    test_session_waits_on_the_first_missing_segment()
+    test_playhead_behind_the_hole_does_not_drop_the_run()
     print("ok")

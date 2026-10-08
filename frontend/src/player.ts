@@ -209,9 +209,27 @@ export class SviewPlayer {
     return this.playing;
   }
 
+  /**
+   * Frames encoded ahead of the playhead.
+   * Sparse ranges grow as segments publish; follow that end the same way
+   * non-sparse follows frames_available. Do not treat the whole movie as ready.
+   */
+  private publishedEnd(): number {
+    const m = this.manifest;
+    if (!m) return 0;
+    const idx = this.index;
+    const prefix = m.bundle.frames_available ?? 0;
+    if (idx < prefix) return prefix;
+    let end = 0;
+    for (const [a, b] of m.bundle.available_ranges ?? []) {
+      if (idx >= a && idx < b) end = Math.max(end, b);
+    }
+    return end;
+  }
+
   /** Frames currently on disk / safe to request (encoder frontier). */
   get Available() {
-    if (this.Sparse) return this.manifest?.bundle.frame_count ?? 0;
+    if (this.Sparse) return this.publishedEnd();
     return framesAvailable(this.manifest);
   }
 
@@ -223,14 +241,32 @@ export class SviewPlayer {
     return this.manifest?.publish_mode === "sparse";
   }
 
+  private rangeStart(): number {
+    const idx = this.index;
+    for (const [a, b] of this.manifest?.bundle.available_ranges ?? []) {
+      if (idx >= a && idx < b) return a;
+    }
+    const prefix = this.manifest?.bundle.frames_available ?? 0;
+    if (idx < prefix) return 0;
+    return idx;
+  }
+
+  /**
+   * A seek lands on the first frames of a new range. The 90-frame pad would
+   * sit behind that playhead, so playback never takes a step.
+   */
+  private sparseAtRangeFront(): boolean {
+    return this.Sparse && this.index - this.rangeStart() < FRONTIER_PAD_FRAMES;
+  }
+
   /**
    * Highest index+1 the playhead may enter while progressive.
    * Leaves FRONTIER_PAD_FRAMES behind the encoder so we don't kiss the wall.
    */
   private playLimit(): number {
     const raw = this.Available;
-    if (this.Sparse) return this.manifest?.bundle.frame_count ?? raw;
     if (this.Complete) return raw;
+    if (this.sparseAtRangeFront()) return raw;
     return Math.max(0, raw - FRONTIER_PAD_FRAMES);
   }
 
@@ -570,8 +606,9 @@ export class SviewPlayer {
       return false;
     }
 
-    // Progressive: hold playhead behind the encoder; hysteresis avoids chatter.
-    if (!this.Sparse && !this.Complete) {
+    // From-start keeps a 90-frame lead. A fresh seek has no lead yet: play the
+    // frames already published, and wait only after catching the encoder.
+    if (!this.Complete && !this.sparseAtRangeFront()) {
       const needLead = this.frontierHold
         ? FRONTIER_RESUME_FRAMES
         : FRONTIER_PAD_FRAMES;
@@ -605,7 +642,7 @@ export class SviewPlayer {
       }
     }
 
-    if (!this.Sparse && next >= raw) {
+    if (next >= raw) {
       if (this.Complete) {
         this.pause();
         this.cb.onStatus?.("Ended");
@@ -639,19 +676,13 @@ export class SviewPlayer {
 
     try {
       if (this.Sparse && !this.isSparseSegmentReady(next)) {
-        this.waitingForFrames = true;
-        this.cb.onStatus?.(`请求后续稀疏窗口… 第 ${next} 帧`);
-        try {
-          await this.ensureSparseSegmentReady(
-            next,
-            this.seekEpoch,
-            this.seekAbort?.signal,
-            true,
-          );
-        } finally {
-          this.waitingForFrames = false;
-        }
-        if (!this.playing) return false;
+        this.frontierHold = true;
+        this.cb.onStatus?.(
+          `缓冲中… 领先 ${this.frontierLead()} 帧（可用 ${this.Available}/${this.manifest.bundle.frame_count}）`,
+        );
+        await this.refreshManifest();
+        await new Promise((r) => window.setTimeout(r, 200));
+        return false;
       }
       await this.ensureSegmentBoundary(next);
       await this.showFrame(next);
@@ -689,17 +720,8 @@ export class SviewPlayer {
     const total = this.manifest?.bundle.frame_count ?? this.Available;
     if (nextStart >= total) return;
     if (this.Sparse && !this.isSparseSegmentReady(nextStart)) {
-      // Queue the next sparse window before playback reaches the boundary.
-      if (pos === Math.floor(segN / 2)) {
-        void this.ensureSparseSegmentReady(
-          nextStart,
-          epoch,
-          signal,
-          true,
-        ).catch(() => {
-          /* the boundary path retries and reports persistent failures */
-        });
-      }
+      // The encode session keeps reading forward from the seek point.
+      // Asking for this segment here would move that frontier and reopen the mcap.
       return;
     }
     if (!this.Sparse && nextStart >= this.Available) return;

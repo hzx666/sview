@@ -39,7 +39,7 @@ Resolution / quality (env or CLI):
   ENCODE_JOB_MAX_CONCURRENT=4        hard per-job ffmpeg cap (12/4 → 3 jobs fill pod)
   ENCODE_PLAYABLE_MAX_CONCURRENT=4   after playable, keep 4-cam parallel (1 = serializes, <realtime)
   ENCODE_FOREGROUND_RESERVE=0        slots kept for not-yet-playable jobs (0=auto ~25%)
-  LIVE_ENCODE=1                      hold 4 encode slots for the job so cameras stay parallel
+  LIVE_ENCODE=1                      one persistent ffmpeg per camera; slot held until the job ends
   ORIN_DIRECT=1                      JPEG 仅 CRF、不加 ABR（默认 0，与头显同一套 TRANSCODE_*）
   LOG_FILE=sview.log                 project log under cwd (shared by all modules)
   LOG_PROGRESS_EVERY_PCT=5           job progress log step (percent); 0=every callback
@@ -956,25 +956,34 @@ def _ffmpeg_annexb_input_flags() -> list[str]:
     ]
 
 
-def _x264_encode_flags(*, threads: int | None = None) -> list[str]:
-    """libx264 flags for live progressive encode (single-slice, no B-frames)."""
+def _x264_encode_flags(*, threads: int | None = None, sliced_threads: bool = False) -> list[str]:
+    """libx264 flags for live progressive encode (no B-frames).
+
+    The one-shot annex-B path keeps sliced_threads off so each picture is one
+    VCL NAL and `_split_h264_access_units` can cut frames. The persistent
+    pipe turns sliced threads on: frame threads would hold the tail pictures
+    until ffmpeg exits, and the FLV tag already groups every slice of a
+    picture into one frame.
+    """
     n = int(threads) if threads is not None else _x264_threads_now()
     n = max(1, n)
-    # sliced_threads=0 is required so each picture is one VCL NAL (AU split).
+    sliced = 1 if sliced_threads else 0
     params = (
-        f"threads={n}:sliced_threads=0:rc-lookahead=0:sync-lookahead=0:"
+        f"threads={n}:sliced_threads={sliced}:rc-lookahead=0:sync-lookahead=0:"
         "aq-mode=0:mbtree=0:weightp=0:8x8dct=0"
     )
+    # preset/tune reset x264 defaults. Params must come after them so
+    # lookahead stays 0 and the live pipe flushes every picture.
     return [
         "-c:v", "libx264",
         "-threads", str(n),
         "-flags", "+low_delay",
-        "-x264-params", params,
         "-profile:v", "baseline",
         "-preset", TRANSCODE_PRESET,
         "-tune", "zerolatency",
         "-bf", "0",
         "-pix_fmt", "yuv420p",
+        "-x264-params", params,
     ]
 
 
@@ -1255,11 +1264,161 @@ def _annexb_has_leading_ps(data: bytes, *, hevc: bool) -> bool:
     return 7 in seen and 8 in seen
 
 
-class LiveX264Encoder:
-    """Holds one encode-gate slot for the whole job; each chunk is a fresh ffmpeg.
+# Annex-B demuxer emits a picture when the next start code arrives. A trailing
+# AUD closes the last VCL without adding a picture, so a chunk can be read back
+# before the following chunk (or EOF) shows up.
+_H264_AUD_CLOSER = b"\x00\x00\x00\x01\x09\xf0"
+_HEVC_AUD_CLOSER = b"\x00\x00\x00\x01\x46\x01\x50"
 
-    After playable, per-chunk acquire used to serialize 4 cameras below realtime.
-    Each chunk is prefixed with cached VPS/SPS/PPS so HEVC P-frame chunks still decode.
+
+def _live_worker_threads(cameras: int) -> int:
+    """Threads for one persistent camera ffmpeg.
+
+    Same split as the old per-chunk encoder: ``X264_THREAD_BUDGET`` across the
+    cameras started together (and any slots already held), at least
+    ``X264_THREADS``, at most 8. Decode and encode both use this count as
+    slice threads, so a picture is emitted without closing the process.
+    """
+    floor = max(1, int(X264_THREADS))
+    cameras = max(1, int(cameras))
+    try:
+        holding = int(encode_gate.holding_count() or 0)
+    except Exception:
+        holding = 0
+    denom = max(cameras, holding, 1)
+    share = max(floor, int(X264_THREAD_BUDGET) // denom)
+    return min(8, share)
+
+
+class _FlvH264Reader:
+    """Pull complete H.264 pictures out of an FLV byte stream.
+
+    Each video tag carries its payload length, so the last picture of a chunk
+    is finished without waiting for the next frame.
+    """
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+        self._pos = 0
+        self._header = False
+        self._nal_len = 4
+        self._sps = b""
+        self._pps = b""
+
+    def feed(self, data: bytes) -> None:
+        if data:
+            self._buf.extend(data)
+
+    def pop_pictures(self) -> list[bytes]:
+        pics: list[bytes] = []
+        while True:
+            pic = self._next_picture()
+            if pic is None:
+                break
+            if pic:
+                pics.append(pic)
+        if self._pos:
+            del self._buf[: self._pos]
+            self._pos = 0
+        return pics
+
+    def _need(self, n: int) -> bool:
+        return self._pos + n <= len(self._buf)
+
+    def _next_picture(self) -> bytes | None:
+        if not self._header:
+            if not self._need(13):
+                return None
+            sig = bytes(self._buf[self._pos : self._pos + 3])
+            if sig != b"FLV":
+                raise RuntimeError("live ffmpeg output is not FLV")
+            header_size = int.from_bytes(self._buf[self._pos + 5 : self._pos + 9], "big")
+            if header_size < 9 or not self._need(header_size + 4):
+                return None
+            self._pos += header_size + 4
+            self._header = True
+        if not self._need(11):
+            return None
+        tag_type = self._buf[self._pos]
+        size = int.from_bytes(self._buf[self._pos + 1 : self._pos + 4], "big")
+        total = 11 + size + 4
+        if not self._need(total):
+            return None
+        payload = bytes(self._buf[self._pos + 11 : self._pos + 11 + size])
+        self._pos += total
+        if tag_type != 9 or len(payload) < 5 or (payload[0] & 0x0F) != 7:
+            return b""
+        packet_type = payload[1]
+        if packet_type == 0:
+            self._take_avcc(payload[5:])
+            return b""
+        if packet_type != 1:
+            return b""
+        return self._annexb_picture(payload)
+
+    def _take_avcc(self, body: bytes) -> None:
+        if len(body) < 7:
+            return
+        self._nal_len = (body[4] & 0x03) + 1
+        n_sps = body[5] & 0x1F
+        p = 6
+        sps: list[bytes] = []
+        for _ in range(n_sps):
+            if p + 2 > len(body):
+                return
+            ln = int.from_bytes(body[p : p + 2], "big")
+            p += 2
+            if p + ln > len(body):
+                return
+            sps.append(body[p : p + ln])
+            p += ln
+        if p >= len(body):
+            return
+        n_pps = body[p]
+        p += 1
+        pps: list[bytes] = []
+        for _ in range(n_pps):
+            if p + 2 > len(body):
+                return
+            ln = int.from_bytes(body[p : p + 2], "big")
+            p += 2
+            if p + ln > len(body):
+                return
+            pps.append(body[p : p + ln])
+            p += ln
+        self._sps = b"".join(b"\x00\x00\x00\x01" + n for n in sps)
+        self._pps = b"".join(b"\x00\x00\x00\x01" + n for n in pps)
+
+    def _annexb_picture(self, payload: bytes) -> bytes:
+        body = payload[5:]
+        nals: list[bytes] = []
+        p = 0
+        width = self._nal_len
+        while p + width <= len(body):
+            ln = int.from_bytes(body[p : p + width], "big")
+            p += width
+            if ln < 0 or p + ln > len(body):
+                break
+            if ln:
+                nals.append(body[p : p + ln])
+            p += ln
+        annex = b"".join(b"\x00\x00\x00\x01" + n for n in nals)
+        key = (payload[0] >> 4) == 1
+        has_ps = any((n[0] & 0x1F) in (7, 8) for n in nals if n)
+        if key and not has_ps and (self._sps or self._pps):
+            annex = self._sps + self._pps + annex
+        return annex
+
+
+class LiveX264Encoder:
+    """One ffmpeg process for the whole job, fed a chunk at a time.
+
+    A free encode-gate slot is taken until close(); if the job cap is already
+    full the process still starts, so the other cameras are not stuck waiting.
+    Decode and x264 both use the old per-chunk thread share as slice threads.
+    Frame threads would keep the last pictures inside the process until it
+    exits. Annex-B input is closed with an AUD so this chunk's pictures are
+    readable before the next chunk arrives.
     """
 
     def __init__(
@@ -1273,8 +1432,10 @@ class LiveX264Encoder:
         gop: int = 30,
         codec: str = "hevc",
         kind: str = "annexb",
+        threads: int | None = None,
     ):
         self._job_id = (job_id or "").strip() or "_anon_"
+        self._threads = max(1, int(threads)) if threads else 0
         self._in_args = list(in_args)
         self._scale_w = scale_w
         self._scale_h = scale_h
@@ -1283,10 +1444,19 @@ class LiveX264Encoder:
         self._kind = kind
         self._codec = (codec or "hevc").lower()
         self._hevc = self._codec in ("hevc", "h265", "h.265")
+        self._fps = 30.0
         self._ps: dict = {}
         self._sniffed = False
         self._closed = False
         self._acquired = False
+        self._proc: subprocess.Popen | None = None
+        self._flv = _FlvH264Reader()
+        self._out_buf = bytearray()
+        self._out_cv = threading.Condition()
+        self._stderr = bytearray()
+        self._stdout_eof = False
+        self._pending: list[bytes] = []
+        self._jpeg_hold = False
 
     def seed_param_sets(self, ps: dict | bytes | None) -> None:
         """Prime SPS/PPS (and HEVC VPS) from a later keyframe / full-bag scan."""
@@ -1300,20 +1470,23 @@ class LiveX264Encoder:
         self._ps.update(ps)
 
     @classmethod
-    def annexb(cls, *, codec: str, scale_w, scale_h, job_id: str | None, fps: float = 30.0):
+    def annexb(cls, *, codec: str, scale_w, scale_h, job_id: str | None, fps: float = 30.0, gop: int = 30, threads: int | None = None):
         in_fmt = "hevc" if (codec or "").lower() in ("hevc", "h265", "h.265") else "h264"
         fps_i = int(fps) if fps and fps > 0 else 30
         in_args = ["-f", in_fmt, "-r", str(fps_i), "-i", "pipe:0"]
-        return cls(
+        enc = cls(
             in_args=in_args,
             scale_w=scale_w,
             scale_h=scale_h,
             job_id=job_id,
             rate_args=_ffmpeg_x264_rate_args(),
-            gop=30,
+            gop=max(1, int(gop)),
             codec=in_fmt,
             kind="annexb",
+            threads=threads,
         )
+        enc._fps = float(fps_i)
+        return enc
 
     @classmethod
     def jpeg(
@@ -1325,6 +1498,7 @@ class LiveX264Encoder:
         fps: float = 30.0,
         crf: int = 23,
         direct: bool = True,
+        threads: int | None = None,
     ):
         fps_f = float(fps) if fps and fps > 0 else 30.0
         in_args = [
@@ -1338,7 +1512,7 @@ class LiveX264Encoder:
             rate_args = ["-crf", str(use_crf)]
         else:
             rate_args = _ffmpeg_x264_rate_args(crf=use_crf)
-        return cls(
+        enc = cls(
             in_args=in_args,
             scale_w=scale_w,
             scale_h=scale_h,
@@ -1347,7 +1521,10 @@ class LiveX264Encoder:
             gop=30,
             codec="mjpeg",
             kind="jpeg",
+            threads=threads,
         )
+        enc._fps = fps_f
+        return enc
 
     def _release(self) -> None:
         if not self._acquired:
@@ -1387,10 +1564,6 @@ class LiveX264Encoder:
                 continue
             continue
 
-    def seed_param_sets(self, ps: dict) -> None:
-        if ps:
-            self._ps.update(ps)
-
     def _with_param_sets(self, raw: bytes) -> bytes:
         found = _collect_annexb_param_sets(raw, hevc=self._hevc)
         if found:
@@ -1402,29 +1575,224 @@ class LiveX264Encoder:
             return raw
         return prefix + raw
 
-    def _jpeg_cmd(self, n_frames: int, output_path: Path) -> list:
-        gop = min(self._gop, max(1, int(n_frames)))
-        n_threads = _x264_threads_now()
+    def _scale_pair(self) -> tuple[int, int]:
+        w = int(self._scale_w) if self._scale_w else 0
+        h = int(self._scale_h) if self._scale_h else 0
+        if w <= 0:
+            w = _tc_size() if _tc_size() > 0 else (_tc_width() or 2096)
+        if h <= 0:
+            h = _tc_size() if _tc_size() > 0 else (_tc_height() or 2096)
+        return max(2, w), max(2, h)
+
+    def _video_filter(self, output_skip: int) -> str:
+        w, h = self._scale_pair()
+        scale = f"scale={w}:{h}:flags=fast_bilinear"
+        skip = max(0, int(output_skip or 0))
+        if skip <= 0:
+            return scale
+        fps = max(1, int(round(self._fps or 30)))
+        # select runs after decode and before x264, so warmup is not encoded
+        # and the first kept picture is an IDR.
+        return f"select='gte(n\\,{skip})',setpts=N/{fps}/TB,{scale}"
+
+    def _worker_threads(self) -> int:
+        if self._threads > 0:
+            return self._threads
+        return _live_worker_threads(1)
+
+    def _command(self, probesize: int, output_skip: int) -> list[str]:
+        n_threads = self._worker_threads()
+        fps_i = max(1, int(round(self._fps or 30)))
+        # JPEG chunks are closed with an extra picture that is discarded.
+        # All-intra keeps that picture from becoming a P-frame reference.
+        gop = 1 if self._kind == "jpeg" else self._gop
         cmd = [
-            FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
-            *_ffmpeg_fast_input_flags(),
-            "-threads", str(n_threads),
-            *self._in_args,
+            FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats",
+            "-probesize", str(max(32, int(probesize))),
+            "-analyzeduration", "0",
         ]
-        if self._scale_w and self._scale_h and int(self._scale_w) > 0 and int(self._scale_h) > 0:
-            cmd += ["-vf", f"scale={int(self._scale_w)}:{int(self._scale_h)}:flags=fast_bilinear"]
+        if self._kind == "jpeg":
+            # image2pipe emits an image when the next SOI arrives. The caller
+            # repeats the last JPEG so this chunk is released and that copy
+            # stays buffered. No input -framerate: it holds more than one image.
+            cmd += [
+                "-f", "image2pipe",
+                "-vcodec", "mjpeg",
+                "-i", "pipe:0",
+            ]
+        else:
+            in_fmt = "hevc" if self._hevc else "h264"
+            cmd += [
+                "-threads", str(n_threads),
+                "-thread_type", "slice",
+                "-fflags", "+genpts+discardcorrupt",
+                "-f", in_fmt, "-r", str(fps_i), "-i", "pipe:0",
+            ]
         cmd += [
             "-an",
-            *_x264_encode_flags(threads=n_threads),
+            "-vf", self._video_filter(output_skip),
+            *_x264_encode_flags(threads=n_threads, sliced_threads=True),
             *self._rate_args,
             "-g", str(gop),
             "-keyint_min", str(gop),
             "-sc_threshold", "0",
+            *(
+                []
+                if self._kind == "jpeg"
+                else ["-force_key_frames", f"expr:not(mod(n,{gop}))"]
+            ),
             "-bsf:v", "dump_extra=freq=keyframe",
-            "-f", "h264",
-            str(output_path),
+            "-flush_packets", "1",
+            "-f", "flv", "pipe:1",
         ]
         return cmd
+
+    def _hold_slot(self) -> None:
+        """Account for this ffmpeg when a slot is free.
+
+        Quad-cam keeps one process per camera for the whole segment. Those
+        four must start together. Waiting out the job cap (often 2 while two
+        siblings already hold slots) times out the segment after 120s.
+        """
+        if self._acquired:
+            return
+        try:
+            encode_gate.acquire(self._job_id, timeout=0)
+        except TimeoutError:
+            log.info(
+                "live ffmpeg starting without encode slot job=%s",
+                self._job_id,
+            )
+            return
+        self._acquired = True
+
+    def _stderr_text(self) -> str:
+        with self._out_cv:
+            err = bytes(self._stderr)
+        return err.decode(errors="replace")[-2000:]
+
+    def _start_proc(self, payload_len: int, output_skip: int) -> None:
+        self._hold_slot()
+        # Raw H.264/HEVC probe reads until probesize or EOF. A persistent
+        # stdin never EOFs, and a read larger than the bytes already written
+        # blocks. Keep probesize strictly under the first write.
+        if self._kind == "jpeg":
+            # image2pipe only needs the SOI marker; a large probesize makes
+            # the demuxer block for more bytes than this chunk contains.
+            probe = 32
+        else:
+            probe = min(8192, max(32, (int(payload_len) * 3) // 4))
+        cmd = self._command(probe, output_skip)
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+            )
+        except Exception:
+            self._release()
+            raise
+        threading.Thread(target=self._drain_stdout, name="sview-live-out", daemon=True).start()
+        threading.Thread(target=self._drain_stderr, name="sview-live-err", daemon=True).start()
+        log.info(
+            "live ffmpeg persistent pid=%s job=%s codec=%s threads=%s sliced=1",
+            self._proc.pid,
+            self._job_id,
+            self._codec,
+            self._worker_threads(),
+        )
+
+    def _drain_stdout(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        try:
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                with self._out_cv:
+                    self._out_buf.extend(chunk)
+                    self._out_cv.notify_all()
+        finally:
+            with self._out_cv:
+                self._stdout_eof = True
+                self._out_cv.notify_all()
+
+    def _drain_stderr(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stderr is None:
+            return
+        try:
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                with self._out_cv:
+                    self._stderr.extend(chunk)
+                    if len(self._stderr) > 8000:
+                        del self._stderr[:-4000]
+        except Exception:
+            return
+
+    def _read_pictures(self, count: int, timeout: float) -> list[bytes]:
+        if count <= 0:
+            return []
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        pics: list[bytes] = list(self._pending)
+        self._pending.clear()
+        while len(pics) < count:
+            with self._out_cv:
+                if self._out_buf:
+                    self._flv.feed(bytes(self._out_buf))
+                    self._out_buf.clear()
+                pics.extend(self._flv.pop_pictures())
+                if len(pics) >= count:
+                    break
+                proc = self._proc
+                dead = proc is None or proc.poll() is not None or self._stdout_eof
+                if dead and not self._out_buf:
+                    err = bytes(self._stderr).decode(errors="replace")[-2000:]
+                    raise RuntimeError(
+                        f"ffmpeg live session ended before {count} pictures "
+                        f"(got {len(pics)}): {err}"
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    err = bytes(self._stderr).decode(errors="replace")[-2000:]
+                    raise TimeoutError(
+                        f"ffmpeg live session timed out waiting for {count} pictures "
+                        f"(got {len(pics)}): {err}"
+                    )
+                self._out_cv.wait(timeout=min(0.2, remaining))
+        extra = pics[count:]
+        if extra:
+            self._pending.extend(extra)
+        return pics[:count]
+
+    def _kill_proc(self) -> None:
+        proc = self._proc
+        if proc is None:
+            return
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        self._proc = None
 
     def encode_frames(
         self,
@@ -1442,69 +1810,60 @@ class LiveX264Encoder:
         if not raw:
             return [b""] * n
         wait_s = timeout if timeout is not None else max(90.0, 3.0 * n)
-        encode_gate.acquire(self._job_id, timeout=120)
-        self._acquired = True
-        out_p: Path | None = None
-        try:
-            fd, out_s = tempfile.mkstemp(prefix="sview_live_", suffix=".h264")
-            os.close(fd)
-            out_p = Path(out_s)
-            if self._kind == "jpeg":
-                try:
-                    subprocess.run(
-                        self._jpeg_cmd(n, out_p),
-                        input=raw,
-                        capture_output=True,
-                        timeout=wait_s,
-                        check=True,
-                    )
-                    skip = max(0, int(output_skip or 0))
-                    if skip and out_p.is_file():
-                        out_p.write_bytes(
-                            _drop_leading_annexb_pictures(out_p.read_bytes(), skip)
-                        )
-                except subprocess.CalledProcessError as e:
-                    err = (e.stderr or b"").decode(errors="replace")[-2000:]
-                    raise RuntimeError(
-                        f"ffmpeg live-chunk failed (exit {e.returncode}): {err}"
-                    ) from e
-                except subprocess.TimeoutExpired as e:
-                    raise TimeoutError(
-                        f"ffmpeg live-chunk timeout after {wait_s:.0f}s ({n} frames)"
-                    ) from e
-            else:
+        skip = max(0, int(output_skip or 0))
+        first = self._proc is None
+        if self._kind != "jpeg":
+            if first:
                 self._sniff_codec(raw)
                 raw = self._with_param_sets(raw)
-                try:
-                    cpu_transcode_chunk(
-                        raw,
-                        out_p,
-                        int(self._scale_w) if self._scale_w else None,
-                        int(self._scale_h) if self._scale_h else None,
-                        "hevc" if self._hevc else "h264",
-                        job_id=self._job_id,
-                        acquire_gate=False,
-                        output_skip=output_skip,
-                    )
-                except subprocess.CalledProcessError as e:
-                    err = (e.stderr or b"").decode(errors="replace")[-2000:]
-                    raise RuntimeError(
-                        f"ffmpeg live-chunk failed (exit {e.returncode}): {err}"
-                    ) from e
-            blob = out_p.read_bytes() if out_p.is_file() else b""
-            return _split_h264_access_units(blob, None)
-        finally:
+            closer = _HEVC_AUD_CLOSER if self._hevc else _H264_AUD_CLOSER
+            payload = raw + closer
+            release_flush = 0
+        else:
+            # Repeat the last JPEG. A tiny synthetic JPEG is not enough for
+            # image2pipe to release the previous picture; a real SOI is.
+            payload = raw + frames[-1]
+            # That repeated picture is emitted at the start of the next chunk.
+            release_flush = 1 if self._jpeg_hold else 0
+            self._jpeg_hold = True
+        # First call bakes warmup into the filter graph (decode, don't encode).
+        # Later calls already have decoder state; drop encoded pictures instead.
+        baked_skip = skip if first else 0
+        drop_after = 0 if first else skip
+        to_read = n - baked_skip
+        if to_read < 0:
+            to_read = 0
+        try:
+            if first:
+                self._start_proc(len(payload), baked_skip)
+            proc = self._proc
+            if proc is None or proc.stdin is None or proc.poll() is not None:
+                raise RuntimeError(
+                    f"ffmpeg live session is not running: {self._stderr_text()}"
+                )
+            proc.stdin.write(payload)
+            proc.stdin.flush()
+            if to_read <= 0 and release_flush <= 0:
+                return []
+            want = (to_read if drop_after <= 0 else n) + release_flush
+            pics = self._read_pictures(want, wait_s)
+            if release_flush:
+                pics = pics[release_flush:]
+        except Exception:
+            self._kill_proc()
+            self._closed = True
             self._release()
-            if out_p is not None:
-                try:
-                    out_p.unlink()
-                except OSError:
-                    pass
+            raise
+        if drop_after > 0:
+            pics = pics[drop_after:]
+        return pics
 
     def close(self) -> None:
-        if self._closed:
+        if self._closed and self._proc is None:
+            self._release()
             return
         self._closed = True
+        self._kill_proc()
         self._release()
 
 
@@ -1524,6 +1883,8 @@ def _start_live_annexb_encoders(channels, camera_metas: dict, job_id: str, scale
     ovr = getattr(_tls, "override", None)
     encoders: dict = {}
 
+    n_threads = _live_worker_threads(len(channels))
+
     def _one(ch: str):
         codec = (camera_metas.get(ch, {}) or {}).get("codec") or "hevc"
         fps = float((camera_metas.get(ch, {}) or {}).get("fps") or 30)
@@ -1533,6 +1894,7 @@ def _start_live_annexb_encoders(channels, camera_metas: dict, job_id: str, scale
             scale_h=scale_h,
             job_id=job_id,
             fps=fps,
+            threads=n_threads,
         )
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1562,6 +1924,8 @@ def _start_live_jpeg_encoders(
     ovr = getattr(_tls, "override", None)
     encoders: dict = {}
 
+    n_threads = _live_worker_threads(len(channels))
+
     def _one(ch: str):
         fps = float((camera_metas.get(ch, {}) or {}).get("fps") or 30)
         return ch, LiveX264Encoder.jpeg(
@@ -1571,6 +1935,7 @@ def _start_live_jpeg_encoders(
             fps=fps,
             crf=crf,
             direct=direct,
+            threads=n_threads,
         )
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -2086,6 +2451,13 @@ def process_mcap(
     sparse_floor = min(sparse_anchors.values()) if sparse_anchors else None
     if sparse_floor is not None:
         cut_ns = sparse_floor
+    # A sparse window is a few dozen frames. Without an end time the reader
+    # keeps going through the rest of the bag when that window never fills,
+    # and output_frames stays 0 for the whole scan.
+    sparse_end_ns = None
+    if int(sparse_encode_count or 0) > 0 and sparse_anchors:
+        slack_s = max(5.0, int(sparse_encode_count) / 30.0)
+        sparse_end_ns = max(int(v) for v in sparse_anchors.values()) + int(slack_s * 1e9)
 
     def _after_origin(ts_ns, channel: str | None = None) -> bool:
         if origin_sec <= 0 and not sparse_anchors:
@@ -2379,7 +2751,13 @@ def process_mcap(
 
                     if enc is not None:
                         t0 = time.time()
-                        aus = _fit_aus(enc.encode_frames(frames_seg))
+                        # The session already decoded earlier pictures. Re-feeding
+                        # from the previous source IDR would encode them again.
+                        aus = list(enc.encode_frames(jpeg_frames[ch][f0:f1]))
+                        if len(aus) > want:
+                            aus = aus[:want]
+                        while len(aus) < want:
+                            aus.append(b"")
                         elapsed = time.time() - t0
                         nbytes = sum(len(a) for a in aus)
                         return ch, aus, elapsed, nbytes
@@ -2986,7 +3364,12 @@ def process_mcap(
 
                 if enc is not None:
                     t0 = time.time()
-                    aus = _fit_aus(enc.encode_frames(frames_seg))
+                    # Persistent decoder state replaces the per-chunk IDR prefix.
+                    aus = list(enc.encode_frames(jpeg_frames[ch][start:end]))
+                    if len(aus) > want:
+                        aus = aus[:want]
+                    while len(aus) < want:
+                        aus.append(b"")
                     elapsed = time.time() - t0
                     nbytes = sum(len(a) for a in aus)
                     return ch, aus, elapsed, nbytes
@@ -3079,7 +3462,7 @@ def process_mcap(
                     while len(channel_aus[ch]) < expect:
                         channel_aus[ch].append(b"")
                     if orin_kind == "h264":
-                        # Keep the current GOP (from last IDR) for the next fresh-ffmpeg chunk.
+                        # Stateless ffmpeg still re-decodes from the last source IDR.
                         origin = _h264_last_idr_index(jpeg_frames[ch], start)
                         if origin < 0:
                             origin = start
@@ -3367,7 +3750,16 @@ def process_mcap(
                     if final:
                         break
 
-            for msg in read_protobuf_messages(str(local_path), start_time_ns=cut_ns):
+            sparse_target = (
+                max(0, int(sparse_encode_offset or 0)) + max(0, int(sparse_encode_count or 0))
+                if int(sparse_encode_count or 0) > 0
+                else 0
+            )
+            for msg in read_protobuf_messages(
+                str(local_path),
+                start_time_ns=cut_ns,
+                end_time_ns=sparse_end_ns,
+            ):
                 topic = msg.topic
 
                 if "/meta" in topic and "camera" in topic.lower():
@@ -3395,6 +3787,8 @@ def process_mcap(
                     video_frames[ch_name].append(msg.proto_msg.data)
                     _append_video_ts(ch_name, msg.log_time_ns)
                     _flush_ready_chunks(final=False)
+                    if sparse_target and published_upto >= sparse_target:
+                        break
 
                 elif topic == "/imu/sample":
                     if not _after_origin(msg.log_time_ns):
@@ -3678,6 +4072,30 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
 
     aus.append(data[au_start:])
     return aus
+
+
+def _au_has_random_access(data: bytes) -> bool:
+    """H.264 IDR or HEVC IDR/CRA. Source seek must start on one of these."""
+    if _h264_payload_has_idr(data):
+        return True
+    pos = 0
+    raw = data or b""
+    while pos + 4 < len(raw):
+        if raw[pos:pos + 4] == b"\x00\x00\x00\x01":
+            hdr = raw[pos + 4:pos + 6]
+            pos += 4
+        elif raw[pos:pos + 3] == b"\x00\x00\x01":
+            hdr = raw[pos + 3:pos + 5]
+            pos += 3
+        else:
+            pos += 1
+            continue
+        if len(hdr) < 2:
+            continue
+        hevc_type = (hdr[0] >> 1) & 0x3F
+        if hevc_type in (19, 20, 21):
+            return True
+    return False
 
 
 def _h264_payload_has_idr(data: bytes) -> bool:
@@ -3987,6 +4405,7 @@ def _publish_sparse_segment(
     base_manifest: dict,
     frame_index_data: dict,
     epoch: int,
+    upload_index: bool = True,
 ) -> dict:
     """PUT segment first, then merge and publish sparse manifest under a lock."""
     from sview.cache.oss_cache_gc import (
@@ -4069,15 +4488,16 @@ def _publish_sparse_segment(
         _publish_manifest(out_dir / "manifest.json", manifest)
         if OSS_CACHE:
             _oss_cache_upload_manifest(job_id, manifest)
-            try:
-                upload_bytes_to_oss(
-                    oss_cache_key(job_id, "frame_index.json"),
-                    json.dumps(frame_index_data, separators=(",", ":")).encode("utf-8"),
-                    content_type="application/json; charset=utf-8",
-                    job_id=job_id,
-                )
-            except Exception:
-                log.exception("[%s] frame index upload failed", job_id)
+            if upload_index:
+                try:
+                    upload_bytes_to_oss(
+                        oss_cache_key(job_id, "frame_index.json"),
+                        json.dumps(frame_index_data, separators=(",", ":")).encode("utf-8"),
+                        content_type="application/json; charset=utf-8",
+                        job_id=job_id,
+                    )
+                except Exception:
+                    log.exception("[%s] frame index upload failed", job_id)
         ready_count = sum(
             max(0, (int(b) - int(a) + SEGMENT_FRAMES - 1) // SEGMENT_FRAMES)
             for a, b in ranges
@@ -4656,12 +5076,12 @@ def _next_session_segment(
     locked_fn,
     cooling_fn,
 ) -> tuple[int | None, bool, list[int]]:
-    """Pick the next unpublished segment for one window.
+    """Pick the next unpublished segment at or after the frontier.
 
-    A segment already owned by another window, or cooling down after a failure,
-    is left alone. The caller then encodes the following hole instead of
-    spinning on the same start. ``blocked`` means at least one missing segment
-    was skipped, so the session must stay alive even when nothing is selectable.
+    The first missing segment is the one playback is waiting on. If it is
+    locked or cooling down, return no segment so the caller waits and retries
+    it. Skipping ahead opens a hole the playhead cannot cross.
+    ``blocked`` means that segment exists but cannot be taken yet.
     """
     from sview.cache.oss_cache_gc import frame_range_ready
 
@@ -4676,27 +5096,541 @@ def _next_session_segment(
         missing = total <= 0 or (
             end > seg and not frame_range_ready(ranges, seg, end)
         )
+        # The playhead cannot cross a hole. Encoding a later segment while
+        # this one is locked or cooling leaves playback stuck on the gap.
         if missing and locked_fn(seg):
-            skipped_locked.append(seg)
-            blocked = True
-            if total <= 0:
-                break
-            seg += seg_n
-            guard += 1
-            continue
+            return None, True, [seg]
         if missing and cooling_fn(seg):
-            blocked = True
-            if total <= 0:
-                break
-            seg += seg_n
-            guard += 1
-            continue
+            return None, True, []
         if missing:
             nxt = seg
             break
         seg += seg_n
         guard += 1
     return nxt, blocked, skipped_locked
+
+
+def _same_forward_cursor(cursor: int | None, nxt: int) -> bool:
+    """True when the next segment continues the already-open read and ffmpeg."""
+    return cursor is not None and int(cursor) == int(nxt)
+
+
+def _frontier_left_forward_run(
+    frontier: int,
+    opened: int,
+    total: int,
+    ranges,
+    seg_n: int,
+    reading: int | None = None,
+) -> bool:
+    """True when the client now wants a different missing segment.
+
+    The playhead stays inside published frames while encoding walks the next
+    hole, so a frontier behind ``opened`` is normal. Abort when that frontier
+    points at an earlier hole, or when a new seek asks for some other segment
+    than the one currently being read.
+    """
+    current = int(opened if reading is None else reading)
+    nxt, _blocked, _skipped = _next_session_segment(
+        frontier,
+        total,
+        ranges,
+        seg_n,
+        locked_fn=lambda _seg: False,
+        cooling_fn=lambda _seg: False,
+    )
+    if nxt is None:
+        return int(frontier) < int(opened)
+    return int(nxt) != current
+
+
+def _forward_read_floor(anchors: dict) -> int:
+    """Earliest positive per-channel timestamp. A 0 must not rewind to byte 0."""
+    vals: list[int] = []
+    for raw in anchors.values():
+        try:
+            ts = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if ts > 0:
+            vals.append(ts)
+    return min(vals) if vals else 0
+
+
+def _headcam_forward_topic(topic: str) -> bool:
+    """Video, camera meta, and IMU. Other protobuf topics stay out of the read."""
+    from sview.ingest.orin_images import sview_channel_for_topic
+
+    raw = (topic or "").strip()
+    if raw == "/imu/sample":
+        return True
+    if "/meta" in raw and "camera" in raw.lower():
+        return sview_channel_for_topic(raw) is not None
+    if "/video" in raw or "/h264" in raw.lower():
+        return sview_channel_for_topic(raw) is not None
+    return False
+
+
+def _headcam_forward_topics(path: Path) -> list[str]:
+    """Topic allow-list for one head-cam forward read. IMU is included."""
+    from mcap.reader import make_reader
+
+    found: list[str] = []
+    try:
+        with Path(path).open("rb") as fh:
+            summary = make_reader(fh).get_summary()
+        if summary is not None:
+            for channel in summary.channels.values():
+                topic = (channel.topic or "").strip()
+                if topic and _headcam_forward_topic(topic) and topic not in found:
+                    found.append(topic)
+    except Exception:
+        log.exception("head-cam topic scan failed for %s", path)
+    if found:
+        return found
+    return [
+        "/camera/RR/video",
+        "/camera/FR/video",
+        "/camera/RL/video",
+        "/camera/FL/video",
+        "/camera/RR/meta",
+        "/camera/FR/meta",
+        "/camera/RL/meta",
+        "/camera/FL/meta",
+        "/imu/sample",
+    ]
+
+
+class _HeadcamForwardRun:
+    """One open mcap and one set of live ffmpeg processes for a forward play.
+
+    Opened at a seek. Contiguous later segments keep feeding that reader and
+    those encoders. A backward seek, a hole, or session end closes it.
+    """
+
+    def __init__(self, *, local_path: Path, job_id: str, source: str, seg_n: int):
+        self.path = local_path
+        self.job_id = job_id
+        self.source = source
+        self.seg_n = max(1, int(seg_n))
+        self.next_frame: int | None = None
+        self.open_frame = 0
+        self.index: dict = {}
+        self.metas: dict = {}
+        self.channels: list[str] = []
+        self.frames: dict[str, list] = defaultdict(list)
+        self.timestamps: dict[str, list] = defaultdict(list)
+        self.imu: list[dict] = []
+        self.encoders: dict | None = None
+        self._messages = None
+        self._anchors: dict[str, int] = {}
+        self._seg_anchors: dict[str, int] = {}
+        self._primed = False
+        self._floor = 0
+        self._seek_check_at = 0.0
+        self._index_uploaded = False
+        self.closed = False
+
+    def continues(self, nxt: int) -> bool:
+        return (not self.closed) and _same_forward_cursor(self.next_frame, nxt)
+
+    def close(self) -> None:
+        self.closed = True
+        self.next_frame = None
+        _close_live_encoders(self.encoders)
+        self.encoders = None
+        gen = self._messages
+        self._messages = None
+        if gen is not None:
+            try:
+                gen.close()
+            except Exception:
+                pass
+
+    def open_at(self, start: int, frame_index: dict) -> None:
+        from sview.ingest.frame_index import sparse_anchor_map
+
+        self.close()
+        self.closed = False
+        self.index = frame_index
+        total = int(frame_index.get("frame_count") or 0)
+        if total and start >= total:
+            raise ValueError(f"segment start {start} past frame_count {total}")
+        # Open on the previous source IDR, not on the segment boundary.
+        # A P-frame there does not decode, so 30 inputs come back as fewer pictures.
+        lookback = min(int(start), 120)
+        origin = int(start) - lookback
+        self._seg_anchors = sparse_anchor_map(frame_index, start)
+        origin_anchors = (
+            sparse_anchor_map(frame_index, origin)
+            if origin != int(start)
+            else self._seg_anchors
+        )
+        self._anchors = origin_anchors
+        self._floor = _forward_read_floor(origin_anchors)
+        self._primed = False
+        self._seek_check_at = 0.0
+        self.open_frame = int(start)
+        self.next_frame = int(start)
+        self.frames = defaultdict(list)
+        self.timestamps = defaultdict(list)
+        self.imu = []
+        self.channels = []
+        self.metas = {}
+        topics = _headcam_forward_topics(self.path)
+        self._messages = read_protobuf_messages(
+            str(self.path),
+            start_time_ns=self._floor or None,
+            topics=topics,
+        )
+        log.info(
+            "[%s] forward run opened at frame %d floor=%d topics=%d (video, meta, imu)",
+            self.job_id,
+            start,
+            self._floor,
+            len(topics),
+        )
+
+    def _accept_ts(self, ts_ns: int, channel: str | None) -> bool:
+        try:
+            t = int(ts_ns)
+        except (TypeError, ValueError):
+            return True
+        if channel is not None and channel in self._anchors:
+            return t >= int(self._anchors[channel])
+        return t >= int(self._floor or 0)
+
+    def _pull_until(self, need: int, seek_back) -> None:
+        if not self.channels:
+            self.channels = list(HEADCAM_CHANNELS)
+        while min(len(self.frames[ch]) for ch in self.channels) < need:
+            self._read_one(seek_back)
+
+    def _pull_segment(self, need: int, seek_back) -> None:
+        if not self.channels:
+            self.channels = list(HEADCAM_CHANNELS)
+        while not self._segment_ready(need):
+            self._read_one(seek_back)
+
+    def _read_one(self, seek_back) -> None:
+        from sview.ingest.orin_images import sview_channel_for_topic
+
+        now = time.monotonic()
+        if now - self._seek_check_at >= 0.1:
+            self._seek_check_at = now
+            if seek_back():
+                raise SparseSegmentAborted()
+        try:
+            msg = next(self._messages)
+        except StopIteration as exc:
+            raise RuntimeError(
+                f"mcap ended before aligned frames at {self.next_frame}"
+            ) from exc
+        topic = msg.topic or ""
+        if "/meta" in topic and "camera" in topic.lower():
+            ch = sview_channel_for_topic(topic)
+            if ch and ch not in self.metas:
+                try:
+                    p = msg.proto_msg
+                    self.metas[ch] = {
+                        "width": int(p.width),
+                        "height": int(p.height),
+                        "fps": int(getattr(p, "fps", 30)),
+                        "position": str(getattr(p, "position", ch)),
+                        "codec": str(getattr(p, "codec", "") or "").lower(),
+                    }
+                except Exception:
+                    pass
+            return
+        if "/video" in topic or "/h264" in topic.lower():
+            ch = sview_channel_for_topic(topic)
+            if not ch or ch not in HEADCAM_CHANNEL_SET:
+                return
+            if not self._accept_ts(msg.log_time_ns, ch):
+                return
+            self.frames[ch].append(msg.proto_msg.data)
+            self.timestamps[ch].append(int(msg.log_time_ns))
+            return
+        if topic == "/imu/sample" and self._accept_ts(msg.log_time_ns, None):
+            try:
+                p = msg.proto_msg
+                self.imu.append({
+                    "log_time_ns": int(msg.log_time_ns),
+                    "monotonic_ns": str(p.monotonic_raw_ns),
+                    "wall_ns": str(p.wall_ns),
+                    "x": p.x, "y": p.y, "z": p.z,
+                    "temp_c": p.temp_c,
+                    "unit": p.unit,
+                    "scale": p.scale,
+                    "sample_index": int(getattr(p, "sample_index", len(self.imu))),
+                })
+            except Exception:
+                pass
+
+    def _ensure_encoders(self) -> None:
+        if self.encoders is not None:
+            return
+        if _resize_requested():
+            _apply_output_scale(self.metas)
+        sw = _scale_dim(self.metas, "w")
+        sh = _scale_dim(self.metas, "h")
+        ovr = getattr(_tls, "override", None)
+        encoders: dict = {}
+        n_threads = _live_worker_threads(len(self.channels))
+
+        def _one(ch: str):
+            meta = self.metas.get(ch) or {}
+            codec = meta.get("codec") or "hevc"
+            fps = float(meta.get("fps") or 30)
+            return ch, LiveX264Encoder.annexb(
+                codec=str(codec),
+                scale_w=sw,
+                scale_h=sh,
+                job_id=self.job_id,
+                fps=fps,
+                gop=self.seg_n,
+                threads=n_threads,
+            )
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, len(self.channels))) as pool:
+                futs = [pool.submit(_tls_call, ovr, _one, ch) for ch in self.channels]
+                for fut in as_completed(futs):
+                    ch, enc = fut.result()
+                    encoders[ch] = enc
+            self.encoders = encoders
+            log.info(
+                "[%s] forward run ffmpeg x%d gop=%d threads=%d",
+                self.job_id, len(encoders), self.seg_n, n_threads,
+            )
+        except Exception:
+            _close_live_encoders(encoders)
+            raise
+
+    def _segment_ready(self, need: int) -> bool:
+        if not self.channels:
+            return False
+        for ch in self.channels:
+            anchor = None if self._primed else self._seg_anchors.get(ch)
+            if anchor is None:
+                if len(self.frames[ch]) < need:
+                    return False
+                continue
+            cut = next(
+                (i for i, t in enumerate(self.timestamps[ch]) if int(t) >= int(anchor)),
+                None,
+            )
+            if cut is None or len(self.frames[ch]) < cut + need:
+                return False
+        return True
+
+    def _pull_segment(self, need: int, seek_back) -> None:
+        while not self._segment_ready(need):
+            before = sum(len(v) for v in self.frames.values())
+            self._pull_until(before + 1 if self.channels else need, seek_back)
+            # _pull_until waits for a raw count. Loop until the segment anchor is covered.
+
+    def _encode_blobs(self, need: int) -> list[bytes]:
+        assert self.encoders is not None
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        ovr = getattr(_tls, "override", None)
+        aus_by_ch: dict[str, list] = {}
+        ts_by_ch: dict[str, list] = {}
+        first = not self._primed
+
+        def _one(ch: str):
+            frames = self.frames[ch]
+            ts = self.timestamps[ch]
+            cut = 0
+            skip = 0
+            if first:
+                anchor = self._seg_anchors.get(ch)
+                if anchor is not None:
+                    for i, t in enumerate(ts):
+                        if int(t) >= int(anchor):
+                            cut = i
+                            break
+                idr = cut
+                for i in range(min(cut, len(frames) - 1), -1, -1):
+                    if frames[i] and _au_has_random_access(frames[i]):
+                        idr = i
+                        break
+                skip = max(0, cut - idr)
+                if skip:
+                    log.info(
+                        "[%s] %s warmup %d frames from source IDR before frame %s",
+                        self.job_id, ch, skip, self.next_frame,
+                    )
+            feed = frames[cut - skip:cut + need]
+            aus = self.encoders[ch].encode_frames(feed, output_skip=skip)
+            if len(aus) > need:
+                aus = aus[:need]
+            while len(aus) < need:
+                aus.append(b"")
+            return ch, aus, cut + need, ts[cut:cut + need]
+
+        with ThreadPoolExecutor(max_workers=max(1, len(self.channels))) as pool:
+            futs = [pool.submit(_tls_call, ovr, _one, ch) for ch in self.channels]
+            for fut in as_completed(futs):
+                ch, aus, drop, ts_out = fut.result()
+                aus_by_ch[ch] = aus
+                ts_by_ch[ch] = ts_out
+                self.frames[ch] = self.frames[ch][drop:]
+                self.timestamps[ch] = self.timestamps[ch][drop:]
+        blobs: list[bytes] = []
+        codecs = {
+            ch: str((self.metas.get(ch) or {}).get("stored_codec") or "h264")
+            for ch in self.channels
+        }
+        imu_at = 0
+        imu_drop = 0
+        for i in range(need):
+            streams = {ch: aus_by_ch[ch][i] for ch in self.channels}
+            ts_vals = [ts_by_ch[ch][i] for ch in self.channels if i < len(ts_by_ch.get(ch, []))]
+            ts = min(ts_vals) if ts_vals else 0
+            nxt_vals = [
+                ts_by_ch[ch][i + 1]
+                for ch in self.channels
+                if i + 1 < len(ts_by_ch.get(ch, []))
+            ]
+            tw_end = min(nxt_vals) if nxt_vals else ts + 33_333_333
+            samples = []
+            while imu_at < len(self.imu) and int(self.imu[imu_at]["log_time_ns"]) < ts:
+                imu_at += 1
+            j = imu_at
+            while j < len(self.imu) and int(self.imu[j]["log_time_ns"]) < tw_end:
+                samples.append(self.imu[j])
+                j += 1
+            imu_drop = j
+            is_key = all(
+                (not streams[ch]) or _h264_payload_has_idr(streams[ch])
+                for ch in self.channels
+            )
+            blobs.append(_build_bundle_frame(
+                i,
+                streams,
+                ts,
+                [ts, tw_end],
+                is_key,
+                {"samples": samples},
+                {"records": []},
+                codecs,
+            ))
+        self._primed = True
+        self.imu = self.imu[imu_drop:]
+        return blobs
+
+    def publish_segment(
+        self,
+        r,
+        start: int,
+        end: int,
+        *,
+        owner: str,
+        epoch: int,
+        seek_back,
+        on_playable=None,
+    ) -> str:
+        """Encode and publish [start, end) on the already-open run."""
+        from sview.jobs.job_status import (
+            POD_IP,
+            job_active_key,
+            release_segment_claim,
+            segment_lock_key,
+            set_job_fields,
+        )
+
+        if self.closed or self.next_frame != start:
+            raise RuntimeError(f"forward run is not positioned at {start}")
+        lock_key = segment_lock_key(self.job_id, start)
+        if not r.set(lock_key, owner, nx=True, ex=180):
+            log.info("[%s] sparse segment %d already owned", self.job_id, start)
+            return "busy"
+        renewer = _RedisValueLockRenewer(
+            r, lock_key, owner, ttl=180,
+            also=[(job_active_key(self.job_id), f"{start}:{owner}")],
+        )
+        renewer.start()
+        try:
+            if seek_back():
+                raise SparseSegmentAborted()
+            set_job_fields(
+                r,
+                self.job_id,
+                status="processing",
+                publish_mode="sparse",
+                encode_status="encoding",
+                encode_window=json.dumps([start, end], separators=(",", ":")),
+                decode_start=start,
+                input_frames=0,
+                output_frames=0,
+                segment_epoch=epoch,
+                owner_pod=POD_IP,
+                error="",
+            )
+            with temporary_transcode_settings(force_reencode=1):
+                need = end - start
+                self._pull_segment(need, seek_back)
+                self._ensure_encoders()
+                blobs = self._encode_blobs(need)
+            manifest = _build_manifest_dict(
+                job_id=self.job_id,
+                camera_metas=self.metas,
+                frame_count=int(self.index.get("frame_count") or 0) or None,
+                frames_available=0,
+                key_frame_indices=[start],
+                timeline_start_ns=0,
+                timeline_end_ns=0,
+                status="partial",
+            )
+            _publish_sparse_segment(
+                r,
+                job_id=self.job_id,
+                source=self.source,
+                start=start,
+                end=end,
+                frame_blobs=blobs,
+                base_manifest=manifest,
+                frame_index_data=self.index,
+                epoch=epoch,
+                upload_index=not self._index_uploaded,
+            )
+            self._index_uploaded = True
+            self.next_frame = end
+            log.info("[%s] forward run published [%d:%d)", self.job_id, start, end)
+            if on_playable is not None:
+                on_playable(self.job_id)
+            return "ok"
+        except SparseSegmentAborted:
+            log.info("[%s] forward run dropped; seek left frame %d", self.job_id, self.open_frame)
+            self.close()
+            return "seek"
+        except BaseException as exc:
+            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                raise
+            log.exception("[%s] forward segment %d failed", self.job_id, start)
+            try:
+                set_job_fields(
+                    r,
+                    self.job_id,
+                    status="processing",
+                    publish_mode="sparse",
+                    encode_status="failed",
+                    error=str(exc)[:500],
+                )
+            except Exception:
+                pass
+            self.close()
+            return "error"
+        finally:
+            renewer.stop()
+            try:
+                release_segment_claim(r, self.job_id, start, owner=owner)
+            except Exception:
+                log.exception("[%s] release segment claim failed", self.job_id)
 
 
 def _run_sparse_session(r, item: dict, on_playable=None) -> None:
@@ -4726,6 +5660,12 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
     renewer.start()
     fail_counts: dict[int, int] = {}
     retry_after: dict[int, float] = {}
+    forward: _HeadcamForwardRun | None = None
+    local_path = redis_path_to_local(source)
+    use_forward = (
+        ingest_family(source) == "head_cam"
+        and local_path.suffix.lower() not in (".hdf5", ".h5", ".hdf")
+    )
     try:
         idle = 0
         while idle < 10:
@@ -4754,7 +5694,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
             )
             for skipped in skipped_locked:
                 log.info(
-                    "[%s] window %s leaves segment %d to the thread already encoding it",
+                    "[%s] window %s waits; segment %d is already being encoded",
                     job_id,
                     client_id,
                     skipped,
@@ -4769,22 +5709,81 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                         time.sleep(0.4)
                 continue
             idle = 0
-            log.info("[%s] window %s encodes segment %d", job_id, client_id, nxt)
-            result = _run_one_segment_job(
-                r,
-                {
-                    "source": source,
-                    "job_id": job_id,
-                    "seg_start": nxt,
-                    "seg_end": (min(total, nxt + seg_n) if total > 0 else nxt + seg_n),
-                    "segment_frames": seg_n,
-                    "client_id": client_id,
-                    "request_id": "",
-                },
-                on_playable=on_playable,
-                session_client=client_id,
-                bound_frontier=frontier,
-            )
+            seg_end = min(total, nxt + seg_n) if total > 0 else nxt + seg_n
+            if use_forward:
+                try:
+                    if forward is None or not forward.continues(nxt):
+                        if forward is not None:
+                            log.info(
+                                "[%s] forward run reopen at %d (cursor was %s)",
+                                job_id, nxt, forward.next_frame,
+                            )
+                            forward.close()
+                        from sview.ingest.frame_index import load_or_build_frame_index
+
+                        index_path = LOCAL_OUTPUT_DIR / job_id / "frame_index.json"
+                        index_path.parent.mkdir(parents=True, exist_ok=True)
+                        frame_index = load_or_build_frame_index(local_path, index_path)
+                        forward = _HeadcamForwardRun(
+                            local_path=local_path,
+                            job_id=job_id,
+                            source=source,
+                            seg_n=seg_n,
+                        )
+                        forward.open_at(nxt, frame_index)
+                    else:
+                        log.info(
+                            "[%s] forward run continues at frame %d without reopening mcap",
+                            job_id, nxt,
+                        )
+
+                    def _seek_back(
+                        opened: int = forward.open_frame,
+                        reading: int = nxt,
+                    ) -> bool:
+                        return _frontier_left_forward_run(
+                            read_client_frontier(r, job_id, client_id),
+                            opened,
+                            total,
+                            ranges,
+                            seg_n,
+                            reading=reading,
+                        )
+
+                    result = forward.publish_segment(
+                        r,
+                        nxt,
+                        seg_end,
+                        owner=owner,
+                        epoch=int(item.get("segment_epoch") or 0),
+                        seek_back=_seek_back,
+                        on_playable=on_playable,
+                    )
+                    if forward.closed:
+                        forward = None
+                except Exception:
+                    log.exception("[%s] forward run failed at %d", job_id, nxt)
+                    if forward is not None:
+                        forward.close()
+                        forward = None
+                    result = "error"
+            else:
+                log.info("[%s] window %s encodes segment %d", job_id, client_id, nxt)
+                result = _run_one_segment_job(
+                    r,
+                    {
+                        "source": source,
+                        "job_id": job_id,
+                        "seg_start": nxt,
+                        "seg_end": seg_end,
+                        "segment_frames": seg_n,
+                        "client_id": client_id,
+                        "request_id": "",
+                    },
+                    on_playable=on_playable,
+                    session_client=client_id,
+                    bound_frontier=frontier,
+                )
             if result == "busy":
                 time.sleep(1.0)
             elif result == "error":
@@ -4793,13 +5792,15 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                 delay = min(30.0, 5.0 * nfail)
                 retry_after[nxt] = time.time() + delay
                 log.info(
-                    "[%s] window %s segment %d failed; encode the next free segment and retry this one in %.0fs",
+                    "[%s] window %s segment %d failed; retry it in %.0fs",
                     job_id,
                     client_id,
                     nxt,
                     delay,
                 )
     finally:
+        if forward is not None:
+            forward.close()
         renewer.stop()
         current = r.get(alive)
         if isinstance(current, bytes):

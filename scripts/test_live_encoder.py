@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Persistent live ffmpeg: one process, several chunks, one AU per picture."""
+"""常驻 live ffmpeg：一个进程、多段 chunk、每幅图一个 AU。"""
 import subprocess
 import sys
 from pathlib import Path
@@ -113,7 +113,7 @@ def test_h264_persists_across_chunks():
         second = enc.encode_frames(frames[30:])
         if enc._proc is None or enc._proc.pid != pid:
             raise AssertionError("live session was restarted between chunks")
-        # GOP is 30, so picture 30 (first of this chunk) is an IDR.
+        # GOP 为 30，所以第 30 幅（本段第一幅）是 IDR。
         _assert_chunk(second, 10, key0=True)
         if _decode_count(first + second) != 40:
             raise AssertionError("concatenated pictures did not decode to 40 frames")
@@ -164,7 +164,7 @@ def test_jpeg_persists_across_chunks():
         pid = enc._proc.pid
         second = enc.encode_frames(frames[3:])
         _assert_chunk(first, 3, key0=True)
-        # JPEG live output is all-intra so the flush picture is not a reference.
+        # JPEG live 输出全是帧内，刷出的那幅不是参考帧。
         _assert_chunk(second, 3, key0=True)
         if enc._proc is None or enc._proc.pid != pid:
             raise AssertionError("jpeg session was restarted")

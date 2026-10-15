@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sparse MCAP frame-index alignment helpers."""
+"""稀疏 mcap 帧号对齐辅助函数。"""
 import sys
 import tempfile
 from pathlib import Path

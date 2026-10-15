@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CPU transcode benchmark: first-frame + full-job times under fixed settings."""
+"""CPU 转码基准：固定参数下的首帧与全任务耗时。"""
 
 from __future__ import annotations
 
@@ -107,7 +107,7 @@ def run_one_inprocess(cfg: dict) -> CaseResult:
     for k, v in env_update.items():
         os.environ[k] = str(v)
 
-    # Fresh import each subprocess invocation.
+    # 每次子进程调用都重新 import。
     import sview.worker.cpu as mod
 
     mod.TRANSCODE_SIZE = int(cfg["size"])

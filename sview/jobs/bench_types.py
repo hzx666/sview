@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Shared bench/test type definitions (1–8) for HTTP test API and offline bench."""
+"""HTTP 测试接口和离线 bench 共用的类型定义（1–8）。"""
 
 from __future__ import annotations
 
 import os
 from typing import Any, Optional
 
-# type → scenario. `source_kind` selects default file via env BENCH_H264_SOURCE / BENCH_H265_SOURCE.
+# type → 场景。`source_kind` 用环境变量 BENCH_H264_SOURCE / BENCH_H265_SOURCE 选默认文件。
 BENCH_TYPES: dict[int, dict[str, Any]] = {
     1: {
         "name": "H264 直出(passthrough)",
@@ -100,7 +100,7 @@ def list_bench_types() -> list[dict[str, Any]]:
 
 
 def bench_job_id(source: str, type_id: int) -> str:
-    """Stable cache id per (source, type) so scenarios do not collide."""
+    """按 (source, type) 固定缓存 id，场景之间不撞。"""
     from sview.jobs.job_status import job_id_from_source
 
     base = job_id_from_source(source)
@@ -108,7 +108,7 @@ def bench_job_id(source: str, type_id: int) -> str:
 
 
 def default_source_for_kind(kind: str) -> Optional[str]:
-    """Resolve default OSS/local path from env for h264/h265 bench files."""
+    """从环境变量解析 h264/h265 bench 文件的默认 OSS 或本地路径。"""
     kind = (kind or "").lower()
     if kind == "h264":
         return (os.environ.get("BENCH_H264_SOURCE") or "").strip() or None
@@ -118,7 +118,7 @@ def default_source_for_kind(kind: str) -> Optional[str]:
 
 
 def resolve_bench_source(type_id: int, source: Optional[str] = None) -> str:
-    """Pick explicit source, else env default for the type's kind."""
+    """优先用显式 source，否则用该类型 kind 的环境变量默认值。"""
     source = (source or "").strip()
     if source:
         return source

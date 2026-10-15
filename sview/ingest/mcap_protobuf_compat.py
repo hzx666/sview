@@ -1,15 +1,14 @@
-"""Tolerant protobuf MCAP reader for SSIEGO / head-cam bags.
+"""容忍非标准编码的 protobuf mcap 读取，给 SSIEGO / 头显包用。
 
-Official ``mcap_protobuf.reader.read_protobuf_messages`` requires
-``channel.message_encoding == schema.encoding == "protobuf"`` and fails the
-whole file on the first non-protobuf channel. Recorders sometimes write
-``proto`` / empty encoding, or mix in a ROS2/JSON topic.
+官方 ``mcap_protobuf.reader.read_protobuf_messages`` 要求
+``channel.message_encoding == schema.encoding == "protobuf"``，
+遇到第一个非 protobuf 通道就整文件失败。录制端有时写成
+``proto`` / 空编码，或混进 ROS2/JSON topic。
 
-This reader:
-- treats common aliases / empty encoding as protobuf when schema data looks
-  like a FileDescriptorSet
-- matches schema.name to a message in the FDS even if it is a file name
-- skips channels it cannot decode instead of aborting
+本读取器：
+- 常见别名或空编码，只要 schema 数据像 FileDescriptorSet，就当 protobuf
+- schema.name 对上 FDS 里的消息，即使它是文件名
+- 解不了的通道跳过，不中断
 """
 
 from __future__ import annotations
@@ -48,7 +47,7 @@ _NON_PROTO = {
     "omgidl",
 }
 
-# SSIEGO / SView logical cameras. One `/camera/{ch}/video` message == one frame.
+# SSIEGO / SView 逻辑相机。一条 `/camera/{ch}/video` 消息就是一帧。
 _HEADCAM_CHANNELS = ("RR", "FR", "RL", "FL")
 _HEADCAM_CHANNEL_SET = frozenset(_HEADCAM_CHANNELS)
 _HEADCAM_VIDEO_RE = re.compile(r"^/camera/(RR|FR|RL|FL)/video/?$", re.IGNORECASE)
@@ -178,12 +177,11 @@ def _headcam_video_channel(topic: str) -> Optional[str]:
 def headcam_frame_count_from_channel_counts(
     topic_counts: dict[str, int],
 ) -> Optional[int]:
-    """Aligned head-cam frame count from per-topic message counts.
+    """用各 topic 消息数算出对齐后的头显帧数。
 
-    Uses min(RR,FR,RL,FL) when the SView quad is present; otherwise min of
-    whatever video topics were counted (head-cam `/camera/{RR,FR,RL,FL}/video`
-    or teleop `/camera/{f_l,f_r,left_wrist,right_wrist}/h264`). Returns None
-    if none.
+    有 SView 四路时取 min(RR,FR,RL,FL)；否则取已计数视频 topic 的最小值
+    （头显 `/camera/{RR,FR,RL,FL}/video` 或遥操
+    `/camera/{f_l,f_r,left_wrist,right_wrist}/h264`）。一个都没有则返回 None。
     """
     video: dict[str, int] = {}
     for topic, n in topic_counts.items():
@@ -205,12 +203,12 @@ def headcam_frame_count_from_channel_counts(
 
 
 def read_headcam_video_frame_count(source: Union[str, Path]) -> Optional[int]:
-    """Read total aligned video frames from MCAP Summary (footer seek).
+    """从 mcap Summary 读对齐后的视频总帧数（文件尾寻址）。
 
-    Uses ``Statistics.channel_message_counts`` for head-cam
-    ``/camera/{RR,FR,RL,FL}/video`` and teleop
-    ``/camera/{f_l,f_r,left_wrist,right_wrist}/h264``.
-    Returns None when the file has no summary, no statistics, or no video channels.
+    用 ``Statistics.channel_message_counts``，覆盖头显
+    ``/camera/{RR,FR,RL,FL}/video`` 和遥操
+    ``/camera/{f_l,f_r,left_wrist,right_wrist}/h264``。
+    文件没有 summary、没有 statistics 或没有视频通道时返回 None。
     """
     path = Path(source)
     if not path.is_file():
@@ -238,7 +236,7 @@ def read_headcam_video_frame_count(source: Union[str, Path]) -> Optional[int]:
 
 
 class TolerantProtobufDecoderFactory(DecoderFactory):
-    """DecoderFactory that accepts non-canonical protobuf encodings and names."""
+    """接受非标准 protobuf 编码和名字的 DecoderFactory。"""
 
     def decoder_for(self, message_encoding: str, schema: Optional[Schema]):
         if schema is None or not _looks_protobuf(message_encoding, schema):
@@ -276,7 +274,7 @@ def read_protobuf_messages_compat(
     end_time_ns: Optional[int] = None,
     topics: Optional[Iterable[str]] = None,
 ) -> Iterator[McapProtobufMessage]:
-    """Yield protobuf messages; skip other encodings instead of raising."""
+    """产出 protobuf 消息；其他编码跳过，不抛异常。"""
     path = str(source)
     factory = TolerantProtobufDecoderFactory()
     skipped_encodings: dict[str, int] = {}

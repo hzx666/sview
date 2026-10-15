@@ -1,4 +1,4 @@
-/** Annex-B H.264 helpers for WebCodecs. */
+/** 给 WebCodecs 用的 Annex-B H.264。 */
 
 export type NalInfo = { offset: number; startCodeLen: number; type: number };
 
@@ -50,7 +50,7 @@ export function extractSpsPps(
   return { sps, pps };
 }
 
-/** Build codec string like avc1.640032 from SPS NAL body (no start code). */
+/** 从 SPS NAL 体（无起始码）拼 codec 字符串，如 avc1.640032。 */
 export function codecFromSps(sps: Uint8Array): string {
   if (sps.length < 4) return "avc1.64001f";
   const profile = sps[1];
@@ -60,21 +60,21 @@ export function codecFromSps(sps: Uint8Array): string {
   return `avc1.${hex(profile)}${hex(compat)}${hex(level)}`;
 }
 
-/** AVCDecoderConfigurationRecord for VideoDecoder description. */
+/** 给 VideoDecoder description 用的 AVCDecoderConfigurationRecord。 */
 export function buildAvcC(sps: Uint8Array, pps: Uint8Array): Uint8Array {
   const out = new Uint8Array(11 + sps.length + pps.length);
   let o = 0;
-  out[o++] = 1; // configurationVersion
+  out[o++] = 1; // 配置版本
   out[o++] = sps[1];
   out[o++] = sps[2];
   out[o++] = sps[3];
-  out[o++] = 0xff; // lengthSizeMinusOne = 3 → 4-byte lengths
-  out[o++] = 0xe1; // one SPS
+  out[o++] = 0xff; // 长度占 4 字节（lengthSizeMinusOne = 3）
+  out[o++] = 0xe1; // 一个 SPS
   out[o++] = (sps.length >> 8) & 0xff;
   out[o++] = sps.length & 0xff;
   out.set(sps, o);
   o += sps.length;
-  out[o++] = 1; // one PPS
+  out[o++] = 1; // 一个 PPS
   out[o++] = (pps.length >> 8) & 0xff;
   out[o++] = pps.length & 0xff;
   out.set(pps, o);
@@ -82,10 +82,10 @@ export function buildAvcC(sps: Uint8Array, pps: Uint8Array): Uint8Array {
 }
 
 /**
- * Annex-B → AVCC.
- * @param vclOnly when true (recommended with avcC description), only keep
- *   slice NALs (1/5). Hardware decoders often fail if SPS/PPS/SEI are repeated
- *   inside samples after configure({ description }).
+ * 把 Annex-B 转成 AVCC。
+ * @param vclOnly 为 true 时（建议配合 avcC description）只保留
+ *   切片 NAL（1/5）。硬解常会失败：SPS/PPS/SEI 若在
+ *   调用 configure({ description }) 之后的 sample 里重复出现。
  */
 export function annexBToAvcc(data: Uint8Array, vclOnly = true): Uint8Array {
   const nals = findNals(data);

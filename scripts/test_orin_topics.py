@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agilex / Orin camera topic matching."""
+"""Agilex / Orin 相机 topic 匹配。"""
 import sys
 from pathlib import Path
 
@@ -71,7 +71,7 @@ def test_orin_frame_count_from_channel_counts():
     }
     assert orin_frame_count_from_channel_counts(teleop, "h264") == 180
 
-    # Head-cam protobuf topics must not be counted as Orin.
+    # 头显 protobuf topic 不能算成 Orin。
     headcam = {
         "/camera/RR/video": 919,
         "/camera/FR/video": 919,
@@ -142,7 +142,92 @@ def test_unknown_teleop_topics_keep_names():
     assert jpeg and jpeg[:2] == b"\xff\xd8"
 
 
+def test_unitree_compressed_video_named_like_jpeg():
+    from sview.ingest.orin_images import classify_teleop_forward_topic
+
+    topic = "/camera/head/color/image_raw/compressed"
+    video = "foxglove_msgs/msg/CompressedVideo"
+    image = "sensor_msgs/msg/CompressedImage"
+    assert classify_teleop_forward_topic(topic, video, kind="h264") == "video"
+    assert classify_teleop_forward_topic(topic, video, kind="jpeg") is None
+    assert classify_teleop_forward_topic(topic, image, kind="h264") is None
+    assert classify_teleop_forward_topic(topic, image, kind="jpeg") == "video"
+
+
+_COMPRESSED_IMAGE_MSGDEF = """std_msgs/Header header
+string format
+uint8[] data
+================================================================================
+MSG: std_msgs/Header
+builtin_interfaces/Time stamp
+string frame_id
+================================================================================
+MSG: builtin_interfaces/Time
+int32 sec
+uint32 nanosec
+"""
+
+
+def _write_compressed_image_mcap(path: Path, streams: dict) -> None:
+    from mcap_ros2.writer import Writer
+
+    with open(path, "wb") as fh:
+        writer = Writer(fh)
+        schema = writer.register_msgdef("sensor_msgs/msg/CompressedImage", _COMPRESSED_IMAGE_MSGDEF)
+        for i in range(3):
+            for topic, (fmt, data) in streams.items():
+                t = 1_000_000_000 + i * 33_000_000
+                writer.write_message(
+                    topic,
+                    schema,
+                    {
+                        "header": {"stamp": {"sec": 1, "nanosec": i}, "frame_id": ""},
+                        "format": fmt,
+                        "data": data,
+                    },
+                    log_time=t,
+                    publish_time=t,
+                )
+        writer.finish()
+
+
+def test_codec_comes_from_payload_not_topic_name():
+    import tempfile
+
+    from sview.ingest.frame_index import build_mcap_frame_index
+    from sview.ingest.orin_images import (
+        _video_topics_from_summary,
+        channel_payload_kinds,
+        orin_stream_kind,
+        teleop_forward_topics,
+    )
+
+    idr = b"\x00\x00\x00\x01\x67\x42\x00\x1e" + b"\x00\x00\x00\x01\x65" + b"\x11" * 16
+    jpeg = b"\xff\xd8\xff\xe0" + b"\x00" * 16 + b"\xff\xd9"
+    h264_topic = "/camera/left/image_raw/compressed"
+    jpeg_topic = "/camera/right/image_raw/compressed"
+    with tempfile.TemporaryDirectory() as tmp:
+        mixed = Path(tmp) / "mixed.mcap"
+        _write_compressed_image_mcap(
+            mixed, {h264_topic: ("h264", idr), jpeg_topic: ("jpeg", jpeg)}
+        )
+        assert channel_payload_kinds(mixed) == {h264_topic: "h264", jpeg_topic: "jpeg"}
+        assert orin_stream_kind(mixed, skip_headcam_guard=True) == "h264"
+        assert _video_topics_from_summary(mixed, kind="h264") == [h264_topic]
+        assert _video_topics_from_summary(mixed, kind="jpeg") == [jpeg_topic]
+        assert [t for t, role in teleop_forward_topics(mixed, kind="jpeg") if role == "video"] == [jpeg_topic]
+
+        h264_only = Path(tmp) / "h264_in_compressed_image.mcap"
+        _write_compressed_image_mcap(h264_only, {h264_topic: ("", idr)})
+        assert orin_stream_kind(h264_only, skip_headcam_guard=True) == "h264"
+        index = build_mcap_frame_index(h264_only)
+        assert index["kind"] == "orin_h264"
+        assert index["frame_count"] == 3
+
+
 if __name__ == "__main__":
+    test_codec_comes_from_payload_not_topic_name()
+    test_unitree_compressed_video_named_like_jpeg()
     test_agilex_image_raw_topics()
     test_orin_frame_count_from_channel_counts()
     test_unknown_teleop_topics_keep_names()

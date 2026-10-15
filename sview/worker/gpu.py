@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-mcap processor – GPU transcode HEVC->H264 MP4, upload to OSS (or local output with --no-upload).
+mcap 处理：GPU 把 HEVC 转成 H.264 MP4，上传 OSS（或 --no-upload 写到本地）。
 
-Two modes:
---path <file>         Process a single mcap file.
-(no --path)           Poll Redis queue every 10s for /head-cam/... paths.
+两种模式：
+--path <file>         处理单个 mcap。
+(无 --path)           每 10 秒从 Redis 队列取 /head-cam/... 路径。
 
-All config via environment variables (K8s Secret friendly).
+配置全部来自环境变量（方便挂 K8s Secret）。
 """
 
 import os
@@ -28,22 +28,22 @@ from sview.logging_setup import setup_logging
 from sview.jobs.bundle_frame import pack_bundle_frame, build_streams_manifest
 
 # ---------------------------------------------------------------------------
-#  Logging  (shared project log under cwd)
+#  日志（工作目录下的项目日志）
 # ---------------------------------------------------------------------------
 log = setup_logging("sview_work_gpu")
 
 # ---------------------------------------------------------------------------
-#  Configuration  (all from env vars)
+#  配置（全部来自环境变量）
 # ---------------------------------------------------------------------------
 
 # -- Redis --
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_USERNAME = os.environ.get("REDIS_USERNAME") or None  # Aliyun Redis ACL
+REDIS_USERNAME = os.environ.get("REDIS_USERNAME") or None  # 阿里云 Redis ACL
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 REDIS_QUEUE_KEY = os.environ.get("REDIS_QUEUE_KEY", "player:queue")
-# -- Local mounts (K8s YAML mounts OSS prefixes here; see path_map.py) --
+# -- 本地挂载（K8s YAML 把 OSS 前缀挂到这里；见 path_map.py） --
 from sview.path_map import (
     HEAD_CAM_MOUNT,
     ORIN_MOUNT,
@@ -52,7 +52,7 @@ from sview.path_map import (
     classify_source,
 )
 
-LOCAL_MOUNT_PATH = HEAD_CAM_MOUNT  # legacy alias (= /head-data by default)
+LOCAL_MOUNT_PATH = HEAD_CAM_MOUNT  # 旧别名（默认 /head-data）
 REDIS_PATH_PREFIX = os.environ.get("REDIS_PATH_PREFIX", "/head-cam")
 
 # -- OSS --
@@ -67,11 +67,11 @@ OSS_OUTPUT_PREFIX = os.environ.get("OSS_OUTPUT_PREFIX", "processed_data").strip(
 OSS_OUTPUT_SUB = os.environ.get("OSS_OUTPUT_SUB", "ego_human_data/head_cam").strip("/")
 NO_UPLOAD = os.environ.get("NO_UPLOAD", "0").lower() in ("1", "true", "yes")
 
-# -- Local output (used when --no-upload) --
+# -- 本地输出（--no-upload 时使用） --
 LOCAL_OUTPUT_DIR = Path(os.environ.get("LOCAL_OUTPUT_DIR", str(Path(__file__).parent / "output")))
 LOCAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# -- FFmpeg & GPU --
+# -- ffmpeg 与 GPU --
 _default_ffmpeg = "ffmpeg"
 if sys.platform == "win32":
     _default_ffmpeg = r"C:\Users\10279\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
@@ -81,18 +81,18 @@ GPU_CONCURRENCY = int(os.environ.get("GPU_CONCURRENCY", "2"))
 nvenc_lock = threading.Semaphore(GPU_CONCURRENCY)
 CHUNK_FRAMES = int(os.environ.get("CHUNK_FRAMES", "150"))
 
-# -- Transcode quality --
-# TRANSCODE_SIZE: 0 = keep source camera resolution (local/playable style);
-# set e.g. 720 via env/--scale to downscale.
+# -- 转码画质 --
+# TRANSCODE_SIZE：0 表示保持源相机分辨率（本地/可播放风格）；
+# 通过环境变量或 --scale 设成例如 720 来降分辨率。
 TRANSCODE_SIZE = int(os.environ.get("TRANSCODE_SIZE", "0"))
-TRANSCODE_CQ = int(os.environ.get("TRANSCODE_CQ", "35"))       # NVENC CQ, higher = smaller
+TRANSCODE_CQ = int(os.environ.get("TRANSCODE_CQ", "35"))       # NVENC CQ，越大文件越小
 TRANSCODE_BITRATE = os.environ.get("TRANSCODE_BITRATE", "2M")
 TRANSCODE_MAXRATE = os.environ.get("TRANSCODE_MAXRATE", "3M")
 TRANSCODE_BUFSIZE = os.environ.get("TRANSCODE_BUFSIZE", "4M")
 TRANSCODE_PRESET = os.environ.get("TRANSCODE_PRESET", "p1")
 
 
-# -- Temp working directory --
+# -- 临时工作目录 --
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", tempfile.gettempdir())) / "mcap_processor"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -149,11 +149,11 @@ def get_redis():
 
 
 # ---------------------------------------------------------------------------
-#  Path mapping  (OSS URI / legacy queue path -> local mount; see path_map.py)
+#  路径映射（OSS URI / 旧队列路径 → 本地挂载；见 path_map.py）
 # ---------------------------------------------------------------------------
 
 def local_path_to_oss_base(local_path: Path) -> str:
-    """Derive output key prefix from local source path (for optional OSS upload)."""
+    """从本地源路径推出输出 key 前缀（可选 OSS 上传用）。"""
     lp = str(local_path).replace("\\", "/")
     rel = None
     for mount in (HEAD_CAM_MOUNT, ORIN_MOUNT, LOCAL_MOUNT_PATH):
@@ -169,15 +169,15 @@ def local_path_to_oss_base(local_path: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  GPU transcoding
+#  GPU 转码
 # ---------------------------------------------------------------------------
 
 def gpu_transcode_chunk(raw_data: bytes, output_path: Path,
                         scale_w: int = None, scale_h: int = None,
                         codec: str = "hevc") -> float:
-    """Transcode raw video -> H.264 using NVENC GPU, resize to (scale_w, scale_h).
+    """用 NVENC GPU 把原始视频转成 H.264，缩放到 (scale_w, scale_h)。
 
-    codec: source codec ('hevc'/'h265' or 'h264'/'avc'); selects ffmpeg -f input.
+    codec：源编码（'hevc'/'h265' 或 'h264'/'avc'）；决定 ffmpeg -f 输入格式。
     """
     if not scale_w:
         scale_w = TRANSCODE_SIZE if TRANSCODE_SIZE > 0 else 2096
@@ -250,14 +250,14 @@ def _concat_h264_chunks(chunk_paths: list, output_path: Path):
                 out.write(inf.read())
 
 # ---------------------------------------------------------------------------
-#  Processing
+#  处理
 # ---------------------------------------------------------------------------
 
 
 
 
 def process_mcap(source_path, no_upload=False):
-    """GPU transcode HEVC->H264 MP4, upload to OSS (or save locally if no_upload)."""
+    """GPU 把 HEVC 转成 H.264 MP4，上传 OSS（no_upload 时存本地）。"""
     local_path = Path(source_path)
     if not local_path.exists():
         raise FileNotFoundError(f"File not found: {source_path}")
@@ -275,10 +275,10 @@ def process_mcap(source_path, no_upload=False):
     work_dir = TEMP_DIR / f"job_{local_path.stem}_{int(time.time())}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Accumulators
-    video_frames = defaultdict(list)  # ch_name -> [bytes, ...]
-    video_timestamps = defaultdict(list)  # ch_name -> [log_time_ns of each frame]
-    imu_rows = []          # all raw IMU samples
+    # 累积器
+    video_frames = defaultdict(list)  # ch_name -> [字节, ...]
+    video_timestamps = defaultdict(list)  # ch_name -> [每帧 log_time_ns]
+    imu_rows = []          # 全部原始 IMU 采样
     camera_metas = {}      # ch_name -> {width, height, fps, position}
     futures = []
     channel_found = set()
@@ -294,7 +294,7 @@ def process_mcap(source_path, no_upload=False):
         for msg in read_protobuf_messages(str(local_path)):
             topic = msg.topic
 
-            # ----- Camera meta -----
+            # ----- 相机元数据 -----
             if "/meta" in topic and "camera" in topic.lower():
                 parts = topic.split("/")
                 if len(parts) >= 3:
@@ -312,7 +312,7 @@ def process_mcap(source_path, no_upload=False):
                         except Exception:
                             pass
 
-            # --- Video ---
+            # --- 视频 ---
             elif "/video" in topic:
                 ch_name = topic.split("/")[2]
                 channel_found.add(ch_name)
@@ -347,8 +347,8 @@ def process_mcap(source_path, no_upload=False):
             # --- IMU ---
             elif topic == "/imu/sample":
                 p = msg.proto_msg
-                # Match local/playable IMU schema: use proto sample_index;
-                # sensor_type is int and only kept when non-zero (gyro=1).
+                # 对齐本地/可播放 IMU 结构：用 proto 的 sample_index；
+                # sensor_type 是整数，只在非 0 时保留（gyro=1）。
                 row = {
                     "log_time_ns": msg.log_time_ns,
                     "monotonic_ns": str(p.monotonic_raw_ns),
@@ -365,7 +365,7 @@ def process_mcap(source_path, no_upload=False):
                 imu_rows.append(row)
                 total_imu += 1
 
-        # Final video chunk
+        # 最后一段视频
         min_total = min(len(f) for f in video_frames.values()) if video_frames else 0
         processed = chunk_idx * CHUNK_FRAMES
         if processed < min_total:
@@ -386,11 +386,11 @@ def process_mcap(source_path, no_upload=False):
         log.info("[%s]  Parsed: %d video frames x %d ch,  %d IMU",
                 fname, total_video_frames, len(video_frames), total_imu)
 
-        # Align timeline + IMU onto monotonic_raw_ns (verify / SView-safe).
+        # 把时间轴和 IMU 对齐到 monotonic_raw_ns（校验 / SView 安全）。
         if _rebase_timestamps_to_monotonic(video_timestamps, imu_rows):
             log.info("[%s]  Rebased timestamps onto monotonic_raw_ns", fname)
 
-        # --- Wait for GPU jobs, collect results ---
+        # --- 等 GPU 任务，收集结果 ---
         transcode_results = defaultdict(list)
         for fut in as_completed(futures):
             ch_name, cidx, path, elapsed = fut.result()
@@ -399,8 +399,8 @@ def process_mcap(source_path, no_upload=False):
 
         print(f"\r  [{fname}] Concatenating...", end="", flush=True)
 
-        # --- Concat per channel, split into per-frame AUs ---
-        channel_aus = {}  # ch_name -> list of AU byte arrays
+        # --- 按通道拼接，再拆成逐帧 AU ---
+        channel_aus = {}  # ch_name -> AU 字节数组列表
         for ch_name in sorted(transcode_results.keys()):
             chunks_sorted = sorted(transcode_results[ch_name], key=lambda x: x[0])
             chunk_paths = [c[1] for c in chunks_sorted]
@@ -420,14 +420,14 @@ def process_mcap(source_path, no_upload=False):
                 except OSError:
                     pass
 
-        # --- Build per-frame bundle bins ---
+        # --- 生成逐帧 bundle bin ---
         min_frames = min(len(aus) for aus in channel_aus.values()) if channel_aus else 0
         key_frame_indices = []
         output_frame_dir = work_dir / "frames"
         output_frame_dir.mkdir(parents=True, exist_ok=True)
 
 
-        # Sort IMU rows by log_time_ns for efficient time-window queries
+        # 按 log_time_ns 排序 IMU，方便按时间窗查询
         imu_sorted = sorted(imu_rows, key=lambda r: r["log_time_ns"])
         imu_idx = 0
 
@@ -437,7 +437,7 @@ def process_mcap(source_path, no_upload=False):
                 aus = channel_aus[ch]
                 streams_data[ch] = aus[fidx] if fidx < len(aus) else b''
 
-            # Determine keyframe by checking for IDR NAL (type 5)
+            # 看有没有 IDR NAL（类型 5）来判断关键帧
             is_keyframe = True
             for ch, data in streams_data.items():
                 if not data:
@@ -448,7 +448,7 @@ def process_mcap(source_path, no_upload=False):
             if is_keyframe:
                 key_frame_indices.append(fidx)
 
-            # ---- Multi-camera time window (spec: min across all channels) ----
+            # ---- 多相机时间窗（约定：取所有通道的最小值） ----
             all_ts = []
             all_next_ts = []
             for ch in sorted(channel_aus.keys()):
@@ -465,7 +465,7 @@ def process_mcap(source_path, no_upload=False):
                 tw_end = tw_start + int(1e9 / 30)
 
 
-            # ---- IMU time-window sampling ----
+            # ---- IMU 时间窗采样 ----
             events_payload = {"records": []}
             imu_samples = []
 
@@ -474,8 +474,8 @@ def process_mcap(source_path, no_upload=False):
             j = imu_idx
             while j < len(imu_sorted) and imu_sorted[j]["log_time_ns"] < tw_end:
                 r = imu_sorted[j]
-                # Field order/content aligned with local_full_mcap_flow_verify bins
-                # (frontend-playable): no segment_index; sensor_type only for gyro.
+                # 字段顺序和内容对齐 local_full_mcap_flow_verify 的 bin
+                # （前端可播放）：不要 segment_index；sensor_type 只给陀螺。
                 entry = {"sample_index": r["sample_index"]}
                 if r.get("sensor_type"):
                     entry["sensor_type"] = int(r["sensor_type"])
@@ -491,7 +491,7 @@ def process_mcap(source_path, no_upload=False):
                 imu_samples.append(entry)
                 j += 1
 
-            # ---- Build IMU payload for bin per doc ----
+            # ---- 按文档组装 bin 里的 IMU payload ----
             imu_payload = {"samples": imu_samples}
 
             bundle = _build_bundle_frame(
@@ -509,8 +509,8 @@ def process_mcap(source_path, no_upload=False):
 
         log.info("[%s]  Built %d frame bundles (%d keyframes)", fname, min_frames, len(key_frame_indices))
 
-        # --- Write manifest.json ---
-        # Compute timeline_end_ns using frame interval estimation (spec 4.1)
+        # --- 写 manifest.json ---
+        # 用帧间隔估算 timeline_end_ns（约定 4.1）
         if channel_aus and video_timestamps:
             first_ch = sorted(channel_aus.keys())[0]
             ts_list = video_timestamps.get(first_ch, [])
@@ -553,10 +553,10 @@ def process_mcap(source_path, no_upload=False):
         manifest_bytes = json.dumps(manifest, indent=2, ensure_ascii=False).encode('utf-8')
         _write_bytes_atomic(manifest_path, manifest_bytes)
 
-        # --- Save/upload outputs ---
+        # --- 保存或上传输出 ---
         if no_upload:
             import shutil as _shutil
-            # Remove intermediate concat bins before copying
+            # 拷贝前删掉中间拼接 bin
             for cb in work_dir.glob("*_concat.bin"):
                 try:
                     cb.unlink()
@@ -566,7 +566,7 @@ def process_mcap(source_path, no_upload=False):
             _shutil.copytree(str(work_dir), str(out_dir), dirs_exist_ok=True)
             log.info("  -> saved  %s  (%d frames)", out_dir, min_frames)
         else:
-            # Upload each frame bin + manifest under .../{job_id}/sview/
+            # 把每帧 bin 和 manifest 传到 .../{job_id}/sview/
             if manifest_path.exists():
                 oss_key = f"{oss_base}/manifest.json"
                 upload_to_oss(manifest_path, oss_key)
@@ -589,11 +589,11 @@ def process_mcap(source_path, no_upload=False):
 
 
 # ---------------------------------------------------------------------------
-#  Timestamp rebase (wall / MCAP log_time → monotonic_raw_ns)
+#  时间戳重定位（wall / mcap log_time → monotonic_raw_ns）
 # ---------------------------------------------------------------------------
 
 def _parse_ns(value):
-    """Parse a nanosecond timestamp from int/str; return None if missing/invalid."""
+    """把 int/str 解析成纳秒时间戳；缺失或非法返回 None。"""
     if value is None or value == "":
         return None
     try:
@@ -603,17 +603,17 @@ def _parse_ns(value):
 
 
 def _rebase_timestamps_to_monotonic(video_timestamps: dict, imu_rows: list) -> bool:
-    """Use monotonic_raw_ns as the shared timeline (same as local_full_mcap_flow_verify).
+    """用 monotonic_raw_ns 做统一时间轴（与 local_full_mcap_flow_verify 相同）。
 
-    Production MCAPs often stamp msg.log_time with wall-clock ns (~1e18), which
-    exceeds JS Number.MAX_SAFE_INTEGER and breaks SView IMU plots. Verify-style
-    recordings already use monotonic log_time (~1e11).
+    线上 mcap 常把 msg.log_time 打成墙上时钟纳秒（约 1e18），超过
+    JS Number.MAX_SAFE_INTEGER，SView 的 IMU 曲线会坏。校验风格的
+    录制已经用单调 log_time（约 1e11）。
 
-    - If MCAP log_time is in the wall domain: subtract median(wall - mono) from
-        video timestamps, and set each IMU log_time_ns = monotonic_raw_ns.
-    - If already monotonic: only normalize IMU log_time_ns to monotonic_raw_ns.
+    - mcap log_time 在 wall 域：视频时间戳减去 median(wall - mono)，
+        并把每条 IMU 的 log_time_ns 设成 monotonic_raw_ns。
+    - 已经是单调时间：只把 IMU 的 log_time_ns 归一到 monotonic_raw_ns。
 
-    Mutates video_timestamps and imu_rows in place. Returns True if any change.
+    原地修改 video_timestamps 和 imu_rows。有改动返回 True。
     """
     if not imu_rows:
         return False
@@ -668,19 +668,19 @@ def _rebase_timestamps_to_monotonic(video_timestamps: dict, imu_rows: list) -> b
 
 
 # ---------------------------------------------------------------------------
-#  Per-frame H264 access unit splitting & bundle serialization
+#  逐帧 H.264 AU 切分与 bundle 序列化
 # ---------------------------------------------------------------------------
 
 def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
-    """Split raw H264 Annex B stream into per-frame AUs using ffprobe.
+    """用 ffprobe 把原始 H.264 Annex B 流切成逐帧 AU。
 
-    Matches local/playable generation: keep ffprobe packet boundaries as-is.
-    Do not re-inject SPS/PPS onto IDR AUs (that changes AU layout vs local bins).
+    对齐本地/可播放产物：保持 ffprobe 的 packet 边界。
+    不要把 SPS/PPS 再塞回 IDR AU（会改 AU 布局，对不上本地 bin）。
     """
     if not data:
         return []
     
-    # Write raw H264 to temp file for ffprobe
+    # 把原始 H.264 写到临时文件给 ffprobe
     tmp = work_dir / "_split_input.h264"
     with open(tmp, 'wb') as f:
         f.write(data)
@@ -695,7 +695,7 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
             str(tmp),
         ], capture_output=True, text=True, timeout=30)
         
-        # Parse pkt_pos and pkt_size
+        # 解析 pkt_pos 和 pkt_size
         positions = []
         current = {}
         for line in result.stdout.strip().split('\n'):
@@ -703,9 +703,9 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
             if not line:
                 continue
             if line.startswith('packet,'):
-                continue  # header
+                continue  # 表头
             parts = line.split(',')
-            # CSV columns: codec_type,stream_index,pts,pts_time,dts,dts_time,duration,duration_time,size,pos,flags
+            # CSV 列：codec_type,stream_index,pts,pts_time,dts,dts_time,duration,duration_time,size,pos,flags
             if len(parts) >= 10:
                 try:
                     size = int(parts[8])
@@ -715,7 +715,7 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
                     pass
         
         if not positions:
-            # Fallback: try show_frames format
+            # 兜底：试 show_frames 格式
             result2 = subprocess.run([
                 ffprobe, '-v', 'quiet',
                 '-show_frames', '-select_streams', 'v:0',
@@ -752,7 +752,7 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
 
 
 def _h264_payload_has_idr(data: bytes) -> bool:
-    """Check if H.264 payload contains an IDR NAL unit (type 5)."""
+    """检查 H.264 payload 里有没有 IDR NAL（类型 5）。"""
     pos = 0
     while pos < len(data) - 4:
         if data[pos:pos+4] == b'\x00\x00\x00\x01':
@@ -769,7 +769,7 @@ def _h264_payload_has_idr(data: bytes) -> bool:
 
 
 def _write_bytes_atomic(target_path: Path, payload: bytes):
-    """Write bytes atomically: write to .tmp first, then rename to target."""
+    """原子写字节：先写 .tmp，再改名到目标。"""
     tmp_path = target_path.with_suffix(target_path.suffix + '.tmp')
     with open(tmp_path, 'wb') as f:
         f.write(payload)
@@ -780,7 +780,7 @@ def _build_bundle_frame(frame_idx: int, streams_data: dict, timestamp_ns: int,
                         time_window_ns: list, is_keyframe: bool,
                         imu_json: dict, events_json: dict,
                         stream_codecs: dict | None = None) -> bytes:
-    """Build a single bundle frame bin (v1 quad-cam or v2 named streams)."""
+    """组装单帧 bundle bin（v1 四路相机或 v2 命名流）。"""
     return pack_bundle_frame(
         frame_idx,
         streams_data,
@@ -805,7 +805,7 @@ def _resolve_path(raw_path: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-#  Redis queue loop
+#  Redis 队列循环
 # ---------------------------------------------------------------------------
 
 def run_redis_loop():
@@ -882,7 +882,7 @@ def run_redis_loop():
 
 
 # ---------------------------------------------------------------------------
-#  Entry point
+#  入口
 # ---------------------------------------------------------------------------
 
 def main():
@@ -910,7 +910,7 @@ def main():
         TRANSCODE_BITRATE = args.bitrate
     if args.maxrate is not None:
         TRANSCODE_MAXRATE = args.maxrate
-        # Keep bufsize roughly in line with maxrate when overridden via CLI
+        # CLI 覆盖 maxrate 时，bufsize 大致跟着走
         if args.bitrate and not os.environ.get("TRANSCODE_BUFSIZE"):
             TRANSCODE_BUFSIZE = args.maxrate
 
@@ -922,10 +922,10 @@ def main():
 
 
 def _scale_dim(metas: dict, which: str) -> int:
-    """Output width/height for transcode + manifest.
+    """转码和 manifest 用的输出宽高。
 
-    - TRANSCODE_SIZE > 0: force square downscale (e.g. 720)
-    - TRANSCODE_SIZE == 0: keep source camera resolution from meta (local style)
+    - TRANSCODE_SIZE > 0：强制缩成正方形（例如 720）
+    - TRANSCODE_SIZE == 0：用 meta 里的源相机分辨率（本地风格）
     """
     if TRANSCODE_SIZE > 0:
         return TRANSCODE_SIZE
@@ -933,12 +933,12 @@ def _scale_dim(metas: dict, which: str) -> int:
     for ch in ("RR", "FR", "RL", "FL"):
         if ch in metas and metas[ch].get(key):
             return int(metas[ch][key])
-    # Fallback when meta not yet available
+    # meta 还没有时的兜底
     return 2096
 
 
 def _build_streams_manifest(metas: dict, fallback_w: int, fallback_h: int) -> dict:
-    """Build streams section of manifest; width/height are the transcoded output size."""
+    """组装 manifest 的 streams；宽高是转码后的输出尺寸。"""
     return build_streams_manifest(metas, fallback_w, fallback_h)
 
 

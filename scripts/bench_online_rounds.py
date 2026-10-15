@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Run online typed bench for N rounds; keep every round; trimmed-mean summary.
+"""按类型跑 N 轮线上基准；保留每一轮；汇总去极值均值。
 
-Trimmed mean: drop 1 lowest + 1 highest per metric, average the rest.
-Requires at least 3 successful samples for a type metric.
+去极值均值：每个指标去掉 1 个最低和 1 个最高，其余取平均。
+某类型指标至少要有 3 个成功样本。
 """
 
 from __future__ import annotations
@@ -34,12 +34,12 @@ def trimmed_mean(values: list[float]) -> float | None:
     if len(vals) < 3:
         return None if not vals else round(statistics.mean(vals), 3)
     vals = sorted(vals)
-    core = vals[1:-1]  # drop lowest + highest
+    core = vals[1:-1]  # 去掉最低和最高
     return round(statistics.mean(core), 3)
 
 
 def summarize_rounds(rounds: list[dict]) -> dict:
-    """Aggregate per-type trimmed means across rounds."""
+    """按类型汇总各轮的去极值均值。"""
     by_type: dict[int, dict] = {}
     for tid, cfg in BENCH_TYPES.items():
         firsts: list[float] = []
@@ -181,7 +181,7 @@ def main() -> int:
     h265 = args.h265 or None
 
     rounds: list[dict] = []
-    # Load prior rounds if resuming
+    # 续跑时先载入已有轮次
     for i in range(1, args.start_round):
         p = rounds_dir / f"round_{i:02d}.json"
         if p.is_file():
@@ -218,12 +218,12 @@ def main() -> int:
         (rounds_dir / f"round_{rnd:02d}.json").write_text(
             json.dumps(round_payload, indent=2, ensure_ascii=False), encoding="utf-8"
         )
-        # also keep a per-round markdown via existing helper
+        # 同时用现有辅助函数留一份每轮 markdown
         write_report(rounds_dir / f"round_{rnd:02d}", base, results)
         rounds.append(round_payload)
         print(f"--- round {rnd} done in {round_payload['wall_sec']}s ---", flush=True)
 
-        # rolling summary after each round
+        # 每轮结束后滚动更新汇总
         summary = summarize_rounds(rounds)
         write_multi_report(out_dir, base, rounds, summary)
 

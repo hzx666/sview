@@ -1,4 +1,4 @@
-"""Encode-from-T: start_sec is seconds into the recording, not wall-clock."""
+"""从 T 起编码：start_sec 是录制内的秒数，不是墙上时钟。"""
 
 from __future__ import annotations
 
@@ -7,20 +7,20 @@ from typing import Any, Optional, Tuple, Union
 
 
 def parse_start_sec(value: Any) -> float:
-    """Non-negative seconds from bag start. Invalid / missing → 0."""
+    """相对包起点的非负秒数。非法或缺失 → 0。"""
     if value is None or value is False or value == "":
         return 0.0
     try:
         sec = float(value)
     except (TypeError, ValueError):
         return 0.0
-    if sec != sec or sec <= 0:  # NaN or non-positive
+    if sec != sec or sec <= 0:  # NaN 或非正
         return 0.0
     return min(sec, 24 * 3600)
 
 
 def origin_job_id(base_id: str, start_sec: float) -> str:
-    """Keep from-zero cache; origin windows get ``{stem}_o{seconds}``."""
+    """从 0 开始的缓存保持原 id；起点窗口用 ``{stem}_o{seconds}``。"""
     base = (base_id or "").strip() or "job"
     sec = parse_start_sec(start_sec)
     if sec <= 0:
@@ -29,7 +29,7 @@ def origin_job_id(base_id: str, start_sec: float) -> str:
 
 
 def mcap_log_time_range(path: Union[str, Path]) -> Tuple[Optional[int], Optional[int]]:
-    """(message_start_time, message_end_time) from MCAP summary, if present."""
+    """mcap summary 里的 (message_start_time, message_end_time)，有则返回。"""
     from mcap.reader import make_reader
 
     p = Path(path)
@@ -58,7 +58,7 @@ def mcap_log_time_range(path: Union[str, Path]) -> Tuple[Optional[int], Optional
 
 
 def cut_log_time_ns(path: Union[str, Path], start_sec: float) -> Optional[int]:
-    """Absolute MCAP log_time where encode should begin, or None."""
+    """编码起点的绝对 mcap log_time，否则 None。"""
     sec = parse_start_sec(start_sec)
     if sec <= 0:
         return None
@@ -76,7 +76,7 @@ def estimate_remaining_frames(
     *,
     fps: float = 30.0,
 ) -> Optional[int]:
-    """Scale summary frame count after dropping ``start_sec`` from the start."""
+    """丢掉开头的 ``start_sec`` 后，按比例缩 summary 帧数。"""
     try:
         total = int(summary_n) if summary_n is not None else None
     except (TypeError, ValueError):

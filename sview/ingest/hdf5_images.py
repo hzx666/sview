@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""HDF5 teleop episodes (Astribot DAgger, etc.) → JPEG frames for the Orin encode path.
+"""HDF5 遥操 episode（Astribot DAgger 等）→ JPEG 帧，走 Orin 编码路径。
 
-Discovers image datasets (RGB arrays or per-frame JPEG/PNG bytes). Stream keys
-keep the camera name / dataset path; they are not forced onto FR/FL/RR/RL.
+找出图像 dataset（RGB 数组，或逐帧 JPEG/PNG 字节）。流 key
+保留相机名 / dataset 路径，不强制映射到 FR/FL/RR/RL。
 
-Astribot files store cameras at `images_dict/<cam>_rgbd/color/count_0`. That leaf
-is often the pixel payload (vlen JPEG/PNG, packed RGB, or an RGB stack) rather
-than a sibling counter.
+Astribot 文件把相机放在 `images_dict/<cam>_rgbd/color/count_0`。这个叶子
+往往就是像素数据（vlen JPEG/PNG、打包 RGB，或 RGB 栈），
+而不是旁边的计数器。
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ _JPEG_MAGIC = b"\xff\xd8"
 _PNG_MAGIC = b"\x89PNG"
 _GZIP_MAGIC = b"\x1f\x8b"
 
-# Longer tokens first.
+# 更长的 token 优先。
 _CAM_NAME_TO_CH: Tuple[Tuple[str, str], ...] = (
     ("left_wrist_rgbd", "FL"),
     ("right_wrist_rgbd", "FR"),
@@ -54,7 +54,7 @@ _CAM_NAME_TO_CH: Tuple[Tuple[str, str], ...] = (
     ("right", "FR"),
 )
 
-# Head 1280x720 / wrists 640x360 are the Astribot S1 sizes seen in public dumps.
+# 头 1280x720、腕 640x360 是公开数据里见过的 Astribot S1 尺寸。
 _COMMON_HW: Tuple[Tuple[int, int], ...] = (
     (720, 1280),
     (360, 640),
@@ -113,7 +113,7 @@ def _parent(name: str) -> str:
 
 
 def _camera_token(name: str) -> Optional[str]:
-    """Known camera name token (left_wrist_rgbd, …), independent of FR/FL slots."""
+    """已知相机名 token（left_wrist_rgbd 等），与 FR/FL 槽位无关。"""
     low = name.replace("\\", "/").lower()
     leaf = _leaf(name)
     visual = any(
@@ -249,7 +249,7 @@ def _hw_from_nbytes(n: int) -> Optional[Tuple[int, int]]:
     for h, w in _COMMON_HW:
         if h * w == pix:
             return h, w
-    # Factor into plausible video resolutions (area match, aspect 1:4 .. 4:1).
+    # 拆成像样的视频分辨率（面积对上，宽高比 1:4 到 4:1）。
     side = int(pix ** 0.5)
     for h in range(max(8, side - 64), side + 65):
         if h > 0 and pix % h == 0:
@@ -306,7 +306,7 @@ def _is_vlen_or_object(dset) -> bool:
 
 
 def _is_index_array(dset) -> bool:
-    """True for 1-D integer counters, not pixel/JPEG payloads."""
+    """一维整数计数器为 True，像素或 JPEG payload 不是。"""
     import numpy as np
 
     shape = tuple(getattr(dset, "shape", ()) or ())
@@ -448,7 +448,7 @@ def _extract_jpegs(dset, h5=None) -> Tuple[List[bytes], int, int]:
         return [blob], ww, hh
 
     n = int(shape[0]) if shape else 0
-    # Avoid treating a single packed image (H*W*3,) as N tiny "frames".
+    # 别把单张打包图 (H*W*3,) 当成 N 个小“帧”。
     if len(shape) == 1 and not _is_vlen_or_object(dset) and n >= 8 * 8 * 3:
         blob = _sample_to_jpeg(np.asarray(dset[()]), h5)
         if blob:
@@ -480,7 +480,7 @@ def _candidate_score(name: str, dset, n_frames: int) -> int:
 def parse_hdf5_image_streams(
     path: str | Path,
 ) -> Tuple[Dict[str, List[bytes]], Dict[str, List[int]], Dict[str, dict]]:
-    """Read camera images from an HDF5 episode → (jpeg_frames, timestamps_ns, metas)."""
+    """从 HDF5 episode 读相机图像 → (jpeg_frames, timestamps_ns, metas)。"""
     import h5py
 
     p = Path(path)
@@ -526,7 +526,7 @@ def parse_hdf5_image_streams(
         for ch, items in by_key_candidates.items():
             best: Optional[Tuple[int, str, List[bytes], int, int]] = None
 
-            # Prefer one dataset that already holds a frame stack.
+            # 优先选已经是帧栈的那个 dataset。
             for name, dset in items:
                 jpegs, w, h = _extract_jpegs(dset, h5)
                 if not jpegs:
@@ -542,7 +542,7 @@ def parse_hdf5_image_streams(
                 if best is None or score > best[0]:
                     best = (score, name, jpegs, w, h)
 
-            # `color/count_0`, `color/count_1`, … each holding one frame.
+            # `color/count_0`、`color/count_1` 等，每个只存一帧。
             if best is None or (best and best[2] and len(best[2]) <= 1):
                 for (gch, parent), group_items in by_group.items():
                     if gch != ch or len(group_items) < 2:

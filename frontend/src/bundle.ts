@@ -9,11 +9,11 @@ export type ParsedBundle = {
 
 export type ParsedSegment = {
   header: SegmentHeader;
-  /** Frame index → original single-frame bundle bytes. */
+  /** 帧号 → 原始单帧 bundle 字节。 */
   frames: Map<number, ArrayBuffer>;
 };
 
-/** Default transport batch size (~1s @ 30fps / 1 GOP). */
+/** 默认传输批大小（约 1 秒 @ 30fps / 1 GOP）。 */
 export const SEGMENT_FRAMES = 30;
 
 export function segmentStartFor(index: number, segmentFrames = SEGMENT_FRAMES): number {
@@ -81,7 +81,7 @@ export function parseBundle(buf: ArrayBuffer): ParsedBundle {
   return { header, streams, imu, events };
 }
 
-/** Unpack `playertrans.bundle_segment.v1` into per-frame bundle buffers. */
+/** 把 `playertrans.bundle_segment.v1` 拆成逐帧 bundle。 */
 export function parseSegment(buf: ArrayBuffer): ParsedSegment {
   const { headerJson, payload } = readLengthPrefixed(buf);
   const header = JSON.parse(headerJson) as SegmentHeader;

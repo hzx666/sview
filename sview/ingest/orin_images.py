@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Orin teleop MCAP: ROS2 image/video streams → H.264 Annex-B.
+Orin 遥操 mcap：ROS2 图像/视频流 → H.264 Annex-B。
 
 两种输入（同一个 mcap 里不会同时出现）::
 
@@ -20,10 +20,10 @@ Orin teleop MCAP: ROS2 image/video streams → H.264 Annex-B.
     /camera/left_wrist/h264
     /camera/right_wrist/h264
 
-Also harvests unknown teleop topics whose schema is sensor_msgs Image /
-CompressedImage / CompressedVideo (Unitree, Franka, …). Stream ids in the
-bundle keep the original topic (leading ``/`` stripped). Extra cameras are
-kept; they are not forced onto FR/FL/RR/RL.
+也收未知遥操 topic，schema 是 sensor_msgs Image /
+CompressedImage / CompressedVideo（Unitree、Franka 等）。bundle 里的
+流 id 保留原 topic（去掉开头的 ``/``）。多出来的相机保留，
+不强制映射到 FR/FL/RR/RL。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from sview.ingest.stream_ids import bundle_stream_key
 
 log = logging.getLogger("sview.orin_images")
 
-# SView / frontend channels: rr, fr, rl, fl
+# SView / 前端通道：rr, fr, rl, fl
 _SVIEW_CHANNELS = ("FR", "FL", "RR", "RL")
 _SVIEW_CHANNEL_SET = frozenset(_SVIEW_CHANNELS)
 DEFAULT_CAMERA_MAP = {
@@ -89,7 +89,7 @@ def _topic_has_h264_segment(topic: str) -> bool:
 
 
 def _looks_like_headcam(topics: List[str], names: List[str]) -> bool:
-    """SSIEGO / head-cam protobuf bags must not go through the Orin ROS2 reader."""
+    """SSIEGO / 头显 protobuf 包不能走 Orin 的 ROS2 reader。"""
     if any(_TELEOP_H264_RE.match((t or "").strip()) for t in topics):
         return False
     for n in names:
@@ -111,7 +111,7 @@ def _looks_like_orin_topic(topic: str) -> bool:
         return True
     if "image_raw/compressed" in t:
         return True
-    # Agilex cobot: /camera_l/color/image_raw (CompressedImage, no /compressed suffix)
+    # Agilex cobot：/camera_l/color/image_raw（CompressedImage，没有 /compressed 后缀）
     if t.rstrip("/").lower().endswith("/color/image_raw"):
         return True
     return bool(_COMPRESSED_TOPIC_RE.match(t))
@@ -137,6 +137,32 @@ def _schema_is_harvest_video(schema_name: Optional[str]) -> bool:
     return _schema_is_compressed_video(schema_name) or _schema_is_raw_image(schema_name)
 
 
+def _topic_wrong_kind(
+    topic: str,
+    schema_name: Optional[str],
+    kind: str,
+    codec: Optional[str] = None,
+) -> bool:
+    """判断这一路不属于 ``kind``（h264 / jpeg）。
+
+    ``codec`` 是 ``channel_payload_kinds`` 从实际消息里看出来的编码，
+    有就以它为准；没有才回退到 schema / topic 名。topic 名不可靠：
+    Unitree 的 H.264 叫 ``.../image_raw/compressed``，也有 CompressedImage
+    里装 ``format=h264`` 的录法。
+    """
+    kind_l = (kind or "").strip().lower()
+    if codec and kind_l in ("h264", "jpeg"):
+        return codec != kind_l
+    is_video_codec = "compressedvideo" in _norm_schema_name(schema_name)
+    if kind_l == "h264":
+        if is_video_codec:
+            return False
+        return _is_orin_jpeg_topic(topic) and not _is_orin_h264_topic(topic)
+    if kind_l == "jpeg":
+        return is_video_codec or _is_orin_h264_topic(topic)
+    return False
+
+
 def _is_headcam_protobuf_topic(topic: str) -> bool:
     ts = (topic or "").strip()
     return bool(
@@ -147,7 +173,7 @@ def _is_headcam_protobuf_topic(topic: str) -> bool:
 
 
 def _harvest_channel_ok(topic: str, schema_name: Optional[str] = None) -> bool:
-    """Teleop video harvest: schema first, topic allowlist as fallback."""
+    """遥操视频收集：先看 schema，topic 白名单兜底。"""
     if _is_headcam_protobuf_topic(topic):
         return False
     if _schema_is_harvest_video(schema_name):
@@ -180,13 +206,12 @@ def _iter_ros2_messages_tolerant(
     start_time_ns: Optional[int] = None,
     topics: Optional[List[str]] = None,
 ):
-    """Yield ROS2 messages; skip protobuf/other encodings instead of aborting the bag.
+    """产出 ROS2 消息；跳过 protobuf 和其他编码，不要整包中断。
 
-    ``topic_ok``: optional ``topic -> bool``.
-    ``channel_ok``: optional ``(topic, schema_name) -> bool``. When set, it
-    replaces ``topic_ok`` and can keep unknown camera topics whose schema is
-    Image / CompressedImage.
-    ``start_time_ns``: MCAP ``iter_messages(start_time=)`` — skip log_time before this.
+    ``topic_ok``：可选 ``topic -> bool``。
+    ``channel_ok``：可选 ``(topic, schema_name) -> bool``。设置后
+    替代 ``topic_ok``，schema 是 Image / CompressedImage 的未知相机 topic 也能留。
+    ``start_time_ns``：mcap ``iter_messages(start_time=)``，跳过更早的 log_time。
     """
     from mcap.reader import make_reader
     from mcap_ros2.decoder import DecoderFactory
@@ -229,7 +254,7 @@ def _iter_ros2_messages_tolerant(
 
 
 def _parse_camera_map(env_val: Optional[str] = None) -> Dict[str, str]:
-    """Parse ``ORIN_CAMERA_MAP=left_camera:FL,right_camera:FR,...``."""
+    """解析 ``ORIN_CAMERA_MAP=left_camera:FL,right_camera:FR,...``。"""
     raw = env_val if env_val is not None else os.environ.get("ORIN_CAMERA_MAP", "")
     out = dict(DEFAULT_CAMERA_MAP)
     if not raw.strip():
@@ -249,9 +274,9 @@ def _stable_assign_topics(
     topics: List[str],
     cam_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, str]:
-    """Map each camera topic to a stable bin stream key (original topic).
+    """把每个相机 topic 映射成稳定的 bin 流 key（原 topic）。
 
-    ``cam_map`` is unused; kept so existing call sites still compile.
+    ``cam_map`` 不用；留着是为了现有调用点还能编译。
     """
     del cam_map
     uniq: List[str] = []
@@ -311,11 +336,12 @@ def classify_teleop_forward_topic(
     schema_name: Optional[str] = None,
     *,
     kind: str,
+    codec: Optional[str] = None,
 ) -> Optional[str]:
-    """``video``, ``meta``, or ``imu`` for a teleop forward read. Else None.
+    """遥操正向读取的角色：``video``、``meta`` 或 ``imu``。否则 None。
 
-    Head-cam protobuf video stays out. IMU is kept, including ``/imu/sample``
-    when the schema is a ROS Imu or the topic path says imu.
+    头显 protobuf 视频排除。IMU 保留，包括 schema 是 ROS Imu
+    或 topic 路径带 imu 的 ``/imu/sample``。
     """
     raw = (topic or "").strip()
     if not raw:
@@ -327,11 +353,8 @@ def classify_teleop_forward_topic(
     if _schema_is_camera_info(schema):
         return "meta"
     video = _harvest_channel_ok(raw, schema) and not _is_headcam_protobuf_topic(raw)
-    if video:
-        if kind_l == "h264" and _is_orin_jpeg_topic(raw) and not _is_orin_h264_topic(raw):
-            video = False
-        elif kind_l == "jpeg" and _is_orin_h264_topic(raw):
-            video = False
+    if video and _topic_wrong_kind(raw, schema, kind_l, codec):
+        video = False
     if video:
         return "video"
     n = _norm_schema_name(schema)
@@ -343,7 +366,7 @@ def classify_teleop_forward_topic(
 
 
 def teleop_forward_topics(path: str | Path, *, kind: str) -> List[tuple]:
-    """``(topic, role)`` pairs to read. Role is video, meta, or imu."""
+    """要读的 ``(topic, role)``。role 是 video、meta 或 imu。"""
     from mcap.reader import make_reader
 
     p = Path(path)
@@ -358,6 +381,7 @@ def teleop_forward_topics(path: str | Path, *, kind: str) -> List[tuple]:
     if not summary or not summary.channels:
         return []
     schemas = summary.schemas or {}
+    codecs = channel_payload_kinds(p)
     found: List[tuple] = []
     seen: set = set()
     for channel in summary.channels.values():
@@ -366,7 +390,9 @@ def teleop_forward_topics(path: str | Path, *, kind: str) -> List[tuple]:
             continue
         schema = schemas.get(getattr(channel, "schema_id", None))
         schema_name = getattr(schema, "name", "") if schema is not None else ""
-        role = classify_teleop_forward_topic(topic, schema_name, kind=kind)
+        role = classify_teleop_forward_topic(
+            topic, schema_name, kind=kind, codec=codecs.get(topic)
+        )
         if not role:
             continue
         seen.add(topic)
@@ -434,10 +460,9 @@ def iter_teleop_forward(
     kind: str,
     start_time_ns: Optional[int] = None,
 ):
-    """Yield ``("video", ch, data, ts, meta)`` or ``("imu", row)`` for one forward read.
+    """一次正向读取，产出 ``("video", ch, data, ts, meta)`` 或 ``("imu", row)``。
 
-    Only video, camera info, and IMU topics are decoded. The file stays open
-    until the generator is closed.
+    只解码视频、camera info 和 IMU topic。文件保持打开，直到生成器关闭。
     """
     kind_l = (kind or "").strip().lower()
     selected = teleop_forward_topics(path, kind=kind_l)
@@ -520,7 +545,7 @@ def _video_topics_from_summary(
     *,
     kind: Optional[str] = None,
 ) -> List[str]:
-    """Topics that look like cameras (schema or allowlist)."""
+    """看起来像相机的 topic（按 schema 或白名单）。"""
     from mcap.reader import make_reader
 
     p = Path(path)
@@ -535,6 +560,7 @@ def _video_topics_from_summary(
         return []
     schemas = summary.schemas or {}
     kind_l = (kind or "").strip().lower()
+    codecs = channel_payload_kinds(p) if kind_l in ("h264", "jpeg") else {}
     out: List[str] = []
     for channel in summary.channels.values():
         topic = (getattr(channel, "topic", "") or "").strip()
@@ -543,21 +569,15 @@ def _video_topics_from_summary(
         schema = schemas.get(getattr(channel, "schema_id", None))
         schema_name = getattr(schema, "name", "") if schema is not None else ""
         harvest = _harvest_channel_ok(topic, schema_name)
-        if not harvest:
+        if not harvest or _topic_wrong_kind(topic, schema_name, kind_l, codecs.get(topic)):
             continue
-        if kind_l == "h264":
-            if _is_orin_jpeg_topic(topic) and not _is_orin_h264_topic(topic):
-                continue
-        elif kind_l == "jpeg":
-            if _is_orin_h264_topic(topic):
-                continue
         if topic not in out:
             out.append(topic)
     return out
 
 
 def mcap_channel_overview(path: str | Path, *, max_topics: int = 24) -> dict:
-    """Cheap MCAP footer summary for errors: encodings / schemas / topics."""
+    """给报错用的便宜 mcap 文件尾摘要：编码 / schema / topic。"""
     from mcap.reader import make_reader
 
     out: dict = {"topics": [], "encodings": {}, "schemas": []}
@@ -607,8 +627,8 @@ def orin_stream_kind(
     不能只看 schema=CompressedImage：H.264 袋同样是 CompressedImage，只是
     ``format=h264``（topic 可能仍是 ``.../image_raw/compressed``）。
 
-    ``skip_headcam_guard``: teleop paths already classified by directory must
-    still be sniffed even if a topic *name* looks like ``/imu/sample``.
+    ``skip_headcam_guard``：目录已经判成遥操的路径仍要嗅探，
+    即使某个 topic 名字看起来像 ``/imu/sample``。
     """
     from mcap.reader import make_reader
 
@@ -632,6 +652,12 @@ def orin_stream_kind(
     if (not skip_headcam_guard) and _looks_like_headcam(topics, names):
         return None
 
+    codecs = set(channel_payload_kinds(p).values()) if topics else set()
+    if "h264" in codecs:
+        return "h264"
+    if "jpeg" in codecs:
+        return "jpeg"
+
     if any(_H264_TOPIC_RE.match(t.strip()) or _topic_has_h264_segment(t) for t in topics):
         return "h264"
 
@@ -653,12 +679,12 @@ def orin_stream_kind(
 
 
 def is_orin_images_mcap(path: str | Path) -> bool:
-    """True if MCAP carries ROS2 CompressedImage (JPEG or H.264, not protobuf)."""
+    """mcap 里是 ROS2 CompressedImage（JPEG 或 H.264，不是 protobuf）则为 True。"""
     return orin_stream_kind(path) in ("jpeg", "h264")
 
 
 def _jpeg_size(data: bytes) -> Tuple[int, int]:
-    """Return (width, height) from JPEG SOF, or (0, 0)."""
+    """从 JPEG SOF 取 (宽, 高)，否则 (0, 0)。"""
     i = 0
     n = len(data)
     while i < n - 8:
@@ -718,7 +744,7 @@ def sview_channel_for_topic(
     topic: str,
     cam_map: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
-    """Map a camera topic onto FR/FL/RR/RL, or None if unknown."""
+    """把相机 topic 映射到 FR/FL/RR/RL，未知则 None。"""
     return _topic_to_channel(topic, cam_map or _parse_camera_map())
 
 
@@ -727,10 +753,10 @@ def iter_orin_jpeg_frames(
     cam_map: Optional[Dict[str, str]] = None,
     start_time_ns: Optional[int] = None,
 ):
-    """Yield ``(stream_key, jpeg_bytes, timestamp_ns, camera_meta)`` without loading the bag.
+    """不整包加载，逐帧产出 ``(stream_key, jpeg_bytes, timestamp_ns, camera_meta)``。
 
-    Harvests CompressedImage JPEG and sensor_msgs/Image (converted) on any topic.
-    Stream keys keep the original topic (leading ``/`` stripped).
+    收集任意 topic 上的 CompressedImage JPEG 和 sensor_msgs/Image（会转成 JPEG）。
+    流 key 保留原 topic（去掉开头的 ``/``）。
     """
     cam_map = cam_map or _parse_camera_map()
     topic_map = _stable_assign_topics(_video_topics_from_summary(path, kind="jpeg"), cam_map)
@@ -787,9 +813,9 @@ def parse_orin_jpeg_streams(
     Dict[str, List[int]],
     Dict[str, dict],
 ]:
-    """Read CompressedImage JPEGs → (frames, timestamps_ns, camera_metas).
+    """读 CompressedImage JPEG → (frames, timestamps_ns, camera_metas)。
 
-    Keys are original topic slugs (leading ``/`` stripped).
+    key 是原 topic 路径（去掉开头的 ``/``）。
     """
     cam_map = cam_map or _parse_camera_map()
     frames: Dict[str, List[bytes]] = defaultdict(list)
@@ -807,7 +833,7 @@ def parse_orin_jpeg_streams(
         if ch not in metas:
             metas[ch] = dict(meta)
 
-    # Count H.264-on-compressed-topic for a better empty-bag error (iterator skips them).
+    # 统计 compressed topic 上的 H.264，空包报错更好看（迭代器会跳过它们）。
     if not frames:
         for msg in _iter_ros2_messages_tolerant(str(path), channel_ok=_harvest_channel_ok):
             if msg.schema is None or not _schema_is_compressed_video(msg.schema.name):
@@ -857,7 +883,7 @@ def parse_orin_jpeg_streams(
 
 
 def _annexb_start(data: bytes) -> Tuple[int, int]:
-    """Return (offset, start_code_len) of the first Annex-B start code, or (-1, 0)."""
+    """返回第一个 Annex-B start code 的 (偏移, 起始码长度)，没有则 (-1, 0)。"""
     head = data[:4096] if len(data) > 4096 else data
     i4 = head.find(b"\x00\x00\x00\x01")
     i3 = head.find(b"\x00\x00\x01")
@@ -886,7 +912,7 @@ def _looks_like_annexb_hevc(data: bytes) -> bool:
 
 
 def _compressed_payload_kind(fmt: str, data: bytes) -> Optional[str]:
-    """Classify a CompressedImage payload as 'jpeg' | 'h264' | 'hevc' | None."""
+    """把 CompressedImage payload 分成 'jpeg' | 'h264' | 'hevc' | None。"""
     f = (fmt or "").lower()
     if "h265" in f or "hevc" in f:
         return "hevc"
@@ -904,7 +930,7 @@ def _compressed_payload_kind(fmt: str, data: bytes) -> Optional[str]:
 
 
 def _ros_image_to_jpeg(ros) -> Optional[bytes]:
-    """sensor_msgs/Image → JPEG bytes, or None if encoding is unsupported."""
+    """sensor_msgs/Image → JPEG 字节；编码不支持则 None。"""
     try:
         from PIL import Image
         import numpy as np
@@ -965,7 +991,7 @@ def _ros_image_to_jpeg(ros) -> Optional[bytes]:
 def _peek_orin_payload_kind(
     path: Path, *, max_msgs: int = 200, max_image: int = 8
 ) -> Optional[str]:
-    """Scan the start of the bag for jpeg vs h264 vs hevc vs raw Image."""
+    """扫包开头，区分 jpeg、h264、hevc 和原始 Image。"""
     n_msg = 0
     n_img = 0
     try:
@@ -997,8 +1023,72 @@ def _peek_orin_payload_kind(
     return None
 
 
+_CHANNEL_KIND_CACHE: Dict[tuple, Dict[str, str]] = {}
+
+
+def channel_payload_kinds(path: str | Path, *, max_msgs: int = 400) -> Dict[str, str]:
+    """每路相机实际的编码：``topic -> 'h264' | 'jpeg'``。
+
+    看每个 topic 的前几条消息（format 字段或字节头），hevc 归到 h264，
+    原始 sensor_msgs/Image 归到 jpeg（转码时压成 JPEG）。看不出来的
+    topic 不出现在结果里，调用方回退到 schema / topic 名判断。
+    """
+    from mcap.reader import make_reader
+
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return {}
+    key = (str(p), st.st_size, st.st_mtime_ns)
+    cached = _CHANNEL_KIND_CACHE.get(key)
+    if cached is not None:
+        return dict(cached)
+    out: Dict[str, str] = {}
+    pending: List[str] = []
+    try:
+        with open(p, "rb") as fh:
+            summary = make_reader(fh).get_summary()
+        if summary and summary.channels:
+            schemas = summary.schemas or {}
+            for channel in summary.channels.values():
+                topic = (getattr(channel, "topic", "") or "").strip()
+                schema = schemas.get(getattr(channel, "schema_id", None))
+                schema_name = getattr(schema, "name", "") if schema is not None else ""
+                if not topic or topic in out or topic in pending:
+                    continue
+                if not _harvest_channel_ok(topic, schema_name):
+                    continue
+                if _schema_is_raw_image(schema_name):
+                    out[topic] = "jpeg"
+                else:
+                    pending.append(topic)
+        if pending:
+            n = 0
+            for msg in _iter_ros2_messages_tolerant(
+                str(p), channel_ok=_harvest_channel_ok, topics=pending
+            ):
+                n += 1
+                topic = (msg.channel.topic if msg.channel else "").strip()
+                if topic in pending:
+                    ros = msg.ros_msg
+                    kind = _compressed_payload_kind(
+                        getattr(ros, "format", "") or "",
+                        bytes(getattr(ros, "data", b"") or b""),
+                    )
+                    if kind:
+                        out[topic] = "h264" if kind in ("h264", "hevc") else kind
+                        pending.remove(topic)
+                if not pending or n >= max_msgs:
+                    break
+    except Exception:
+        log.debug("channel_payload_kinds failed for %s", p, exc_info=True)
+    _CHANNEL_KIND_CACHE[key] = dict(out)
+    return out
+
+
 def _iter_h264_nals(data: bytes):
-    """Yield Annex-B NAL units including their start codes."""
+    """产出 Annex-B NAL，含起始码。"""
     if not data:
         return
     starts = []
@@ -1048,7 +1138,7 @@ def _h264_has_idr(data: bytes) -> bool:
 
 
 def _avcc_to_annexb(data: bytes) -> Optional[bytes]:
-    """4-byte length-prefixed (AVCC) NALs → Annex-B. None if not AVCC."""
+    """4 字节长度前缀（AVCC）的 NAL → Annex-B。不是 AVCC 则 None。"""
     i, n = 0, len(data)
     out = bytearray()
     nals = 0
@@ -1070,7 +1160,7 @@ def _avcc_to_annexb(data: bytes) -> Optional[bytes]:
 
 
 def _to_annexb_h264(data: bytes) -> Optional[bytes]:
-    """Normalize one CompressedImage payload to Annex-B, or None if unusable."""
+    """把一条 CompressedImage payload 归一成 Annex-B，不能用则 None。"""
     if not data:
         return None
     if _looks_like_annexb_h264(data):
@@ -1093,11 +1183,11 @@ def _prepare_h264_decode_start(
     timestamps: Dict[str, List[int]],
     metas: Dict[str, dict],
 ) -> None:
-    """Drop leading P-frames and prefix SPS/PPS so ffmpeg can open the first chunk.
+    """丢掉开头的 P 帧并补上 SPS/PPS，让 ffmpeg 能打开第一段。
 
-    Live encode starts a *new* ffmpeg per chunk. A chunk that begins on a
-    P-slice (no PPS, no reference pictures) fails with
-    ``non-existing PPS 0 referenced`` / ``no frame!``.
+    边转边播每个 chunk 都会新起一个 ffmpeg。chunk 若从
+    P 片开始（没有 PPS、没有参考帧）会失败，报
+    ``non-existing PPS 0 referenced`` / ``no frame!``。
     """
     for ch in list(frames.keys()):
         blobs = frames[ch]
@@ -1173,7 +1263,7 @@ def _skip_scaling_list(br: _BitReader, size: int) -> None:
 
 
 def _h264_sps_size(data: bytes) -> Tuple[int, int]:
-    """Return (width, height) parsed from the first SPS NAL, or (0, 0)."""
+    """从第一个 SPS NAL 解析 (宽, 高)，否则 (0, 0)。"""
     sps = None
     pos, n = 0, len(data)
     while pos < n - 5:
@@ -1212,7 +1302,7 @@ def _h264_sps_size(data: bytes) -> Tuple[int, int]:
     try:
         br = _BitReader(bytes(rbsp))
         profile_idc = br.u(8)
-        br.u(8)  # constraint flags
+        br.u(8)  # 约束标志
         br.u(8)  # level_idc
         br.ue()  # sps id
         if profile_idc in (100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135):
@@ -1268,7 +1358,7 @@ def _estimate_fps_into_metas(timestamps: Dict[str, List[int]], metas: Dict[str, 
 
 
 def _summary_topic_message_counts(path: str | Path) -> Dict[str, int]:
-    """MCAP Summary ``channel_message_counts`` keyed by topic (footer seek)."""
+    """mcap Summary 的 ``channel_message_counts``，按 topic 做 key（文件尾寻址）。"""
     from mcap.reader import make_reader
 
     p = Path(path)
@@ -1304,9 +1394,9 @@ def orin_frame_count_from_channel_counts(
     kind: str,
     cam_map: Optional[Dict[str, str]] = None,
 ) -> Optional[int]:
-    """Aligned Orin frame count from per-topic message counts.
+    """用各 topic 消息数算出对齐后的 Orin 帧数。
 
-    Min of harvested video topics. ``kind`` is ``h264`` or ``jpeg``.
+    取收集到的视频 topic 的最小值。``kind`` 为 ``h264`` 或 ``jpeg``。
     """
     kind_l = (kind or "").strip().lower()
     if kind_l not in ("h264", "jpeg"):
@@ -1368,7 +1458,7 @@ def read_orin_video_frame_count(
     kind: str,
     cam_map: Optional[Dict[str, str]] = None,
 ) -> Optional[int]:
-    """Read total aligned Orin video frames from MCAP Summary (footer seek)."""
+    """从 mcap Summary 读对齐后的 Orin 视频总帧数（文件尾寻址）。"""
     counts = _summary_topic_message_counts(source)
     if not counts:
         return None
@@ -1390,7 +1480,7 @@ def read_orin_video_frame_count(
 
 
 def orin_h264_channels_from_summary(path: str | Path) -> List[str]:
-    """Stream keys present as H.264 / compressed-video topics in the MCAP summary."""
+    """mcap summary 里以 H.264 / 压缩视频 topic 出现的流 key。"""
     topics = _video_topics_from_summary(path, kind="h264")
     if not topics:
         return []
@@ -1421,11 +1511,10 @@ def iter_orin_h264_annexb(
     cam_map: Optional[Dict[str, str]] = None,
     start_time_ns: Optional[int] = None,
 ):
-    """Yield ``(stream_key, annexb, timestamp_ns, camera_meta)`` one frame at a time.
+    """逐帧产出 ``(stream_key, annexb, timestamp_ns, camera_meta)``。
 
-    Stream keys keep the original topic (leading ``/`` stripped).
-    Does not load the whole bag first — callers can encode the first GOP while
-    the rest of the file is still being read.
+    流 key 保留原 topic（去掉开头的 ``/``）。
+    不先整包加载——调用方可以边读文件边编码第一段 GOP。
     """
     cam_map = cam_map or _parse_camera_map()
     topic_map = _stable_assign_topics(_video_topics_from_summary(path, kind="h264"), cam_map)
@@ -1495,7 +1584,7 @@ def parse_orin_h264_streams(
     Dict[str, List[int]],
     Dict[str, dict],
 ]:
-    """Read Orin Annex-B H.264 CompressedImage streams → (frames, timestamps_ns, metas).
+    """读 Orin Annex-B H.264 CompressedImage 流 → (frames, timestamps_ns, metas)。
 
     两种 topic（与 JPEG 不会同时出现）::
 
@@ -1549,16 +1638,15 @@ def jpeg_sequence_to_h264(
     direct: bool = False,
     threads: int = 2,
 ) -> float:
-    """Encode a list of JPEG blobs to Annex-B H.264 via ffmpeg image2pipe.
+    """用 ffmpeg image2pipe 把一串 JPEG 编成 Annex-B H.264。
 
-    Each call starts a fresh encoder, so the first output AU is an IDR (safe for
-    progressive chunk boundaries / seek).
+    每次调用都新开编码器，所以第一帧输出 AU 是 IDR（分段边界和 seek 安全）。
 
-    direct=True: near-lossless path (CRF-only, no bitrate cap / no scale knobs
-    from caller). Used when Orin should “直出” without quality crushing.
+    direct=True：近无损路径（只用 CRF，不限码率、不吃调用方的缩放参数）。
+    Orin 要“直出”、不想把画质压坏时用。
 
-    Note: libx264 ``high`` + ``yuv420p`` cannot use CRF 0 (lossless requires
-    high444). Direct mode therefore uses a low CRF (default 12) instead of 0.
+    注意：libx264 的 ``high`` + ``yuv420p`` 不能用 CRF 0（无损要 high444）。
+    直出模式因此用较低 CRF（默认 12），不用 0。
     """
     import time
 
@@ -1571,7 +1659,7 @@ def jpeg_sequence_to_h264(
     g = max(1, min(g, len(jpegs)))
     thr = max(1, int(threads or 1))
 
-    # CRF 0 + profile high + yuv420p → x264 error "high profile doesn't support lossless".
+    # CRF 0 + profile high + yuv420p → x264 报错 "high profile doesn't support lossless"。
     if direct:
         use_crf = max(1, min(51, int(crf))) if crf and int(crf) > 0 else 12
     else:
@@ -1603,7 +1691,7 @@ def jpeg_sequence_to_h264(
         "-bf", "0",
         "-pix_fmt", "yuv420p",
     ]
-    # Rate caps crush quality; skip them for direct / when bitrate unset.
+    # 码率上限会压画质；直出或没设码率时跳过。
     if (not direct) and bitrate:
         cmd += ["-b:v", bitrate]
         if maxrate:

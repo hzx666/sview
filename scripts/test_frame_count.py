@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stable progressive frame_count helpers."""
+"""边转边播时稳定的 frame_count 辅助函数。"""
 import sys
 from pathlib import Path
 

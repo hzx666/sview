@@ -1,1 +1,1 @@
-"""HTTP master: enqueue, job status, signed media, play cache."""
+"""HTTP Master：入队、任务状态、签名媒体、播放缓存。"""

@@ -27,11 +27,11 @@ export type PlayerCallbacks = {
   onFrame?: (index: number, tsNs: number, imu: unknown) => void;
   onStatus?: (text: string) => void;
   onError?: (err: Error) => void;
-  /** Fired when manifest grows (progressive publish). */
+  /** 当 manifest 变长时触发（边转边播）。 */
   onManifest?: (m: Manifest) => void;
 };
 
-/** Decode preference. Windows HW (DXVA) often corrupts multi-stream H.264. */
+/** 解码偏好。Windows 硬解（DXVA）多路 H.264 经常花屏。 */
 export type DecodeAccel = "auto" | "prefer-hardware" | "prefer-software";
 
 type CamState = {
@@ -40,39 +40,39 @@ type CamState = {
   ctx: CanvasRenderingContext2D | null;
   configured: boolean;
   codec: string;
-  /** After decode error, skip deltas until next IDR. */
+  /** 解码出错后，跳过差值帧直到下一个 IDR。 */
   needsKeyframe: boolean;
   decodeErrors: number;
-  /** After HW glitches, force prefer-software on next configure. */
+  /** 硬解异常后，下次 configure 强制优先软解。 */
   forceSoftware: boolean;
   waiters: Array<() => void>;
   lastConfig: VideoDecoderConfig | null;
   description: Uint8Array | null;
   codedWidth: number;
   codedHeight: number;
-  /** Timeline generation this decoder is allowed to present. */
+  /** 这个解码器允许上屏的时间线代次。 */
   epoch: number;
 };
 
-/** How many segments ahead of the playhead to prefetch (Vite/Master proxy is slow). */
+/** 播放头前面预取多少段（Vite/Master 代理慢）。 */
 const PREFETCH_SEGMENTS = 8;
-/** Sparse encode keeps a short forward window; the server continues it. */
+/** 稀疏编码只留一小段前向窗口，服务端会接着编。 */
 const ENCODE_PREFETCH_SEGMENTS = 3;
-/** Keep roughly this many segments of frame bundles in memory. */
+/** 内存里大约留这么多段的帧 bundle。 */
 const CACHE_SEGMENTS = 16;
-/** Segments to fully cache before autoplay (reduces start-of-play underruns). */
+/** 自动播放前要整段缓存的段数（减少起播欠载）。 */
 const WARMUP_SEGMENTS = 5;
-/** When this many frames remain in the current segment, hard-await the next. */
+/** 当前段还剩这么多帧时，硬等下一段。 */
 const BOUNDARY_AWAIT_FRAMES = 8;
-/** Snap playback clock only if behind by more than this many frame periods. */
+/** 落后超过这么多个帧周期才把播放时钟拉齐。 */
 const MAX_FRAME_DEBT = 5;
 /**
- * While progressive, never play into the last N published frames.
- * Stops micro-stalling every time the playhead kisses frames_available.
+ * 边转边播时，不播进最后 N 个已发布帧。
+ * 避免播放头一贴上 frames_available 就微卡一下。
  */
-const FRONTIER_PAD_FRAMES = 90; // ~3s @ 30fps
-/** After hitting the pad, wait until lead recovers to this before resuming. */
-const FRONTIER_RESUME_FRAMES = 150; // ~5s @ 30fps
+const FRONTIER_PAD_FRAMES = 90; // 约 3 秒 @ 30fps
+/** 撞上垫层后，领先量恢复到这里再继续播。 */
+const FRONTIER_RESUME_FRAMES = 150; // 约 5 秒 @ 30fps
 const MANIFEST_POLL_MS = 1000;
 
 function isAbortError(e: unknown): boolean {
@@ -100,7 +100,7 @@ export function sharedClientId(): string {
   }
 }
 
-/** Resolve accel: URL ?decode=software|hardware|auto, else Windows→software. */
+/** 解析加速方式：URL ?decode=software|hardware|auto，否则 Windows 用软解。 */
 export function resolveDecodeAccel(override?: DecodeAccel): DecodeAccel {
   if (override && override !== "auto") return override;
   try {
@@ -108,9 +108,9 @@ export function resolveDecodeAccel(override?: DecodeAccel): DecodeAccel {
     if (q === "software" || q === "prefer-software") return "prefer-software";
     if (q === "hardware" || q === "prefer-hardware") return "prefer-hardware";
   } catch {
-    /* ignore */
+    /* 忽略 */
   }
-  // Four concurrent HW decoders frequently tear / green-block on Windows.
+  // 四路硬解同时跑，Windows 上经常撕裂或绿块。
   return isWindowsPlatform() ? "prefer-software" : "prefer-hardware";
 }
 
@@ -120,7 +120,7 @@ export class SviewPlayer {
   private manifest: Manifest | null = null;
   private cams = new Map<Channel, CamState>();
   private cache = new Map<number, ArrayBuffer>();
-  /** In-flight segment loads keyed by segment start index. */
+  /** 在途的段加载，按段起点索引。 */
   private segmentInflight = new Map<
     number,
     { epoch: number; promise: Promise<void> }
@@ -139,11 +139,11 @@ export class SviewPlayer {
   private accel: DecodeAccel;
   private manifestTimer = 0;
   private waitingForFrames = false;
-  /** True while fetch+decode+draw of one frame is in flight (backpressure). */
+  /** 一帧的拉取、解码、绘制还在进行（背压）。 */
   private advancing = false;
-  /** After frontier underrun: hold until resume lead is rebuilt. */
+  /** 前沿欠载后：先停住，等领先量补回来。 */
   private frontierHold = false;
-  /** Monotonic generation shared with sparse encode requests. */
+  /** 与稀疏编码请求共用的单调代次。 */
   private seekEpoch = 0;
   private seekAbort: AbortController | null = null;
   private seekSerial: Promise<unknown> = Promise.resolve();
@@ -210,9 +210,9 @@ export class SviewPlayer {
   }
 
   /**
-   * Frames encoded ahead of the playhead.
-   * Sparse ranges grow as segments publish; follow that end the same way
-   * non-sparse follows frames_available. Do not treat the whole movie as ready.
+   * 播放头前面已经编好的帧。
+   * 稀疏区间随段发布增长；跟这个结尾走，跟非稀疏跟 frames_available 一样。
+   * 不要把整段片子当成已经就绪。
    */
   private publishedEnd(): number {
     const m = this.manifest;
@@ -227,7 +227,7 @@ export class SviewPlayer {
     return end;
   }
 
-  /** Frames currently on disk / safe to request (encoder frontier). */
+  /** 当前盘上、可以请求的帧（编码器前沿）。 */
   get Available() {
     if (this.Sparse) return this.publishedEnd();
     return framesAvailable(this.manifest);
@@ -252,16 +252,16 @@ export class SviewPlayer {
   }
 
   /**
-   * A seek lands on the first frames of a new range. The 90-frame pad would
-   * sit behind that playhead, so playback never takes a step.
+   * 一次 seek 会落在新区间的开头几帧。90 帧垫层会落在播放头后面，
+   * 播放就一步都迈不出去。
    */
   private sparseAtRangeFront(): boolean {
     return this.Sparse && this.index - this.rangeStart() < FRONTIER_PAD_FRAMES;
   }
 
   /**
-   * Highest index+1 the playhead may enter while progressive.
-   * Leaves FRONTIER_PAD_FRAMES behind the encoder so we don't kiss the wall.
+   * 边转边播时播放头最多能进到的 index+1。
+   * 在编码器后面留出 FRONTIER_PAD_FRAMES，避免贴墙。
    */
   private playLimit(): number {
     const raw = this.Available;
@@ -286,8 +286,8 @@ export class SviewPlayer {
     this.cache.clear();
     this.segmentInflight.clear();
     this.sparseReadyInflight.clear();
-    // Only use explicit mediaBase. Do NOT auto-switch to manifest.play_base:
-    // private buckets block anonymous GET (403); Master 302 → signed OSS instead.
+    // 只用显式传入的 mediaBase。不要自动切到 manifest.play_base：
+    // 私有桶会拦匿名 GET（403）；改由 Master 302 到签名 OSS。
     const mediaBase = (opts.mediaBase || "").replace(/\/+$/, "") || "";
     this.api = new SviewApi(baseUrl, mediaBase);
     this.jobId = jobId;
@@ -333,8 +333,8 @@ export class SviewPlayer {
   }
 
   /**
-   * Block until several upcoming segments are in cache (or frontier runs out).
-   * Call before play() when media rides a slow Master/Vite proxy.
+   * 堵住，直到后面几段进缓存（或前沿用尽）。
+   * 媒体走慢的 Master/Vite 代理时，play() 之前调用。
    */
   async warmup(segments = WARMUP_SEGMENTS): Promise<void> {
     if (!this.manifest) return;
@@ -367,7 +367,7 @@ export class SviewPlayer {
     }
     if (starts.length && this.api.preferSignedOss) {
       await this.api.prefetchSignedSegmentUrls(this.jobId, starts).catch(() => {
-        /* fall back inside ensureSegment */
+        /* 回退到 ensureSegment 里 */
       });
     }
     for (const start of starts) {
@@ -394,7 +394,7 @@ export class SviewPlayer {
     const loop = (now: number) => {
       if (!this.playing || !this.manifest) return;
       this.raf = requestAnimationFrame(loop);
-      // Serialize: never overlap showFrame (was the main stutter source).
+      // 串行：showFrame 不能重叠（以前卡顿的主因）。
       if (this.advancing || this.waitingForFrames) return;
 
       const frameMs = 1000 / this.fps;
@@ -405,13 +405,13 @@ export class SviewPlayer {
         .then((presented) => {
           if (!this.playing) return;
           if (!presented) {
-            // Buffering / ended — freeze clock so we don't burst after wait.
+            // 缓冲中 / 结束——冻住时钟，避免等完后突发。
             this.lastTick = performance.now();
             return;
           }
           this.lastTick += frameMs;
-          // Mildly behind: present ASAP without snapping (avoids micro-hitches).
-          // Badly behind: snap so we don't queue an ever-growing delay.
+          // 稍微落后：尽快上屏，不拉齐（避免微顿）。
+          // 落后很多：拉齐，避免延迟越积越长。
           const behind = performance.now() - this.lastTick;
           if (behind > frameMs * MAX_FRAME_DEBT) {
             this.lastTick = performance.now();
@@ -472,7 +472,7 @@ export class SviewPlayer {
     this.activeRequestId = "";
     if (!requestId || !this.jobId) return;
     void this.api.cancelEncodeRequest(this.jobId, requestId).catch(() => {
-      /* request may already be ready or expired */
+      /* 请求可能已经就绪或过期 */
     });
   }
 
@@ -482,7 +482,7 @@ export class SviewPlayer {
     }
   }
 
-  /** Latest seek wins; superseded seeks never cache or present a frame. */
+  /** 以最后一次 seek 为准；被取代的 seek 不缓存、不上屏。 */
   async seek(index: number): Promise<boolean> {
     if (!this.manifest) return false;
     const wasPlaying = this.playing || this.resumeAfterSeek;
@@ -505,7 +505,7 @@ export class SviewPlayer {
       }
       this.assertCurrent(epoch, signal);
       const segStart = segmentStartFor(clamped, this.segmentFrames());
-      // Sparse segments are independently decodable from their segment head.
+      // 稀疏段从段头就能独立解码。
       const keys = this.Sparse
         ? [segStart]
         : this.manifest!.bundle.key_frame_indices || [0];
@@ -539,7 +539,7 @@ export class SviewPlayer {
     }
   }
 
-  /** Flush/close every decoder and rebind with last (or software) config. */
+  /** 每个解码器都 flush/关闭，再用上次（或软解）配置重新绑定。 */
   private async resetAllDecoders(epoch = this.seekEpoch, signal?: AbortSignal) {
     for (const ch of this.channelList()) {
       this.assertCurrent(epoch, signal);
@@ -560,7 +560,7 @@ export class SviewPlayer {
       try {
         if (dec.state === "configured") await dec.flush();
       } catch {
-        /* ignore flush errors on broken pipelines */
+        /* 坏管线上的 flush 错误忽略 */
       }
       try {
         dec.close();
@@ -586,14 +586,14 @@ export class SviewPlayer {
         return;
       }
     }
-    // Fall back to full reconfigure from SPS/PPS on disk.
+    // 退回：从盘上的 SPS/PPS 完整重新配置。
     cam.configured = false;
     await this.ensureConfigured();
   }
 
   /**
-   * Advance exactly one display frame (awaited).
-   * @returns true if a frame was presented.
+   * 正好前进一帧显示（会等待）。
+   * @returns 上屏了一帧则为 true。
    */
   private async advanceOneFrame(): Promise<boolean> {
     if (!this.manifest) return false;
@@ -606,8 +606,8 @@ export class SviewPlayer {
       return false;
     }
 
-    // From-start keeps a 90-frame lead. A fresh seek has no lead yet: play the
-    // frames already published, and wait only after catching the encoder.
+    // 从头播要留 90 帧领先。刚 seek 还没有领先量：先播已经发布的帧，
+    // 追上编码器之后再等。
     if (!this.Complete && !this.sparseAtRangeFront()) {
       const needLead = this.frontierHold
         ? FRONTIER_RESUME_FRAMES
@@ -635,7 +635,7 @@ export class SviewPlayer {
         } finally {
           this.waitingForFrames = false;
         }
-        // Fall through to present if resume condition met and next is still valid.
+        // 恢复条件满足且下一帧仍有效，就继续上屏。
         if (!this.Complete && next >= this.playLimit()) {
           return false;
         }
@@ -701,8 +701,8 @@ export class SviewPlayer {
   }
 
   /**
-   * Near a segment boundary, finish loading the next segment before decode.
-   * Avoids a hitch every ~1s when the playhead crosses into an unloaded pack.
+   * 靠近段边界时，解码前先把下一段加载完。
+   * 避免播放头跨进未加载的包时，大约每 1 秒卡一下。
    */
   private async ensureSegmentBoundary(index: number): Promise<void> {
     const segN = this.segmentFrames();
@@ -712,7 +712,7 @@ export class SviewPlayer {
     const epoch = this.seekEpoch;
     const signal = this.seekAbort?.signal;
 
-    // Always keep current segment warm.
+    // 当前段始终保持热着。
     if (!this.segmentCachedThrough(curStart, segN)) {
       await this.ensureSegment(curStart, { quiet: true, epoch, signal });
     }
@@ -720,8 +720,8 @@ export class SviewPlayer {
     const total = this.manifest?.bundle.frame_count ?? this.Available;
     if (nextStart >= total) return;
     if (this.Sparse && !this.isSparseSegmentReady(nextStart)) {
-      // The encode session keeps reading forward from the seek point.
-      // Asking for this segment here would move that frontier and reopen the mcap.
+      // 编码会话从 seek 点一直往前读。
+      // 这里再要这一段会把前沿挪走，并重新打开 mcap。
       return;
     }
     if (!this.Sparse && nextStart >= this.Available) return;
@@ -768,7 +768,7 @@ export class SviewPlayer {
     if (this.Complete) return;
     this.manifestTimer = window.setInterval(() => {
       void this.refreshManifest().catch(() => {
-        /* ignore transient */
+        /* 忽略瞬时错误 */
       });
     }, MANIFEST_POLL_MS);
   }
@@ -782,7 +782,7 @@ export class SviewPlayer {
 
   async refreshManifest(opts: { epoch?: number; signal?: AbortSignal } = {}) {
     if (!this.jobId) return;
-    // Polling already retries every second; avoid overlapping per-request 425 loops.
+    // 轮询已经每秒重试；不要再叠一层按请求的 425 循环。
     const next = await this.api.fetchManifest(this.jobId, {
       retries: 0,
       signal: opts.signal,
@@ -811,14 +811,14 @@ export class SviewPlayer {
       try {
         cam.decoder?.close();
       } catch {
-        /* ignore */
+        /* 忽略 */
       }
       cam.decoder = null;
       cam.configured = false;
       cam.codec = "";
       cam.needsKeyframe = true;
       cam.decodeErrors = 0;
-      // Keep Windows / ?decode=software preference across reloads.
+      // 重新加载时保留 Windows / ?decode=software 偏好。
       cam.forceSoftware = this.accel === "prefer-software";
       cam.waiters = [];
       cam.lastConfig = null;
@@ -953,7 +953,7 @@ export class SviewPlayer {
     return true;
   }
 
-  /** Load one transport segment into the frame cache (deduped). */
+  /** 把一段传输包载入帧缓存（去重）。 */
   private ensureSegment(
     startIndex: number,
     opts: {
@@ -971,7 +971,7 @@ export class SviewPlayer {
 
     let entry = this.segmentInflight.get(start);
     if (!entry || entry.epoch !== epoch) {
-      // Sign a window ahead so boundary crossings don't wait on Master RTT.
+      // 提前签一段窗口，跨边界时不用等 Master RTT。
       const signAhead: number[] = [];
       for (let i = 0; i <= PREFETCH_SEGMENTS; i++) {
         const s = start + i * segN;
@@ -1062,7 +1062,7 @@ export class SviewPlayer {
       void this.api
         .prefetchSignedSegmentUrls(this.jobId, starts, this.seekAbort?.signal)
         .catch(() => {
-        /* signed disabled → Master fallback inside fetchSegment */
+        /* 签名关掉后，fetchSegment 里回退 Master */
         });
     }
     for (const start of starts) {
@@ -1074,12 +1074,12 @@ export class SviewPlayer {
         epoch: this.seekEpoch,
         signal: this.seekAbort?.signal,
       }).catch(() => {
-        /* prefetch miss is fine */
+        /* 预取没命中没关系 */
       });
     }
   }
 
-  /** Find first AU that contains SPS/PPS for each channel (usually a keyframe). */
+  /** 找每个通道第一包含 SPS/PPS 的 AU（通常是关键帧）。 */
   private async findParamSets(): Promise<
     Partial<Record<Channel, { sps: Uint8Array; pps: Uint8Array }>>
   > {
@@ -1144,14 +1144,14 @@ export class SviewPlayer {
         const waiters = cam.waiters.splice(0);
         for (const wfn of waiters) wfn();
 
-        // After a few HW glitches, drop to software decode (runtime 降级).
+        // 硬解连续异常几次后，运行时降级软解。
         if (!cam.forceSoftware && cam.decodeErrors >= 2) {
           cam.forceSoftware = true;
           this.cb.onStatus?.(
             `${streamLabel(ch)} 硬解异常，降级软解… (${err.message})`,
           );
           void this.resetDecoder(ch, cam, true).catch(() => {
-            /* ensureConfigured later */
+            /* 稍后 ensureConfigured */
           });
           return;
         }
@@ -1178,13 +1178,13 @@ export class SviewPlayer {
     if (hw === "prefer-software") cam.forceSoftware = true;
   }
 
-  /** Build supported VideoDecoderConfig ladder; Windows / force → software first. */
+  /** 搭一份浏览器支持的 VideoDecoderConfig 阶梯；Windows / 强制时软解优先。 */
   private async pickDecoderConfig(
     codec: string,
     description: Uint8Array,
     forceSoftware = false,
   ): Promise<VideoDecoderConfig | null> {
-    // Omit codedWidth/Height — manifest size can disagree with SPS and break HW.
+    // 不填 codedWidth/Height——manifest 尺寸可能和 SPS 不一致，硬解会挂。
     const base = { codec, description };
     const softFirst =
       forceSoftware ||
@@ -1200,7 +1200,7 @@ export class SviewPlayer {
           },
           { ...base, hardwareAcceleration: "prefer-software" },
           { ...base, hardwareAcceleration: "no-preference" },
-          // Last resort if software path is unavailable in this browser.
+          // 这个浏览器没有软解时的最后一档。
           { ...base, hardwareAcceleration: "prefer-hardware" },
         ]
       : [
@@ -1223,7 +1223,7 @@ export class SviewPlayer {
         const support = await VideoDecoder.isConfigSupported(cfg);
         if (support.supported) return support.config ?? cfg;
       } catch {
-        /* try next */
+        /* 试下一档 */
       }
     }
     return null;
@@ -1309,6 +1309,26 @@ export class SviewPlayer {
     });
   }
 
+  private async configureFromParams(
+    ch: Channel,
+    cam: CamState,
+    sp: { sps: Uint8Array; pps: Uint8Array },
+  ) {
+    const codec = codecFromSps(sp.sps);
+    const description = buildAvcC(sp.sps, sp.pps);
+    const chosen = await this.pickDecoderConfig(codec, description, cam.forceSoftware);
+    if (!chosen) return;
+    cam.codec = codec;
+    cam.description = description;
+    this.bindDecoder(ch, cam, chosen);
+  }
+
+  private blankCanvas(cam: CamState) {
+    if (!cam.ctx) return;
+    cam.ctx.fillStyle = "#000";
+    cam.ctx.fillRect(0, 0, cam.canvas.width, cam.canvas.height);
+  }
+
   private async decodeFrame(
     index: number,
     render: boolean,
@@ -1323,7 +1343,7 @@ export class SviewPlayer {
     const buf = await this.getFrameBuf(index, epoch, signal);
     this.assertCurrent(epoch, signal);
     const parsed = parseBundle(buf);
-    // Relative PTS — absolute monotonic ns confuses some HW decoders
+    // 相对 PTS——绝对单调纳秒会让有的硬解困惑
     const tsUs = Math.round((index * 1_000_000) / this.fps);
 
     const waits: Promise<void>[] = [];
@@ -1332,16 +1352,28 @@ export class SviewPlayer {
       const cam = this.cams.get(ch);
       if (!cam) continue;
       const au = parsed.streams[ch];
-      if (!au?.length) continue;
+      if (!au?.length) {
+        // 这一路此帧还没有可解码画面（关键帧之前留空），别停在 seek 前的旧图上。
+        if (render && cam.needsKeyframe) this.blankCanvas(cam);
+        continue;
+      }
+      if (!cam.configured && !cam.codec) {
+        // 开头几帧留空的那一路，启动时找不到参数集；第一张 IDR 自带 SPS/PPS。
+        const sp = extractSpsPps(au);
+        if (sp) await this.configureFromParams(ch, cam, sp);
+      }
       if (!cam.decoder || !cam.configured) {
         await this.recoverChannel(ch);
       }
       this.assertCurrent(epoch, signal);
       if (!cam.decoder || cam.decoder.state !== "configured") continue;
 
-      // Per-channel key detection — don't trust global header for chunk type.
+      // 按通道判断关键帧，不拿全局头当 chunk 类型。
       const key = hasIdr(au);
-      if (cam.needsKeyframe && !key) continue;
+      if (cam.needsKeyframe && !key) {
+        if (render) this.blankCanvas(cam);
+        continue;
+      }
 
       const data = annexBToAvcc(au, true);
       if (!data.length) continue;

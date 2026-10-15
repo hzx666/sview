@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""OSS flush: advertise frames_available only after the segment PUT succeeds."""
+"""OSS 刷盘：segment PUT 成功后才公布 frames_available。"""
 import json
 import sys
 import tempfile

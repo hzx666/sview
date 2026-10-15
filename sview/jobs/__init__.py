@@ -1,1 +1,1 @@
-"""Redis job status, queue helpers, and bench type catalog."""
+"""Redis 任务状态、队列辅助，以及 bench 类型表。"""

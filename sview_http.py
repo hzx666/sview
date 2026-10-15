@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry. Implementation: ``sview.http.server``."""
+"""命令行入口。实现：``sview.http.server``。"""
 from pathlib import Path
 import runpy
 import sys

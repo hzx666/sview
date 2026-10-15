@@ -1,39 +1,39 @@
 #!/usr/bin/env python3
 """
-SView HTTP: local cache file server + job submit/status API.
+SView HTTP：本地缓存文件服务 + 任务提交/状态 API。
 
   GET  /healthz
   POST /api/jobs          {"source":"oss://.../*.mcap"}
-  POST /api/jobs          HandVis mesh:
+  POST /api/jobs          HandVis mesh：
                           {"kind":"handvis","ep_dir":"oss://.../ep1/","item_name":"clip_001"}
                           (或 "video_path"+"posehand_path"; task_id 默认 posehand 文件名)
-  GET  /api/jobs/stats    queue depth + processing jobs
+  GET  /api/jobs/stats    队列深度 + 处理中任务
   GET  /api/jobs/{job_id}
   GET  /api/jobs/{job_id}/manifest.json
-  GET  /api/jobs/{job_id}/index.json            # HandVis mesh catalog
+  GET  /api/jobs/{job_id}/index.json            # 目录（HandVis mesh）
   GET  /api/jobs/{job_id}/faces.u32
   GET  /api/jobs/{job_id}/video_projection.bin
-  GET  /api/jobs/{job_id}/segments/000000.bin   # ~30 frames packed (preferred)
-  GET  /api/jobs/{job_id}/frames/000000.bin     # single frame (compat)
+  GET  /api/jobs/{job_id}/segments/000000.bin   # 约 30 帧打包（优先）
+  GET  /api/jobs/{job_id}/frames/000000.bin     # 单帧（兼容）
 
-  # Bench / typed scenarios (does not change /api/jobs contract)
+  # 分类型基准场景（不改 /api/jobs 契约）
   GET  /api/test/types
   POST /api/test/jobs     {"type":1-8,"source":"...","force":true}
   GET  /api/test/jobs/{job_id}
 
-  # Legacy aliases (same handlers as /api/jobs/... media paths)
+  # 旧路径别名（与 /api/jobs/... 媒体路径同一处理函数）
   GET  /{job_id}/manifest.json
   GET  /{job_id}/segments/000000.bin
   GET  /{job_id}/frames/000000.bin
 
-Env:
+环境变量：
   HTTP_HOST / HTTP_PORT
-  LOCAL_OUTPUT_DIR (cache root)
-  SEGMENT_FRAMES=30        frames per segment response (aligned to gop)
-  REDIS_*  (for /api/jobs)
-  SVIEW_CLUSTER=1          enable owner sticky reverse-proxy across pods
-  POD_IP / POD_HTTP_PORT   Downward API identity for cluster mode
-  BENCH_H264_SOURCE / BENCH_H265_SOURCE  (optional defaults for /api/test/jobs)
+  LOCAL_OUTPUT_DIR（缓存根目录）
+  SEGMENT_FRAMES=30        每段响应帧数（按 GOP 对齐）
+  REDIS_*  （供 /api/jobs）
+  SVIEW_CLUSTER=1          开启跨 pod 的 owner 粘滞反向代理
+  POD_IP / POD_HTTP_PORT   集群模式用的 Downward API 身份
+  BENCH_H264_SOURCE / BENCH_H265_SOURCE  （/api/test/jobs 的可选默认源）
 """
 
 import errno
@@ -57,7 +57,7 @@ from sview.logging_setup import setup_logging
 
 log = setup_logging("sview_http")
 
-# Client gone mid-request (LB / probe / browser). Not an app failure.
+# 请求中途客户端断开（LB / 探针 / 浏览器）。不是应用故障。
 _CLIENT_DISCONNECT_ERRNOS = {
     errno.ECONNRESET,
     errno.EPIPE,
@@ -76,7 +76,7 @@ def _is_client_disconnect(exc: BaseException) -> bool:
 
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer that does not dump stack traces for peer resets."""
+    """对端重置连接时不打印堆栈的 ThreadingHTTPServer。"""
 
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
@@ -105,7 +105,7 @@ def _segment_frames() -> int:
 
 
 def _pack_segment(start_index: int, frame_blobs: list[bytes], segment_frames: int) -> bytes:
-    """Pack consecutive single-frame bundles into a segment container."""
+    """把连续的单帧包打进一个片段容器。"""
     header = {
         "packet_schema": "playertrans.bundle_segment.v1",
         "start_index": int(start_index),
@@ -153,7 +153,7 @@ def _playable_min_frames() -> int:
 
 
 def _get_redis():
-    """Lazy Redis client for job API (same env as workers)."""
+    """任务 API 用的懒加载 Redis 客户端（环境变量与 worker 相同）。"""
     global _redis_client
     if _redis_client is not None:
         return _redis_client
@@ -204,7 +204,7 @@ def _optional_int(value) -> Optional[int]:
 
 
 def _optional_frame_count(*values) -> Optional[int]:
-    """First positive int among values; 0/empty means total is still unknown."""
+    """取这些值里的第一个正整数；0 或空表示总数还未知。"""
     for value in values:
         n = _optional_int(value)
         if n is not None and n > 0:
@@ -219,10 +219,10 @@ def _fail_submit_job(
     *,
     publish_mode: str,
 ) -> None:
-    """Persist status=failed and drop this job's Redis playback state.
+    """写入 status=failed，并清掉该任务的 Redis 播放状态。
 
-    The player stops on ``failed`` and shows ``error``. A literal status
-    ``error`` would leave the client waiting.
+    播放器遇到 ``failed`` 会停，并显示 ``error``。状态若写成
+    ``error``，客户端会一直等。
     """
     try:
         from sview.jobs.job_status import fail_submit
@@ -239,7 +239,7 @@ def _fail_submit_job(
 
 
 def _purge_job_play_cache(cache_root: Path, job_id: str, *, reason: str) -> dict:
-    """Wipe local /cache/{job_id}, OSS player-bin/{job_id}/, and Redis progress fields."""
+    """清掉本地 /cache/{job_id}、OSS 上的 player-bin/{job_id}/，以及 Redis 进度字段。"""
     import shutil
 
     summary: dict = {"local_cleared": False}
@@ -267,7 +267,7 @@ def _oss_cache_on() -> bool:
 
 
 def _align_manifest_dict(job_id: str, data: dict) -> dict:
-    """Clamp frames_available to contiguous OSS segments when OSS_CACHE is on."""
+    """开启 OSS_CACHE 时，把 frames_available 收成连续的 OSS 片段。"""
     if not _oss_cache_on():
         return data
     try:
@@ -316,10 +316,10 @@ def _read_oss_manifest(job_id: str) -> Optional[dict]:
 
 
 def _load_play_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
-    """Load play manifest; with OSS_CACHE prefer the OSS object over local.
+    """加载播放 manifest；开了 OSS_CACHE 时优先用 OSS 对象，不用本地的。
 
-    Local progressive files can claim frames that have not been PUT yet.
-    Signed playback must follow what is on OSS, then clamp to contiguous segments.
+    本地渐进文件可能把还没 PUT 的帧也算进去。
+    签名播放必须以 OSS 上的内容为准，再收成连续片段。
     """
     local = _read_local_manifest(cache_root, job_id)
     if _oss_cache_on():
@@ -333,11 +333,11 @@ def _load_play_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
 
 
 def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
-    """Summarize manifest for job API (local file, else OSS), clamped to contiguous OSS segments.
+    """给任务 API 汇总 manifest（本地文件，否则 OSS），并收成连续的 OSS 片段。
 
-    Returns a clean public payload:
+    返回干净的公开字段：
       job_id, status, frame_count, frames_done, playable, cached, duration_sec
-    Plus internal `_manifest_status` for server-side logic only (stripped before send).
+    另加内部字段 `_manifest_status`，只给服务端逻辑用（发出前会去掉）。
     """
     data = _load_play_manifest(cache_root, job_id)
     if data is None:
@@ -353,7 +353,7 @@ def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
         origin_sec = data.get("origin_sec")
         publish_mode = (data.get("publish_mode") or "progressive").lower()
         available_ranges = bundle.get("available_ranges") or []
-        # Cannot confirm OSS objects — do not advertise a local/OSS claim.
+        # 确认不了 OSS 对象，就不要宣称本地或 OSS 已有这份缓存。
         if data.get("cache_align_failed"):
             return {
                 "job_id": data.get("job_id", job_id),
@@ -370,7 +370,7 @@ def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
                 "_manifest_status": "partial",
                 "cache_aligned": False,
             }
-        # Ghost cache: aligned to 0 frames → never report ready/cached.
+        # 幽灵缓存：对齐后是 0 帧，绝不报 ready/cached。
         if frames_done is not None and frames_done <= 0 and data.get("cache_aligned"):
             return {
                 "job_id": data.get("job_id", job_id),
@@ -420,7 +420,7 @@ def _read_manifest_summary(cache_root: Path, job_id: str) -> Optional[dict]:
 
 
 def _public_job_payload(data: dict) -> dict:
-    """Strip internal keys; keep only fields documented for frontend."""
+    """去掉内部字段，只保留文档里给前端的字段。"""
     out = {}
     for k in (
         "job_id",
@@ -457,7 +457,7 @@ def _public_job_payload(data: dict) -> dict:
     ):
         if k in data and data[k] is not None and data[k] != "":
             out[k] = data[k]
-    # Always include these when present as bool/number 0
+    # 即使是布尔值或数字 0，只要有也要带上
     for k in ("playable", "cached", "frames_done", "frame_count", "percent", "cache_bytes"):
         if k in data and k not in out and data[k] is not None:
             out[k] = data[k]
@@ -482,7 +482,7 @@ def _optional_float(value) -> Optional[float]:
 
 
 def _public_test_job_payload(data: dict) -> dict:
-    """Public payload for /api/test/* — includes bench type + timing fields."""
+    """测试接口 /api/test/* 的公开内容，包含基准类型和计时字段。"""
     out = _public_job_payload(data)
     for k in (
         "type",
@@ -501,7 +501,7 @@ def _public_test_job_payload(data: dict) -> dict:
     ):
         if k in data and data[k] is not None and data[k] != "":
             out[k] = data[k]
-    # Normalize type alias
+    # 把 type 别名归一
     if "type" not in out and "bench_type" in out:
         out["type"] = _optional_int(out["bench_type"])
     if "type_name" not in out and data.get("bench_name"):
@@ -533,7 +533,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
-        # Access log into the shared project log file (cwd/sview.log).
+        # 访问日志写入项目共用日志（cwd/sview.log）。
         log.info("HTTP %s - " + fmt, self.address_string(), *args)
 
     def handle(self):
@@ -659,7 +659,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": "missing source (oss://...mcap)"})
             return
         if not source.lower().endswith(".mcap") and ".mcap" not in source.lower():
-            # allow without strict check but warn via message if clearly wrong
+            # 不严格校验也放行；明显不对时在消息里警告
             pass
 
         origin_sec = parse_start_sec(
@@ -834,7 +834,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Already cached locally (complete)?
+        # 本地是否已有完整缓存？
         summary = _read_manifest_summary(self.cache_root, job_id)
         force = bool(body.get("force"))
         if summary and summary.get("status") == "ready" and not force:
@@ -851,7 +851,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Cluster: Redis ready on another pod — no local files; client may fetch via proxy.
+        # 集群：Redis 显示别的 pod 已就绪，本地没有文件；客户端可以走代理拉取。
         if not force and _cluster_enabled() and (not summary or summary.get("status") != "ready"):
             try:
                 r0 = _get_redis()
@@ -881,7 +881,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-        # Optional: verify local mount path exists (helps fail fast)
+        # 可选：确认本地挂载路径存在（便于尽快失败）
         local = source_to_local(source)
         if not local.exists():
             message = "source not found on local mount"
@@ -1103,7 +1103,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             return
 
         owner = (fields.get("owner_pod") or "").strip()
-        # Force-release lock if we own it or single-instance / no owner.
+        # 锁是自己的，或单实例、没有 owner 时，强制释放。
         purge = (not owner) or owner in ("local", POD_IP, _pod_ip())
         fields = request_cancel(r, job_id, purge_owner=purge)
         _purge_job_play_cache(self.cache_root, job_id, reason="cancelled")
@@ -1156,7 +1156,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         )
 
     def _handle_encode_window(self, job_id: str):
-        """Queue an idempotent sparse encode window around one global frame."""
+        """围绕某一全局帧，幂等地排一个稀疏编码窗口。"""
         from sview.cache.oss_cache_gc import frame_range_ready
         from sview.jobs.job_status import (
             create_encode_request,
@@ -1331,7 +1331,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
     def _handle_create_test_job(self):
-        """POST /api/test/jobs — typed bench scenarios (type 1-8). Does not alter /api/jobs."""
+        """分类型基准场景（type 为 1-8）：POST /api/test/jobs。不改动 /api/jobs。"""
         try:
             from sview.jobs.bench_types import bench_job_id, get_bench_type, resolve_bench_source
         except ImportError as e:
@@ -1373,7 +1373,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"invalid job_id derived from source: {job_id}"})
             return
 
-        # Default force=true so repeated type runs re-measure instead of serving stale cache.
+        # 默认 force=true，同一类型再跑时重新计时，不返回旧缓存。
         force = True if "force" not in body else bool(body.get("force"))
         summary = _read_manifest_summary(self.cache_root, job_id)
         if summary and summary.get("status") == "ready" and not force:
@@ -1405,7 +1405,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # force=true: drop stale cache so status polling cannot hit an old ready manifest.
+        # 当 force=true 时丢掉旧缓存，避免状态轮询命中上次的 ready manifest。
         if force:
             import shutil
 
@@ -1508,8 +1508,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
 
         rstatus = (fields.get("status") or "").lower() if fields else ""
 
-        # While Redis says the job is in-flight / failed, never short-circuit on a
-        # stale on-disk ready manifest from a previous force run.
+        # 任务在 Redis 里仍是进行中或失败时，不要短路返回，
+        # 不能直接用上次 force 留下的磁盘上 ready manifest。
         if rstatus in ("queued", "processing", "failed"):
             frames_done = _optional_int(fields.get("frames_done"))
             frame_count = _optional_frame_count(
@@ -1618,7 +1618,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_err(503, f"metrics unavailable: {e}")
 
     def _handle_debug_oss(self):
-        """Ops check: which OSS hosts this Master process will use (no secrets)."""
+        """运维检查：这个 Master 进程会用哪些 OSS 域名（不含密钥）。"""
         from urllib.parse import urlparse
 
         import sview.worker.cpu as sw
@@ -1660,7 +1660,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_json(503, {"error": f"redis unavailable: {e}"})
 
     def _handle_job_events(self, job_id: str):
-        """SSE stream of job progress (Master polls Redis, pushes to client)."""
+        """任务进度的 SSE 流（Master 轮询 Redis，再推给客户端）。"""
         from sview.jobs.job_status import get_job_fields, job_progress_percent, touch_job
 
         try:
@@ -1676,8 +1676,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self._cors()
         self.end_headers()
-        # Comment frame so proxies flush headers immediately (Ingress often buffers
-        # until the first body bytes; EventSource then dies with readyState=2).
+        # 先发注释帧，让代理立刻刷出响应头（Ingress 常缓冲到
+        # 收到第一段正文；否则 EventSource 会停在 readyState=2）。
         try:
             self.wfile.write(b": connected\n\n")
             self.wfile.flush()
@@ -1761,7 +1761,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         from sview.jobs.job_status import get_job_fields, job_progress_percent, touch_job
 
         summary = _read_manifest_summary(self.cache_root, job_id)
-        # Complete cache wins.
+        # 完整缓存优先。
         if summary and summary.get("status") == "ready":
             try:
                 touch_job(_get_redis(), job_id)
@@ -1886,7 +1886,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # No Redis — partial on-disk only
+        # 没有 Redis，只看磁盘上的部分结果
         if summary:
             self._send_json(200, _public_job_payload(summary))
             return
@@ -2024,7 +2024,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_test_job_status(job_id)
             return
 
-        # GET /api/jobs/stats  (before /api/jobs/{job_id})
+        # 须写在 /api/jobs/{job_id} 之前：GET /api/jobs/stats
         if len(parts) == 3 and parts[0] == "api" and parts[1] == "jobs" and parts[2] == "stats":
             if not body:
                 self.send_response(200)
@@ -2034,7 +2034,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_job_stats()
             return
 
-        # GET /metrics or /api/metrics — Prometheus text for HPA
+        # 给 HPA 的 Prometheus 文本：GET /metrics 或 /api/metrics
         if path.rstrip("/") in ("/metrics", "/api/metrics"):
             if not body:
                 self.send_response(200)
@@ -2044,7 +2044,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_metrics()
             return
 
-        # GET /api/debug/oss — verify sign host (no secrets)
+        # 核对签名域名（不含密钥）：GET /api/debug/oss
         if path.rstrip("/") in ("/api/debug/oss", "/debug/oss"):
             if not body:
                 self.send_response(200)
@@ -2054,7 +2054,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_debug_oss()
             return
 
-        # GET /api/workers — alive worker heartbeats
+        # 存活 worker 的心跳：GET /api/workers
         if len(parts) == 2 and parts[0] == "api" and parts[1] == "workers":
             if not body:
                 self.send_response(200)
@@ -2064,7 +2064,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_workers()
             return
 
-        # GET /api/jobs/{job_id}/events — SSE progress stream
+        # 进度 SSE 流：GET /api/jobs/{job_id}/events
         if (
             len(parts) == 4
             and parts[0] == "api"
@@ -2083,7 +2083,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_job_events(job_id)
             return
 
-        # GET /api/jobs/{job_id}/signed-media — batch presigned public OSS URLs
+        # 批量签发公网 OSS URL：GET /api/jobs/{job_id}/signed-media
         if (
             len(parts) == 4
             and parts[0] == "api"
@@ -2135,7 +2135,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._handle_job_status(job_id)
             return
 
-        # GET /api/jobs/{job_id}/index.json  (HandVis mesh catalog; same job_id as segments)
+        # 目录（HandVis mesh，job_id 与 segments 相同）：GET /api/jobs/{job_id}/index.json
         if (
             len(parts) == 4
             and parts[0] == "api"
@@ -2178,8 +2178,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # GET /api/jobs/{job_id}/manifest.json  (preferred)
-        # GET /{job_id}/manifest.json          (legacy alias)
+        # 优先路径：GET /api/jobs/{job_id}/manifest.json
+        # 旧路径别名：GET /{job_id}/manifest.json
         if (
             (len(parts) == 4 and parts[0] == "api" and parts[1] == "jobs"
              and parts[3] == "manifest.json")
@@ -2189,8 +2189,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._serve_manifest(job_id, body=body)
             return
 
-        # GET /api/jobs/{job_id}/segments/{name}  (preferred batch path)
-        # GET /{job_id}/segments/{name}           (legacy alias)
+        # 优先的批量路径：GET /api/jobs/{job_id}/segments/{name}
+        # 旧路径别名：GET /{job_id}/segments/{name}
         if (
             (len(parts) == 5 and parts[0] == "api" and parts[1] == "jobs"
              and parts[3] == "segments")
@@ -2203,8 +2203,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._serve_segment(job_id, seg_name, body=body)
             return
 
-        # GET /api/jobs/{job_id}/frames/{name}  (single-frame compat)
-        # GET /{job_id}/frames/{name}           (legacy alias)
+        # 单帧兼容：GET /api/jobs/{job_id}/frames/{name}
+        # 旧路径别名：GET /{job_id}/frames/{name}
         if (
             (len(parts) == 5 and parts[0] == "api" and parts[1] == "jobs"
              and parts[3] == "frames")
@@ -2220,14 +2220,14 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         self._send_err(404, "not found")
 
     def _handle_signed_media(self, job_id: str):
-        """Batch-sign player-bin segment GET URLs on the public OSS endpoint.
+        """在公网 OSS 上，给 player-bin 片段的 GET URL 批量签名。
 
-        Query:
-          starts=0,30,60          explicit segment indices
-          start=0&count=8&step=30 range form (defaults step=SEGMENT_FRAMES)
-          kind=segments           only; frames are not stored on OSS
-        Browser should fetch returned HTTPS URLs directly (CORS on bucket required).
-        Out-of-range starts are omitted (see `skipped`); they are not signed.
+        查询参数：
+          starts=0,30,60          显式片段起点
+          start=0&count=8&step=30 区间形式（step 默认 SEGMENT_FRAMES）
+          kind=segments           只支持这一种；帧不放在 OSS 上
+        浏览器应直接请求返回的 HTTPS URL（桶需要 CORS）。
+        超出范围的 starts 会略过（见 `skipped`），不会签名。
         """
         if not self._oss_cache_enabled():
             self._send_json(503, {"error": "OSS_CACHE disabled"})
@@ -2359,11 +2359,11 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         self._send_json(200, payload)
 
     def _owner_for_proxy(self, job_id: str) -> Optional[str]:
-        """Return remote owner pod IP if we should reverse-proxy; else None."""
+        """需要反向代理时返回远端 owner 的 pod IP，否则返回 None。"""
         if not _cluster_enabled():
             return None
         if (self.headers.get(_PROXY_HEADER) or "").strip() == "1":
-            return None  # already a hop — serve local only
+            return None  # 已经转发过一次，只提供本地内容
         try:
             from sview.jobs.job_status import get_job_fields, get_lock_owner
 
@@ -2379,8 +2379,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         return owner
 
     def _proxy_from_owner(self, owner: str, body: bool) -> bool:
-        """Reverse-proxy current request to owner pod. Returns True if handled."""
-        # Preserve query flags such as ?proxy=1 across the owner hop.
+        """把当前请求反向代理到 owner pod。已处理则返回 True。"""
+        # 转到 owner 时保留查询参数，例如 ?proxy=1。
         path = self.path
         url = f"http://{owner}:{_pod_http_port()}{path}"
         method = "GET" if body else "HEAD"
@@ -2444,11 +2444,11 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         return False
 
     def _redirect_oss_play(self, job_id: str, *rel_parts: str, body: bool) -> bool:
-        """302 to a short-lived signed OSS URL (private bucket + browser CORS).
+        """用 302 跳到短期签名的 OSS URL（私有桶 + 浏览器 CORS）。
 
-        Returns True if a redirect response was sent.
-        Note: do NOT use this for manifest.json — browsers often fail to parse
-        JSON after a cross-origin 302; serve/proxy the body instead.
+        发出重定向时返回 True。
+        注意：不要用于 manifest.json。浏览器经常解析不了
+        跨域 302 之后的 JSON，改为直接下发或代理正文。
         """
         if not self._oss_cache_enabled():
             return False
@@ -2461,7 +2461,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             log.warning("oss sign redirect skip %s/%s: %s", job_id, "/".join(rel_parts), e)
             return False
         if "-internal." in url:
-            # Browser cannot reach VPC-only OSS hosts; fall back to proxy path.
+            # 浏览器访问不了仅 VPC 的 OSS 域名，改走代理。
             log.error("signed URL still internal, skip 302: %s", url.split("?", 1)[0])
             return False
         self.send_response(302)
@@ -2473,7 +2473,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         return True
 
     def _proxy_oss_object(self, job_id: str, *rel_parts: str, content_type: str, body: bool) -> bool:
-        """Fetch private OSS object server-side and return bytes with Master CORS."""
+        """在服务端拉取私有 OSS 对象，带上 Master 的 CORS 返回字节。"""
         if not self._oss_cache_enabled():
             return False
         try:
@@ -2503,7 +2503,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         body: bool,
         as_json: bool = False,
     ):
-        """Serve HandVis sidecars from local cache or OSS player-bin/{job_id}/{name}."""
+        """从本地缓存或 OSS 的 player-bin/{job_id}/{name} 提供 HandVis 附属文件。"""
         if not _safe_job_id(job_id) or name not in (
             "index.json",
             "faces.u32",
@@ -2550,7 +2550,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             return
         data = _load_play_manifest(self.cache_root, job_id)
         if (data or {}).get("publish_mode", "").lower() != "sparse":
-            # Remote owner → always proxy (ignore stale local cache on this pod).
+            # 远端 owner 一律走代理（忽略本 pod 上过期的本地缓存）。
             owner = self._owner_for_proxy(job_id)
             if owner and self._proxy_from_owner(owner, body=body):
                 return
@@ -2562,7 +2562,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             self._send_retry(425, "play cache not aligned yet", retry_after=1)
             return
 
-        # After cancel/GC/hole: nothing contiguous → 404 so FE cannot start on ghost cache.
+        # 取消、GC 或出现空洞后没有连续段，返回 404，避免前端靠幽灵缓存开播。
         avail = _optional_int((data.get("bundle") or {}).get("frames_available"))
         if (
             (data.get("publish_mode") or "").lower() != "sparse"
@@ -2585,7 +2585,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         if body:
             self.wfile.write(payload)
     def _frame_not_ready(self, job_id: str, frame_idx: Optional[int]) -> bool:
-        """True if missing frame should be 425 (still encoding) rather than 404."""
+        """缺帧应回 425（仍在编码）而不是 404 时，返回 True。"""
         summary = _read_manifest_summary(self.cache_root, job_id)
         if summary:
             mstat = summary.get("_manifest_status")
@@ -2609,7 +2609,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         return False
 
     def _serve_segment(self, job_id: str, seg_name: str, body: bool):
-        """Serve SEGMENT_FRAMES consecutive frame bundles in one response."""
+        """在一次响应里提供连续的 SEGMENT_FRAMES 帧。"""
         if not _safe_job_id(job_id) or not _FRAME_RE.match(seg_name):
             self._send_err(400, "invalid path")
             return
@@ -2627,8 +2627,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         is_sparse = (
             (sparse_manifest or {}).get("publish_mode") or ""
         ).lower() == "sparse"
-        # Sparse segments live in the shared OSS cache. Do not let a stale
-        # worker owner intercept the request before the OSS path.
+        # 稀疏片段放在共享 OSS 缓存里。过期的 worker owner
+        # 不要在走 OSS 路径之前把请求截走。
         if not is_sparse:
             owner = self._owner_for_proxy(job_id)
             if owner and self._proxy_from_owner(owner, body=body):
@@ -2682,8 +2682,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             )
             return
 
-        # Prefer local frames when present (same-node Master/Worker). OSS redirect
-        # only when local pack is unavailable — avoids CORS/parse issues on FE.
+        # 本地有帧就优先用（同机的 Master/Worker）。本地包没有时
+        # 才跳到 OSS，避免前端出现 CORS 或解析问题。
         prefer_oss = os.environ.get("OSS_MEDIA_REDIRECT", "1").lower() in (
             "1", "true", "yes", "on",
         )
@@ -2691,7 +2691,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             "1", "true", "yes", "on",
         )
         force_proxy = self._query_flag("proxy")
-        # ?proxy=1 → never 302 (frontend fallback when Master still signs *-internal*).
+        # 带 ?proxy=1 时绝不 302（Master 仍在签 *-internal* 时的前端回退）。
         if (
             prefer_oss
             and not force_proxy
@@ -2745,7 +2745,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                 self._send_retry(425, "segment not ready yet", retry_after=1)
             return
 
-        # Full segment unless this is the final partial chunk of a finished job.
+        # 要整段，除非这是已完成任务最后一段不完整的数据。
         want = seg_n
         if avail is not None:
             remaining = avail - start_index
@@ -2763,7 +2763,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             name = f"{i:06d}.bin"
             file_path = _resolve_under(self.cache_root, job_id, "frames", name)
             if file_path is None or not file_path.is_file():
-                # Local miss: public 302 (unless ?proxy=1), else Master streams via internal GET.
+                # 本地没有时走公网 302（除非带了 ?proxy=1），否则由 Master 用内网 GET 流转发。
                 if (
                     prefer_oss
                     and not force_proxy
@@ -2811,7 +2811,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                 return
 
         data = _pack_segment(start_index, blobs, seg_n)
-        # Full segments are immutable; final short segment of a done job too.
+        # 完整片段不可变；已完成任务最后一段较短的片段也一样。
         cache = "public, max-age=86400, immutable"
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
@@ -2828,13 +2828,13 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         if not _safe_job_id(job_id) or not _FRAME_RE.match(frame_name):
             self._send_err(400, "invalid path")
             return
-        # Remote owner → always proxy (ignore stale local cache on this pod).
+        # 远端 owner 一律走代理（忽略本 pod 上过期的本地缓存）。
         owner = self._owner_for_proxy(job_id)
         if owner and self._proxy_from_owner(owner, body=body):
             return
         file_path = _resolve_under(self.cache_root, job_id, "frames", frame_name)
         if file_path is None or not file_path.is_file():
-            # Prefer 425 (retry) over 404 while job is still producing frames.
+            # 任务还在产帧时，优先返回 425（让客户端重试），不要 404。
             frame_idx = None
             try:
                 frame_idx = int(frame_name.split(".", 1)[0])
@@ -2995,7 +2995,7 @@ def start_sview_http_server(
     log.info("  GET  /api/test/jobs/{job_id}")
     log.info("  (legacy) GET /{job_id}/manifest.json | segments|frames/*.bin")
 
-    # Master/all with OSS_CACHE: start idle+LRU GC loop.
+    # 角色是 master 或 all 且开启了 OSS_CACHE 时，启动空闲与 LRU 的 GC 循环。
     role = (os.environ.get("SVIEW_ROLE", "all") or "all").strip().lower()
     if role in ("all", "master") and os.environ.get("OSS_CACHE", "0").lower() in (
         "1",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Path-first ingest family: head_cam vs teleoperation/{Robot}."""
+"""按路径判断采集族：head_cam 与 teleoperation/{Robot}。"""
 import sys
 from pathlib import Path
 
@@ -42,7 +42,7 @@ def test_ingest_family():
 
 
 def test_unitree_never_head_cam():
-    """The bag that used to hit 'Head-cam MCAP has no aligned video frames'."""
+    """曾经触发 'Head-cam MCAP has no aligned video frames' 的那个包。"""
     assert ingest_family(UNITREE_OSS) != "head_cam"
     assert ingest_family(
         "/teleoperation/Unitree/260917/G1D_001_device/"

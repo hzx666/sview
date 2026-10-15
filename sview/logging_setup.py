@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Shared logging for the whole SView project → console + file under cwd.
+"""整个 SView 项目共用的日志 → 控制台 + 当前目录下的文件。
 
-All Python entry points should call ``setup_logging(...)`` once. Child loggers
-(``sview_http``, ``sview.orin_images``, scripts, …) propagate into the same file.
+所有 Python 入口都应调用一次 ``setup_logging(...)``。子 logger
+（``sview_http``、``sview.orin_images``、脚本等）会进同一个文件。
 
-Env:
-  LOG_LEVEL      default INFO
-  LOG_FILE       default sview.log (relative → Path.cwd())
-  LOG_TEE_STDOUT default 1 — also append print() stdout into the log file
+环境变量：
+  LOG_LEVEL      默认 INFO
+  LOG_FILE       默认 sview.log（相对路径 → Path.cwd()）
+  LOG_TEE_STDOUT 默认 1 — print() 的 stdout 也追加进日志文件
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ DEFAULT_LOG_FILE = "sview.log"
 
 
 class _StdoutFileTee:
-    """Mirror stdout writes into the project log file (for print())."""
+    """把 stdout 写入镜像到项目日志（给 print() 用）。"""
 
     def __init__(self, stream, path: Path):
         self._stream = stream
@@ -55,7 +55,7 @@ class _StdoutFileTee:
 
 
 def log_path() -> Path:
-    """Resolved path of the project log file (cwd-relative by default)."""
+    """项目日志文件的解析路径（默认相对当前目录）。"""
     global _LOG_PATH
     if _LOG_PATH is not None:
         return _LOG_PATH
@@ -68,7 +68,7 @@ def log_path() -> Path:
 
 
 def setup_logging(name: str | None = None) -> logging.Logger:
-    """Configure root handlers once; return a named (or root) logger."""
+    """配置一次 root handler，返回具名（或 root）logger。"""
     global _CONFIGURED
 
     level_name = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -82,8 +82,8 @@ def setup_logging(name: str | None = None) -> logging.Logger:
     root.setLevel(level)
 
     if not _CONFIGURED:
-        # Drop leftover handlers (e.g. prior basicConfig) so everything goes
-        # through our console + cwd file sinks.
+        # 丢掉残留 handler（例如之前的 basicConfig），全部走
+        # 我们的控制台和当前目录文件。
         for h in list(root.handlers):
             root.removeHandler(h)
 

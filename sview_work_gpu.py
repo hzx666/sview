@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CLI entry. Implementation: ``sview.worker.gpu``."""
+"""命令行入口。实现：``sview.worker.gpu``。"""
 from pathlib import Path
 import sys
 

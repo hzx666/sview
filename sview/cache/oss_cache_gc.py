@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""OSS play-cache GC: idle TTL + 500GiB LRU, with Lifecycle as ops fallback.
+"""OSS 播放缓存 GC：空闲 TTL + 500GiB LRU，Lifecycle 作为运维兜底。
 
-Env:
-  CACHE_MAX_BYTES=536870912000   soft cap (~500 GiB)
-  CACHE_IDLE_TTL_SEC=14400       delete when last_access older than this
-  CACHE_GC_INTERVAL_SEC=300      master loop interval
-  CACHE_PIN_SEC=1800             protect recently touched / playable jobs (30m)
+环境变量：
+  CACHE_MAX_BYTES=536870912000   软上限（约 500 GiB）
+  CACHE_IDLE_TTL_SEC=14400       last_access 超过此时长则删除
+  CACHE_GC_INTERVAL_SEC=300      master 循环间隔
+  CACHE_PIN_SEC=1800             保护最近碰过 / 可播放的任务（30 分钟）
   OSS_CACHE_PREFIX=player-bin
   OSS_BUCKET / OSS_ENDPOINT / OSS_ACCESS_KEY_*
 """
@@ -63,7 +63,7 @@ def job_prefix(job_id: str) -> str:
 
 
 def delete_job_prefix(job_id: str) -> int:
-    """Delete all objects under player-bin/{job_id}/. Returns deleted count."""
+    """删除 player-bin/{job_id}/ 下全部对象。返回删除数量。"""
     bucket = get_oss_bucket()
     prefix = job_prefix(job_id)
     deleted = 0
@@ -79,7 +79,7 @@ def delete_job_prefix(job_id: str) -> int:
 
 
 def list_oss_segment_starts(job_id: str) -> Optional[set[int]]:
-    """Return set of segment start indices present on OSS, or None on list failure."""
+    """返回 OSS 上已有的分段起点下标集合；列举失败返回 None。"""
     try:
         bucket = get_oss_bucket()
     except Exception:
@@ -110,7 +110,7 @@ def contiguous_frames_from_starts(
     segment_frames: int = 30,
     claimed: Optional[int] = None,
 ) -> int:
-    """Frames playable from index 0 given complete segment objects (no holes)."""
+    """分段对象完整（无空洞）时，从下标 0 起可播放的帧数。"""
     seg_n = max(1, int(segment_frames or 30))
     if not starts:
         return 0
@@ -120,7 +120,7 @@ def contiguous_frames_from_starts(
         avail = s + seg_n
         s += seg_n
     if claimed is not None and claimed >= 0:
-        # Allow a short final partial segment: claimed may be < last full boundary.
+        # 允许末尾短的半段：claimed 可以小于最后一个完整边界。
         if claimed < avail and (avail - seg_n) in starts and claimed > (avail - seg_n):
             return int(claimed)
         return int(min(avail, claimed))
@@ -132,7 +132,7 @@ def merge_available_ranges(
     *,
     frame_count: Optional[int] = None,
 ) -> list[list[int]]:
-    """Normalize and merge half-open frame ranges."""
+    """归一并合并半开帧区间。"""
     cleaned: list[tuple[int, int]] = []
     try:
         parsed_limit = int(frame_count) if frame_count is not None else None
@@ -168,7 +168,7 @@ def available_ranges_from_starts(
     segment_frames: int = 30,
     frame_count: Optional[int] = None,
 ) -> list[list[int]]:
-    """Build merged half-open ranges from physically present segment objects."""
+    """按实际存在的分段对象拼出合并后的半开区间。"""
     seg_n = max(1, int(segment_frames or 30))
     ranges = []
     for start in sorted(starts or set()):
@@ -187,7 +187,7 @@ def available_ranges_from_starts(
 
 
 def contiguous_prefix_from_ranges(ranges: Any) -> int:
-    """Return the covered frame count starting exactly at frame zero."""
+    """返回从第 0 帧起连续覆盖的帧数。"""
     merged = merge_available_ranges(ranges)
     if not merged or merged[0][0] != 0:
         return 0
@@ -195,7 +195,7 @@ def contiguous_prefix_from_ranges(ranges: Any) -> int:
 
 
 def frame_range_ready(ranges: Any, start: int, end: Optional[int] = None) -> bool:
-    """Whether one half-open frame interval is fully covered."""
+    """一个半开帧区间是否被完全覆盖。"""
     start = int(start)
     end = int(end if end is not None else start + 1)
     return any(int(a) <= start and int(b) >= end for a, b in merge_available_ranges(ranges))
@@ -207,7 +207,7 @@ def contiguous_oss_frames(
     segment_frames: int = 30,
     claimed: Optional[int] = None,
 ) -> Optional[int]:
-    """Contiguous playable frames from OSS segments starting at 0; None if list fails."""
+    """OSS 分段从 0 起连续可播放的帧数；列举失败返回 None。"""
     starts = list_oss_segment_starts(job_id)
     if starts is None:
         return None
@@ -223,11 +223,11 @@ def filter_playable_segment_starts(
     segment_frames: int = 30,
     available_ranges: Any = None,
 ) -> tuple[list[int], list[dict[str, Any]]]:
-    """Keep OSS segment starts that exist for the advertised playable prefix.
+    """只保留已公布可播放前缀里、OSS 上存在的分段起点。
 
-    A start is playable when it is a non-negative multiple of segment_frames
-    and strictly less than frames_available (last object is
-    floor((avail-1)/seg)*seg). Out-of-range starts are skipped, not signed.
+    起点可播放的条件：非负，且是 segment_frames 的整数倍，
+    并严格小于 frames_available（最后一个对象是
+    floor((avail-1)/seg)*seg）。超出范围的起点跳过，不签名。
     """
     seg_n = max(1, int(segment_frames or 30))
     kept: list[int] = []
@@ -254,7 +254,7 @@ def filter_playable_segment_starts(
 
 
 def oss_segment_hole(starts: set[int]) -> bool:
-    """True if objects exist but segment 0 is missing (orphaned tail / partial Lifecycle)."""
+    """有对象但缺分段 0 时为 True（尾部孤儿 / Lifecycle 删了一部分）。"""
     return bool(starts) and 0 not in starts
 
 
@@ -265,9 +265,9 @@ def purge_job_play_cache(
     reason: str = "purged",
     clear_redis_progress: bool = True,
 ) -> dict:
-    """Delete OSS player-bin/{job_id}/ and reset Redis so clients cannot see ghost frames.
+    """删除 OSS 上的 player-bin/{job_id}/，并重置 Redis，避免客户端看到幽灵帧。
 
-    Local /cache/{job_id} should still be removed by the caller (Master/Worker).
+    本地 /cache/{job_id} 仍由调用方（Master/Worker）删除。
     """
     from sview.jobs.job_status import get_job_fields, remove_cache_job, set_job_fields
 
@@ -327,10 +327,10 @@ def align_manifest_to_oss(
     segment_frames: Optional[int] = None,
     job_status: Optional[str] = None,
 ) -> dict:
-    """Clamp manifest frames_available to contiguous OSS segments (fixes ghost tails).
+    """把 manifest 的 frames_available 夹到 OSS 上连续的分段（修幽灵尾）。
 
-    If OSS listing fails, sets cache_align_failed so callers must not advertise
-    the unclamped local/OSS claim (Master returns 425 instead of a ghost tail).
+    OSS 列举失败时置 cache_align_failed，调用方不能再公布
+    未夹紧的本地/OSS 声明（Master 返回 425，而不是幽灵尾）。
     """
     if not isinstance(manifest, dict):
         return manifest
@@ -381,12 +381,12 @@ def align_manifest_to_oss(
     hole = oss_segment_hole(starts)
     status = (job_status or manifest.get("status") or "").lower()
 
-    # Orphaned tail (Lifecycle / cancel without wipe): never advertise early frames.
+    # 孤儿尾（Lifecycle / 取消时没清干净）：不要公布靠前的帧。
     if hole:
-        bundle["frames_available"] = aligned  # usually 0
+        bundle["frames_available"] = aligned  # 通常是 0
         manifest["bundle"] = bundle
         if aligned <= 0 and status in ("done", "ready", "partial"):
-            # Do not look playable when nothing is contiguous from 0.
+            # 从 0 起没有连续段时，不要看起来像能播。
             manifest["status"] = "partial"
         manifest["cache_aligned"] = True
         manifest["cache_align_reason"] = "oss_segment_hole"
@@ -397,7 +397,7 @@ def align_manifest_to_oss(
         manifest["bundle"] = bundle
         manifest["cache_aligned"] = True
         manifest["cache_align_reason"] = "oss_contiguous_clamp"
-        # If nothing left on OSS, demote done → avoid FE treating as complete cache.
+        # OSS 上什么都不剩时，把 done 降级，避免前端当成完整缓存。
         if aligned <= 0 and status in ("done", "ready"):
             manifest["status"] = "partial"
         return manifest
@@ -427,7 +427,7 @@ def _is_protected(fields: dict, now: float) -> bool:
 
 
 def run_gc_once(r) -> dict:
-    """Evict idle jobs then LRU until under CACHE_MAX_BYTES."""
+    """先淘汰空闲任务，再按 LRU 淘汰，直到低于 CACHE_MAX_BYTES。"""
     from sview.jobs.job_status import (
         get_job_fields,
         list_cache_jobs,
@@ -524,7 +524,7 @@ def _gc_loop(get_redis):
 
 
 def start_cache_gc(get_redis, *, daemon: bool = True) -> Optional[threading.Thread]:
-    """Start background GC on master (no-op if OSS_CACHE=0)."""
+    """在 master 上启动后台 GC（OSS_CACHE=0 时什么都不做）。"""
     global _gc_thread
     if not _env_bool("OSS_CACHE", "0"):
         log.info("OSS_CACHE disabled — cache GC not started")

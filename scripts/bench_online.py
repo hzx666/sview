@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Online bench client: hit /api/test/jobs for types 1-8 and write a report.
+"""线上基准客户端：请求 /api/test/jobs 的类型 1-8，并写报告。
 
-Usage:
+用法：
   python scripts/bench_online.py --base-url http://139.224.211.114:8080
   python scripts/bench_online.py --base-url http://139.224.211.114:8080 --types 1,2,3 --h264 SOURCE --h265 SOURCE
 
-Env (optional, same as server defaults):
+环境变量（可选，与服务端默认一致）：
   BENCH_H264_SOURCE / BENCH_H265_SOURCE
 """
 
@@ -57,7 +57,7 @@ def _http_json(method: str, url: str, body: dict | None = None, timeout: float =
             time.sleep(min(8.0, 0.5 * attempt * attempt))
             continue
         except Exception as e:
-            # http.client may raise RemoteDisconnected as subclass of ConnectionResetError on some versions
+            # 某些版本里 http.client 会把 RemoteDisconnected 当成 ConnectionResetError 的子类抛出
             if "Remote end closed" in str(e) or "Connection reset" in str(e):
                 last_err = e
                 time.sleep(min(8.0, 0.5 * attempt * attempt))
@@ -130,8 +130,8 @@ def run_type(
             result["wall_poll_sec"] = round(time.perf_counter() - t0, 3)
             return result
         if st == "ready":
-            # After a forced re-run, require worker timing fields so we don't
-            # accept a stale ready response without measurements.
+            # 强制重跑后必须有 worker 计时字段，
+            # 避免把没有测量数据的旧 ready 当成结果。
             full = status.get("full_sec")
             if force and full is None:
                 continue

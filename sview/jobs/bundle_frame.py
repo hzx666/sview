@@ -1,4 +1,4 @@
-"""Length-prefixed bundle_frame packer (v1 quad-cam, v2 N named streams)."""
+"""长度前缀的 bundle_frame 打包（v1 四路相机，v2 为 N 路命名流）。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ HEADCAM_CHANNEL_SET = frozenset(HEADCAM_CHANNELS)
 
 
 def classic_quad_keys(keys) -> bool:
-    """True when stream ids are the head-cam RR/FR/RL/FL set (or a subset)."""
+    """流 id 是头显 RR/FR/RL/FL（或其子集）时为 True。"""
     up = {str(k).upper() for k in (keys or []) if k}
     return bool(up) and up <= HEADCAM_CHANNEL_SET
 
@@ -33,10 +33,10 @@ def pack_bundle_frame(
     events_json: dict,
     stream_codecs: dict | None = None,
 ) -> bytes:
-    """header_len | header JSON | payload_len | payload(streams…|IMU|Events).
+    """header_len | header JSON | payload_len | payload（streams…|IMU|Events）。
 
-    v1 (head-cam): streams keys ``rr/fr/rl/fl``, payload order RR|FR|RL|FL.
-    v2 (teleop): streams keyed by original topic slug, N streams, each has codec.
+    v1（头显）：streams 的 key 为 ``rr/fr/rl/fl``，payload 顺序 RR|FR|RL|FL。
+    v2（遥操）：按原 topic 路径做 key，N 路，每路带 codec。
     """
     codecs = stream_codecs or {}
     use_v1 = classic_quad_keys(streams_data.keys())
@@ -93,7 +93,7 @@ def pack_bundle_frame(
 
 
 def build_streams_manifest(metas: dict, fallback_w: int, fallback_h: int) -> dict:
-    """Manifest ``streams`` object. Quad-cam keeps camera_rr/…; teleop uses topic keys."""
+    """manifest 的 ``streams``。四路相机仍用 camera_rr/…；遥操用 topic key。"""
     metas = metas or {}
     if classic_quad_keys(metas.keys()):
         result = {}

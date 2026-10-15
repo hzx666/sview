@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Redis job status helpers shared by HTTP API and workers."""
+"""供 HTTP API 与 worker 共用的 Redis 任务状态辅助。"""
 
 from __future__ import annotations
 
@@ -38,8 +38,8 @@ JOB_ACTIVE_PREFIX = os.environ.get(
 ENCODE_REQUEST_TTL_SEC = max(
     300, int(os.environ.get("SVIEW_ENCODE_REQUEST_TTL_SEC", "3600") or "3600")
 )
-# Segments kept queued ahead of the playback frontier. The worker refills this
-# window after each segment, so playback can start while later segments encode.
+# 播放前沿之前预先排队的片段数。每完成一段，worker 就补这个
+# 窗口，后面的片段还在编码时就可以先播。
 SPARSE_FORWARD_SEGMENTS = max(
     1, min(8, int(os.environ.get("SVIEW_SPARSE_FORWARD_SEGMENTS", "3") or "3"))
 )
@@ -53,7 +53,7 @@ CACHE_PIN_SEC = max(0, int(os.environ.get("CACHE_PIN_SEC", "1800") or "1800"))
 
 
 def ensure_cluster_identity(*, fatal: bool = True) -> None:
-    """SVIEW_CLUSTER=1 requires a real POD_IP; otherwise all pods share owner 'local'."""
+    """开启 SVIEW_CLUSTER=1 时必须有真实 POD_IP，否则所有 pod 都会共用 owner 'local'。"""
     if not SVIEW_CLUSTER:
         return
     if _RAW_POD_IP and _RAW_POD_IP.lower() != "local":
@@ -78,7 +78,7 @@ def job_id_from_source(source: str) -> str:
 
 
 def sparse_cache_job_id(source: str, local_path: str | Path | None = None) -> str:
-    """Stable shared-cache id for one source version and encode profile."""
+    """同一源版本、同一编码配置下稳定的共享缓存 id。"""
     stem = job_id_from_source(source)
     normalized = source.strip().replace("\\", "/").rstrip("/")
     version = ""
@@ -102,7 +102,7 @@ def sparse_cache_job_id(source: str, local_path: str | Path | None = None) -> st
     digest = hashlib.sha256(
         f"{normalized}\n{version}\n{profile}".encode("utf-8")
     ).hexdigest()[:12]
-    # Leave room under the API's 200-character job-id limit.
+    # 给 API 的 job_id 上限 200 字符留出余量。
     return f"{stem[:180]}_c{digest}"
 
 
@@ -123,7 +123,7 @@ def segment_lock_key(job_id: str, start: int) -> str:
 
 
 def segment_slot_key(job_id: str, start: int) -> str:
-    """One worker slot for a segment, shared by every window waiting on it."""
+    """一个片段只占一个 worker 槽，等它的窗口都共用这一个。"""
     return f"{SEGMENT_SLOT_PREFIX}{job_id}:{int(start)}"
 
 
@@ -139,8 +139,8 @@ def set_job_fields(r, job_id: str, **fields: Any) -> None:
     data = {k: str(v) for k, v in fields.items() if v is not None}
     data["updated_at"] = str(int(time.time()))
     key = job_redis_key(job_id)
-    # Redis 4+ accepts multi-field HSET; Windows Redis 3.x only accepts one pair
-    # or HMSET. Prefer multi-HSET, fall back to per-field HSET.
+    # 多字段 HSET：Redis 4+ 可以一次写多个字段；Windows 的 Redis 3.x 只接受一对，
+    # 或者用 HMSET。优先多字段 HSET，失败再逐字段 HSET。
     try:
         r.hset(key, mapping=data)
     except Exception:
@@ -152,7 +152,7 @@ def set_job_fields(r, job_id: str, **fields: Any) -> None:
 
 def get_job_fields(r, job_id: str) -> dict:
     raw = r.hgetall(job_redis_key(job_id)) or {}
-    # redis-py may return bytes if decode_responses=False
+    # 若 decode_responses=False，redis-py 可能返回 bytes
     out = {}
     for k, v in raw.items():
         if isinstance(k, bytes):
@@ -294,7 +294,7 @@ def is_cancel_requested(fields: Optional[dict]) -> bool:
 
 
 def acquire_job_lock(r, job_id: str, owner: Optional[str] = None, ttl: Optional[int] = None) -> bool:
-    """SET NX EX lock. Returns True if this owner acquired the lock."""
+    """用 SET NX EX 加锁。这个 owner 抢到锁时返回 True。"""
     owner = (owner or POD_IP).strip() or "local"
     ttl = int(ttl or SVIEW_LOCK_TTL_SEC)
     ok = r.set(lock_redis_key(job_id), owner, nx=True, ex=ttl)
@@ -302,7 +302,7 @@ def acquire_job_lock(r, job_id: str, owner: Optional[str] = None, ttl: Optional[
 
 
 def renew_job_lock(r, job_id: str, owner: Optional[str] = None, ttl: Optional[int] = None) -> bool:
-    """Refresh TTL only if we still hold the lock."""
+    """只有仍持有锁时才刷新 TTL。"""
     owner = (owner or POD_IP).strip() or "local"
     ttl = int(ttl or SVIEW_LOCK_TTL_SEC)
     key = lock_redis_key(job_id)
@@ -316,7 +316,7 @@ def renew_job_lock(r, job_id: str, owner: Optional[str] = None, ttl: Optional[in
 
 
 def release_job_lock(r, job_id: str, owner: Optional[str] = None, force: bool = False) -> bool:
-    """Delete lock if owned by us, or if force=True."""
+    """锁属于自己，或 force=True 时，删除这把锁。"""
     owner = (owner or POD_IP).strip() or "local"
     key = lock_redis_key(job_id)
     cur = r.get(key)
@@ -340,7 +340,7 @@ def get_lock_owner(r, job_id: str) -> Optional[str]:
 
 
 def collect_job_stats(r) -> dict:
-    """Queue depth + locked/processing jobs (cluster-safe via Redis)."""
+    """队列深度，以及持锁或处理中的任务（经 Redis，集群下也安全）。"""
     queued = int(r.llen(REDIS_QUEUE_KEY) or 0)
     jobs: list = []
     cursor = 0
@@ -466,7 +466,7 @@ def collect_job_stats(r) -> dict:
 
 
 def touch_job(r, job_id: str, *, pin_sec: Optional[int] = None) -> dict:
-    """Refresh last_access_at / pin_until so GC won't evict an active viewer."""
+    """刷新 last_access_at / pin_until，避免 GC 清掉正在观看的人。"""
     now = int(time.time())
     pin = int(pin_sec if pin_sec is not None else CACHE_PIN_SEC)
     patch = {"last_access_at": now}
@@ -477,7 +477,7 @@ def touch_job(r, job_id: str, *, pin_sec: Optional[int] = None) -> dict:
 
 
 def register_cache_bytes(r, job_id: str, add_bytes: int) -> int:
-    """Track OSS cache size for a job; returns new job cache_bytes."""
+    """记录某个任务的 OSS 缓存大小，并返回新的 cache_bytes。"""
     add_bytes = max(0, int(add_bytes or 0))
     fields = get_job_fields(r, job_id)
     try:
@@ -511,7 +511,7 @@ def list_cache_jobs(r) -> list:
 
 
 def _scan_keys(r, pattern: str) -> list[str]:
-    """Return keys matching a Redis glob. Empty when the client cannot scan."""
+    """返回匹配 Redis glob 的键。客户端不能 scan 时为空。"""
     if not hasattr(r, "scan"):
         return []
     found: list[str] = []
@@ -536,7 +536,7 @@ def _delete_keys(r, keys: list[str]) -> None:
 
 
 def _clear_job_runtime_keys(r, job_id: str) -> None:
-    """Drop locks, sessions, and segment claims. Keep the job hash itself."""
+    """丢掉锁、会话和片段认领，保留任务 hash 本身。"""
     exact = [
         lock_redis_key(job_id),
         job_active_key(job_id),
@@ -560,7 +560,7 @@ def _clear_job_runtime_keys(r, job_id: str) -> None:
 
 
 def _drop_queued_job(r, job_id: str, source: str = "") -> None:
-    """Remove queue items that would start this job again."""
+    """去掉会再次启动这个任务的队列项。"""
     try:
         items = r.lrange(REDIS_QUEUE_KEY, 0, -1) or []
     except Exception:
@@ -583,10 +583,10 @@ def _drop_queued_job(r, job_id: str, source: str = "") -> None:
 
 
 def jobs_matching_source(r, source: str) -> list[str]:
-    """Existing job ids whose stored source is this path.
+    """已保存的 source 等于该路径的那些 job_id。
 
-    Sparse ids include a file-stat digest, so a missing file computes a
-    different id than the job created when the file was present.
+    稀疏 id 带文件 stat 摘要，文件缺失时算出的 id
+    和文件还在时创建的任务不一样。
     """
     source = (source or "").strip()
     if not source:
@@ -610,7 +610,7 @@ def fail_job(
     source: str = "",
     publish_mode: str = "",
 ) -> dict:
-    """Mark one job failed, keep the error, and drop its Redis playback state."""
+    """把一个任务标成失败，保留 error，并清掉它的 Redis 播放状态。"""
     message = (error or "failed").strip()[:500]
     _clear_job_runtime_keys(r, job_id)
     _drop_queued_job(r, job_id, source)
@@ -661,7 +661,7 @@ def fail_submit(
     *,
     publish_mode: str = "",
 ) -> list[str]:
-    """Fail this submit and any older Redis job for the same source."""
+    """让这次提交失败，同一 source 更早的 Redis 任务也一并失败。"""
     ids: list[str] = []
     try:
         ids = jobs_matching_source(r, source)
@@ -682,7 +682,7 @@ def remove_cache_job(r, job_id: str, nbytes: int = 0) -> None:
             r.decrby(CACHE_TOTAL_BYTES_KEY, n)
         except Exception:
             pass
-        # Avoid negative totals
+        # 避免总量变成负数
         try:
             total = int(r.get(CACHE_TOTAL_BYTES_KEY) or 0)
             if total < 0:
@@ -714,7 +714,7 @@ def claim_job_segment(
     *,
     ttl: int = 180,
 ) -> bool:
-    """Allow one active sparse segment per shared Job."""
+    """每个共享任务同时只允许一个稀疏片段在跑。"""
     return bool(
         r.set(job_active_key(job_id), f"{int(start)}:{owner}", nx=True, ex=max(30, int(ttl)))
     )
@@ -738,7 +738,7 @@ def set_worker_heartbeat(
     jobs: Optional[list] = None,
     extra: Optional[dict] = None,
 ) -> None:
-    """Worker liveness record (TTL). Used by master /metrics and ops UI."""
+    """带 TTL 的 worker 存活记录。给 master 的 /metrics 和运维界面用。"""
     payload = {
         "worker_id": worker_id,
         "pod_ip": POD_IP,
@@ -778,7 +778,7 @@ def list_workers(r) -> list:
 
 
 def prometheus_metrics(r) -> str:
-    """Text exposition for HPA (Prometheus / custom metrics adapter)."""
+    """给 HPA 用的文本指标（Prometheus / 自定义指标适配器）。"""
     stats = collect_job_stats(r)
     workers = list_workers(r)
     total_cache = cache_total_bytes(r)
@@ -816,7 +816,7 @@ def job_progress_percent(fields: Optional[dict]) -> Optional[float]:
 
 
 def job_in_flight(fields: Optional[dict], r=None, job_id: Optional[str] = None) -> bool:
-    """True when job is queued/processing and (if checkable) lock still held or just queued."""
+    """任务处于 queued 或 processing，且（查得到的话）仍持有锁，或只是刚入队时，返回 True。"""
     if not fields:
         return False
     status = (fields.get("status") or "").lower()
@@ -825,7 +825,7 @@ def job_in_flight(fields: Optional[dict], r=None, job_id: Optional[str] = None) 
     if status != "processing":
         return False
     if r is not None and job_id:
-        # processing without a lock → stale; allow re-enqueue
+        # 状态为 processing 但没有锁，视为过期，允许重新入队
         return get_lock_owner(r, job_id) is not None
     return True
 
@@ -838,11 +838,11 @@ def enqueue_source(
     force: bool = False,
     origin_sec: float = 0.0,
 ) -> Tuple[str, bool]:
-    """Record queued status and RPUSH source. Returns (job_id, enqueued).
+    """记下 queued 状态，并 RPUSH source。返回 (job_id, enqueued)。
 
-    If the same job is already queued/processing (lock alive) and force is False,
-    skip RPUSH and return enqueued=False.
-    ``origin_sec`` > 0 encodes from that offset; job_id becomes ``{stem}_o{sec}``.
+    同一任务已在 queued 或 processing（锁还在）且 force 为 False 时，
+    跳过 RPUSH，并返回 enqueued=False。
+    ``origin_sec`` > 0 时从该偏移开始编码，job_id 变成 ``{stem}_o{sec}``。
     """
     from sview.jobs.origin import origin_job_id, parse_start_sec
 
@@ -892,7 +892,7 @@ def enqueue_sparse_job(
     force: bool = False,
     segment_frames: int = 30,
 ) -> Tuple[str, bool]:
-    """Create one sparse job and queue its initial segment."""
+    """创建一个稀疏任务，并把首段入队。"""
     source = source.strip()
     jid = job_id or job_id_from_source(source)
     fields = get_job_fields(r, jid)
@@ -921,8 +921,8 @@ def enqueue_sparse_job(
         )
         if first_ready or active:
             return jid, False
-        # Recover a sparse job whose worker died after claiming the segment.
-        # Shared OSS is still authoritative, so only stale Redis claims reset.
+        # 恢复 worker 认领片段后挂掉的稀疏任务。
+        # 共享 OSS 仍以它为准，只重置过期的 Redis 认领。
         for start in range(0, max(1, int(segment_frames or 30)), max(1, int(segment_frames or 30))):
             r.delete(segment_pending_key(jid, start))
             r.delete(segment_lock_key(jid, start))
@@ -962,10 +962,10 @@ def enqueue_segment_window(
     request_id: str = "",
     client_id: str = "",
 ) -> list[int]:
-    """Queue missing sparse segments with Redis SET-NX dedupe.
+    """把缺少的稀疏片段入队，并用 Redis SET-NX 去重。
 
-    Segment items are LPUSHed so an interactive seek wins over normal RPUSH
-    jobs while preserving ascending order inside the requested window.
+    片段用 LPUSH，这样交互拖动能压过普通的 RPUSH
+    任务，窗口内部仍保持升序。
     """
     seg_n = max(1, int(segment_frames or 30))
     frame = max(0, int(frame_index or 0))
@@ -1016,8 +1016,8 @@ def enqueue_segment_window(
             )
         )
         queued.append(start)
-    # LPUSH in reverse so the contiguous playback segment stays at the head.
-    # Later prefetch segments remain behind it.
+    # 倒序 LPUSH，让连续播放的那段留在队头。
+    # 更靠后的预取片段排在它后面。
     for payload in reversed(payloads):
         r.lpush(REDIS_QUEUE_KEY, payload)
     active = (fields.get("encode_status") or "").lower()
@@ -1059,11 +1059,11 @@ def enqueue_forward_from(
     bump_epoch: bool = True,
     ranges_override: Any = None,
 ) -> list[int]:
-    """Queue missing segments forward from the playhead or seek point.
+    """从播放头或拖动点往前，把缺少的片段入队。
 
-    Segments already in available_ranges are skipped. The first missing
-    segment is pushed to the queue head. A seek records encode_frontier so
-    older segments of this Job are no longer the playback path.
+    已经在 available_ranges 里的片段会跳过。第一个缺少的
+    片段推到队头。拖动会记下 encode_frontier，
+    于是这个任务更早的片段不再作为播放路径。
     """
     from sview.cache.oss_cache_gc import frame_range_ready
 
@@ -1195,7 +1195,7 @@ def set_client_frontier(
     *,
     segment_frames: int = 30,
 ) -> int:
-    """Point this window at a segment. Does not start another encode thread."""
+    """把这个窗口指到某个片段，不再另开编码线程。"""
     seg_n = max(1, int(segment_frames or 30))
     origin = (max(0, int(frame_index or 0)) // seg_n) * seg_n
     r.set(session_frontier_key(job_id, client_id), str(origin), ex=ENCODE_REQUEST_TTL_SEC)
@@ -1211,10 +1211,10 @@ def claim_segment_slot(
     *,
     ttl: int = 180,
 ) -> bool:
-    """Claim the single worker slot for one segment.
+    """认领某个片段唯一的 worker 槽。
 
-    The same window may renew its own claim. Another window must wait for the
-    published segment instead of taking a second inflight thread.
+    同一窗口可以给自己的认领续期。别的窗口必须等
+    片段发布，不能再占第二条在途线程。
     """
     client_id = (client_id or "anonymous")[:128]
     key = segment_slot_key(job_id, start)
@@ -1249,9 +1249,9 @@ def first_unencoded_segment(
     client_id: str,
     segment_frames: int = 30,
 ) -> Optional[int]:
-    """First missing segment at or after this window's frontier.
+    """本窗口前沿及之后，第一个还缺的片段。
 
-    None means every segment through frame_count is already published.
+    返回 None 表示直到 frame_count 的片段都已发布。
     """
     from sview.cache.oss_cache_gc import frame_range_ready
 
@@ -1285,11 +1285,11 @@ def ensure_sparse_session(
     *,
     segment_frames: int = 30,
 ) -> bool:
-    """Queue one encode thread for this window's next missing segment.
+    """为本窗口下一个缺段排一条编码线程。
 
-    A later seek on the same window only moves that window's frontier.
-    Another window whose next segment already has an encode slot does not
-    take a worker inflight place; it waits until that segment is published.
+    同一窗口之后再拖动，只移动该窗口的前沿。
+    下一段已有编码槽的其他窗口不再占 worker 在途名额，
+    而是等到该片段发布。
     """
     client_id = (client_id or "anonymous")[:128]
     if r.get(session_alive_key(job_id, client_id)):
@@ -1322,7 +1322,7 @@ def ensure_sparse_session(
 
 
 def release_segment_claim(r, job_id: str, start: int, *, owner: str = "") -> None:
-    """Release pending and worker lock keys for one sparse segment."""
+    """释放一个稀疏片段的待处理标记和 worker 锁。"""
     r.delete(segment_pending_key(job_id, start))
     key = segment_lock_key(job_id, start)
     if not owner:
@@ -1347,9 +1347,9 @@ def enqueue_bench_job(
     type_name: str = "",
     force: bool = True,
 ) -> Tuple[str, bool]:
-    """Enqueue a typed bench job with per-job transcode overrides (JSON queue payload).
+    """入队一个分类型基准任务，可按任务覆盖转码参数（队列负载为 JSON）。
 
-    Returns (job_id, enqueued). Bench defaults to force=True (re-measure).
+    返回 (job_id, enqueued)。基准默认 force=True（重新计时）。
     """
     source = source.strip()
     jid = job_id or f"{job_id_from_source(source)}__t{int(type_id)}"
@@ -1399,7 +1399,7 @@ def enqueue_bench_job(
 
 
 def request_cancel(r, job_id: str, *, purge_owner: bool = False) -> dict:
-    """Mark job cancelled; release lock if we own it or purge_owner."""
+    """把任务标为取消；锁属于自己或带了 purge_owner 时释放锁。"""
     set_job_fields(
         r,
         job_id,
@@ -1415,7 +1415,7 @@ def request_cancel(r, job_id: str, *, purge_owner: bool = False) -> dict:
 
 
 def parse_queue_item(raw: Any) -> dict:
-    """Parse a queue item: plain source string (prod) or JSON bench payload."""
+    """解析队列项：普通的 source 字符串（线上），或 JSON 基准负载。"""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     text = (raw or "").strip()

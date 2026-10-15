@@ -3,8 +3,8 @@ import { CHANNELS, SviewApi, canvasDomId, playChannels, streamLabel } from "./ap
 import { sharedClientId, SviewPlayer } from "./player";
 
 const params = new URLSearchParams(location.search);
-// Prefer Vite proxy so Master→OSS 302 is followed in Node (no browser CORS).
-// Override: ?base=http://47.x.x.x:8080  (needs OSS Bucket CORS)
+// 优先走 Vite 代理，这样 Master→OSS 的 302 在 Node 里跟随（浏览器不用 CORS）。
+// 覆盖：?base=http://47.x.x.x:8080（需要 OSS Bucket CORS）
 const defaultBase = params.get("base") ?? `${location.origin}/sview`;
 const defaultSource =
   params.get("source") ??
@@ -125,7 +125,7 @@ function formatSec(ms: number): string {
   return `${(ms / 1000).toFixed(2)} s`;
 }
 
-/** Client-side timing for submit → playable / first frame / fully ready. */
+/** 客户端计时：提交 → 可播 / 首帧 / 全部就绪。 */
 let timingStart = 0;
 let timingPlayableMs: number | null = null;
 let timingFirstFrameMs: number | null = null;
@@ -180,7 +180,7 @@ function markReady() {
   renderTiming();
 }
 
-/** After progressive playable, keep watching until job is fully ready. */
+/** 边转边播可起播后，继续盯到任务全部就绪。 */
 function watchUntilFullyReady(api: SviewApi, jobId: string) {
   const token = ++readyWatchToken;
   void (async () => {
@@ -194,7 +194,7 @@ function watchUntilFullyReady(api: SviewApi, jobId: string) {
         markReady();
       }
     } catch {
-      /* ignore; timing line keeps "全解完 …" */
+      /* 忽略；计时行保留「全解完 …」 */
     }
   })();
 }
@@ -385,11 +385,11 @@ function startTouchLoop(api: SviewApi, jobId: string) {
   touchTimer = window.setInterval(() => {
     if (!touchJobId) return;
     void api.touchJob(touchJobId).catch(() => {
-      /* ignore */
+      /* 忽略 */
     });
   }, 60_000);
   void api.touchJob(jobId).catch(() => {
-    /* ignore */
+    /* 忽略 */
   });
 }
 
@@ -401,7 +401,7 @@ el.force.addEventListener("change", () => {
       el.source.value.trim(),
     );
   } catch {
-    /* ignore */
+    /* 忽略 */
   }
 });
 
@@ -414,7 +414,7 @@ el.sparse.addEventListener("change", () => {
       el.source.value.trim(),
     );
   } catch {
-    /* ignore */
+    /* 忽略 */
   }
 });
 el.startSec.disabled = el.sparse.checked;
@@ -491,7 +491,7 @@ el.submit.addEventListener("click", async () => {
       markPlayable();
       markReady();
       el.status.textContent = `已缓存 ${created.job_id}，加载中…`;
-      // Media via Master (302 → signed OSS when private bucket). Avoid browser 403 on play_base.
+      // 媒体经 Master（私有桶时 302 到签名 OSS）。避免浏览器对 play_base 直接 403。
       await loadJob(base, created.job_id);
       startTouchLoop(api, created.job_id);
       player.play();
@@ -502,9 +502,9 @@ el.submit.addEventListener("click", async () => {
     const ready = await api.waitUntilPlayable(created.job_id, {
       intervalMs: 800,
       timeoutMs: 15 * 60 * 1000,
-      // Start only after ~5s of published frames so playhead is not glued to the frontier.
-      // Sparse segments are independently decodable; one published frame range
-      // is enough to load, while progressive keeps its larger safety lead.
+      // 已发布帧大约够 5 秒再起播，避免播放头贴在前沿上。
+      // 稀疏段可以独立解码；有一段已发布的帧区间就够加载，
+      // 边转边播则保留更大的安全领先量。
       minFrames: publishMode === "sparse" ? 1 : 150,
       preferSse: true,
       allowPollFallback: true,
@@ -592,7 +592,7 @@ window.setInterval(() => {
 
 let seekTimer = 0;
 let seekRequestEpoch = 0;
-/** Frame the user asked for while it is still being encoded. Slider stays here. */
+/** 用户点的那一帧还在编码。滑块停在这里。 */
 let seekHold: number | null = null;
 let seekHoldTimer = 0;
 

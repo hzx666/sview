@@ -1,56 +1,56 @@
 #!/usr/bin/env python3
 """
-SView worker – CPU transcode HEVC->H264 (libx264) + NAL AU split, Redis queue, HTTP cache.
+用 CPU 跑的 SView worker：libx264 把 HEVC 转成 H.264，再按 NAL 切 AU，带 Redis 队列和 HTTP 缓存。
 
-Pairs with sview_http.py. Splits H.264 into per-frame AUs via Annex-B NAL scan
-(no ffprobe). Encode path is libx264 (no CUDA/NVENC).
+配合 sview_http.py。用 Annex-B NAL 扫描把 H.264 切成逐帧 AU
+（不用 ffprobe）。编码走 libx264（无 CUDA/NVENC）。
 
-Input formats (path family first, then codec sniff):
-  - ``head_cam`` / SSIEGO: protobuf ``/camera/*/video`` (H.264/HEVC AUs)
-  - ``teleoperation/{Orin,Agilex,Astribot,Franka,Unitree}``: ROS2 JPEG / H.264
-    or HDF5 (Astribot). Named streams in bundle_frame.v2 (original topic keys).
-    Never fall back to head-cam protobuf.
-  - Unknown path (CLI copy): auto-detect Orin then protobuf.
+输入格式（先看路径族，再嗅探编码）：
+  - ``head_cam`` / SSIEGO：protobuf ``/camera/*/video``（H.264/HEVC AU）
+  - ``teleoperation/{Orin,Agilex,Astribot,Franka,Unitree}``：ROS2 JPEG / H.264
+    或 HDF5（Astribot）。bundle_frame.v2 里用原始 topic 名作流名。
+    不会回退到头显 protobuf。
+  - 未知路径（CLI 拷贝）：先探测 Orin，再试 protobuf。
 
-Two modes:
---path <file>         Process a single mcap file.
-(no --path)           Poll Redis queue for source paths / bench JSON jobs.
+两种模式：
+--path <file>         处理单个 mcap。
+(no --path)           轮询 Redis 队列，取源路径或 bench JSON 任务。
 
-All config via environment variables (K8s Secret friendly).
+配置全部来自环境变量（方便挂 K8s Secret）。
 
-Resolution / quality (env or CLI):
-  TRANSCODE_SIZE / --scale           square resize; default 1080 (0 = keep source)
-  TRANSCODE_WIDTH / --width          output width; 0 = keep source
-  TRANSCODE_HEIGHT / --height        output height; 0 = keep source
-  TRANSCODE_CRF / --crf              libx264 CRF 0-51 (default 28; alias TRANSCODE_CQ)
-  TRANSCODE_BITRATE / --bitrate      ABR target; 0/empty = CRF+VBV (recommended)
-  TRANSCODE_MAXRATE / --maxrate      VBV ceiling (default 1.5M)
-  TRANSCODE_BUFSIZE / --bufsize      VBV buffer (default 3M)
-  TRANSCODE_PRESET / --preset        default ultrafast (speed); veryfast for nicer quality
-  TRANSCODE_FORCE_REENCODE=1         force re-encode (default on; disables H.264 passthrough)
-  X264_THREADS=2                     min threads per ffmpeg (floor when the pod is busy)
-  X264_THREAD_BUDGET=16              total x264 threads on the pod; live 4-cam ≈ budget/4 each
-  PROGRESSIVE_PUBLISH=1              write frames to LOCAL_OUTPUT_DIR as built
-  PARTIAL_MANIFEST_EVERY=30          refresh partial manifest every N frames
-  PLAYABLE_MIN_FRAMES=30             API/frontend playable threshold
-  MAX_INFLIGHT_JOBS=3                max concurrent process_mcap in Redis mode
-  OVERLAP_AFTER_PLAYABLE=1           start next job once every active job is playable
-  CPU_CONCURRENCY=12                 max concurrent ffmpeg encodes on this pod
-  ENCODE_JOB_MAX_CONCURRENT=4        hard per-job ffmpeg cap (12/4 → 3 jobs fill pod)
-  ENCODE_PLAYABLE_MAX_CONCURRENT=4   after playable, keep 4-cam parallel (1 = serializes, <realtime)
-  ENCODE_FOREGROUND_RESERVE=0        slots kept for not-yet-playable jobs (0=auto ~25%)
-  LIVE_ENCODE=1                      one persistent ffmpeg per camera; slot held until the job ends
+分辨率 / 质量（环境变量或 CLI）：
+  TRANSCODE_SIZE / --scale           正方形缩放；默认 1080（0 = 保持源分辨率）
+  TRANSCODE_WIDTH / --width          输出宽；0 = 保持源
+  TRANSCODE_HEIGHT / --height        输出高；0 = 保持源
+  TRANSCODE_CRF / --crf              libx264 CRF 0-51（默认 28；别名 TRANSCODE_CQ）
+  TRANSCODE_BITRATE / --bitrate      ABR 目标；0/空 = CRF+VBV（推荐）
+  TRANSCODE_MAXRATE / --maxrate      VBV 上限（默认 1.5M）
+  TRANSCODE_BUFSIZE / --bufsize      VBV 缓冲（默认 3M）
+  TRANSCODE_PRESET / --preset        默认 ultrafast（要速度）；veryfast 画质更好
+  TRANSCODE_FORCE_REENCODE=1         强制重编码（默认开；关掉 H.264 直通）
+  X264_THREADS=2                     每个 ffmpeg 最少线程（Pod 忙时的下限）
+  X264_THREAD_BUDGET=16              Pod 上 x264 线程总数；四路直播约 budget/4
+  PROGRESSIVE_PUBLISH=1              帧一生成就写入 LOCAL_OUTPUT_DIR
+  PARTIAL_MANIFEST_EVERY=30          每 N 帧刷新一次 partial 清单
+  PLAYABLE_MIN_FRAMES=30             API/前端判定可播的帧数门槛
+  MAX_INFLIGHT_JOBS=3                Redis 模式下同时跑的 process_mcap 上限
+  OVERLAP_AFTER_PLAYABLE=1           每个在跑任务都可播后再开下一个
+  CPU_CONCURRENCY=12                 本 Pod 同时跑的 ffmpeg 上限
+  ENCODE_JOB_MAX_CONCURRENT=4        单任务 ffmpeg 硬上限（12/4 → 3 个任务占满 Pod）
+  ENCODE_PLAYABLE_MAX_CONCURRENT=4   可播后仍保持四路并行（1 = 串行，低于实时）
+  ENCODE_FOREGROUND_RESERVE=0        留给还没可播任务的槽（0=自动约 25%）
+  LIVE_ENCODE=1                      每路相机一个常驻 ffmpeg；槽占到任务结束
   ORIN_DIRECT=1                      JPEG 仅 CRF、不加 ABR（默认 0，与头显同一套 TRANSCODE_*）
-  LOG_FILE=sview.log                 project log under cwd (shared by all modules)
-  LOG_PROGRESS_EVERY_PCT=5           job progress log step (percent); 0=every callback
-  SVIEW_ROLE=all|master|worker       master=HTTP only; worker=encode; all=both
-  OSS_CACHE=1                        mirror progressive publish to OSS play cache
-  OSS_CACHE_PREFIX=player-bin        OSS key prefix for play cache
+  LOG_FILE=sview.log                 工作目录下的项目日志（各模块共用）
+  LOG_PROGRESS_EVERY_PCT=5           任务进度日志步长（百分比）；0=每次回调都打
+  SVIEW_ROLE=all|master|worker       master=只 HTTP；worker=编码；all=两者都做
+  OSS_CACHE=1                        边转边播镜像到 OSS 播放缓存
+  OSS_CACHE_PREFIX=player-bin        播放缓存的 OSS key 前缀
   OSS_PUBLIC_BASE=https://bucket.oss-cn-shanghai.aliyuncs.com
-  SEGMENT_FRAMES=30                  OSS/HTTP segment size
-  CACHE_MAX_BYTES=536870912000       OSS play-cache cap (~500GiB)
-  CACHE_IDLE_TTL_SEC=14400           idle job eviction (4h)
-  CACHE_GC_INTERVAL_SEC=300          master GC loop interval
+  SEGMENT_FRAMES=30                  OSS/HTTP 分段大小
+  CACHE_MAX_BYTES=536870912000       OSS 播放缓存上限（约 500GiB）
+  CACHE_IDLE_TTL_SEC=14400           空闲任务淘汰（4 小时）
+  CACHE_GC_INTERVAL_SEC=300          master 的 GC 循环间隔
 """
 
 import os
@@ -86,18 +86,18 @@ from sview.jobs.bundle_frame import (
 log = setup_logging("sview_worker")
 
 # ---------------------------------------------------------------------------
-#  Configuration  (all from env vars)
+#  配置（全部来自环境变量）
 # ---------------------------------------------------------------------------
 
 # -- Redis --
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", "6379"))
-REDIS_USERNAME = os.environ.get("REDIS_USERNAME") or None  # Aliyun Redis ACL
+REDIS_USERNAME = os.environ.get("REDIS_USERNAME") or None  # 阿里云 Redis ACL
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD") or None
 REDIS_DB = int(os.environ.get("REDIS_DB", "0"))
 REDIS_QUEUE_KEY = os.environ.get("REDIS_QUEUE_KEY", "player:queue")
-# -- Local mounts (K8s YAML mounts OSS prefixes here; see path_map.py) --
-# Prefer HEAD_CAM_MOUNT / ORIN_MOUNT; LOCAL_MOUNT_PATH kept for backward compat.
+# -- 本地挂载（K8s YAML 把 OSS 前缀挂到这里；见 path_map.py） --
+# 优先 HEAD_CAM_MOUNT / ORIN_MOUNT；LOCAL_MOUNT_PATH 只为兼容旧配置。
 from sview.path_map import (
     HEAD_CAM_MOUNT,
     ORIN_MOUNT,
@@ -108,7 +108,7 @@ from sview.path_map import (
     teleop_robot,
 )
 
-LOCAL_MOUNT_PATH = HEAD_CAM_MOUNT  # legacy alias (= /head-data by default)
+LOCAL_MOUNT_PATH = HEAD_CAM_MOUNT  # 旧别名（默认 /head-data）
 REDIS_PATH_PREFIX = os.environ.get("REDIS_PATH_PREFIX", "/head-cam")
 
 # -- OSS --
@@ -121,21 +121,21 @@ OSS_ACCESS_KEY_ID = os.environ.get("OSS_ACCESS_KEY_ID", "")
 OSS_ACCESS_KEY_SECRET = os.environ.get("OSS_ACCESS_KEY_SECRET", "")
 OSS_OUTPUT_PREFIX = os.environ.get("OSS_OUTPUT_PREFIX", "processed_data").strip("/")
 OSS_OUTPUT_SUB = os.environ.get("OSS_OUTPUT_SUB", "ego_human_data/head_cam").strip("/")
-# When true, never upload finished archives to processed_data/; local-cache mode.
+# 为 true 时不把成品上传到 processed_data/，只走本地缓存。
 NO_UPLOAD = os.environ.get("NO_UPLOAD", "0").lower() in ("1", "true", "yes")
-# Role: all (default) | master (HTTP+enqueue only) | worker (Redis consumer + encode)
+# 角色：all（默认）| master（只 HTTP + 入队）| worker（消费 Redis + 编码）
 SVIEW_ROLE = (os.environ.get("SVIEW_ROLE", "all") or "all").strip().lower()
-# Mirror progressive local frames to OSS as a shared play cache (segments + manifest).
+# 把本地边转边播的帧镜像到 OSS，作为共享播放缓存（分段 + 清单）。
 OSS_CACHE = os.environ.get("OSS_CACHE", "0").lower() in ("1", "true", "yes", "on")
 OSS_CACHE_PREFIX = (os.environ.get("OSS_CACHE_PREFIX", "player-bin") or "player-bin").strip("/")
-# Default off: most buckets enable Block Public Access. Playback uses Master
-# local/signed redirect instead of anonymous play_base GET.
+# 默认关闭：多数桶开了 Block Public Access。播放走 Master
+# 的本地或签名跳转，不走匿名的 play_base GET。
 OSS_CACHE_PUBLIC = os.environ.get("OSS_CACHE_PUBLIC", "0").lower() in ("1", "true", "yes", "on")
-# Latch after first "public ACL not allowed" so we do not double-PUT every object.
+# 第一次出现 "public ACL not allowed" 后闩住，避免每个对象重复 PUT。
 _oss_public_acl_blocked = False
 
-# Browser-facing base, e.g. https://bucket.oss-cn-shanghai.aliyuncs.com
-# If empty, derived from OSS_BUCKET + OSS_PUBLIC_ENDPOINT.
+# 浏览器访问的根地址，例如 https://bucket.oss-cn-shanghai.aliyuncs.com
+# 为空时由 OSS_BUCKET + OSS_PUBLIC_ENDPOINT 拼出来。
 OSS_PUBLIC_BASE = (os.environ.get("OSS_PUBLIC_BASE") or "").rstrip("/")
 _oss_public_endpoint = os.environ.get("OSS_PUBLIC_ENDPOINT", "oss-cn-shanghai.aliyuncs.com")
 if _oss_public_endpoint.startswith("https://"):
@@ -143,37 +143,37 @@ if _oss_public_endpoint.startswith("https://"):
 elif _oss_public_endpoint.startswith("http://"):
     _oss_public_endpoint = _oss_public_endpoint[len("http://"):]
 OSS_PUBLIC_ENDPOINT = _oss_public_endpoint
-# Segment size for OSS cache objects (align with HTTP SEGMENT_FRAMES / gop).
+# 缓存分段大小（OSS 对象，与 HTTP 的 SEGMENT_FRAMES / gop 对齐）。
 try:
     SEGMENT_FRAMES = max(1, int(os.environ.get("SEGMENT_FRAMES", "30") or "30"))
 except (TypeError, ValueError):
     SEGMENT_FRAMES = 30
 
-# -- Local output (used when --no-upload) --
+# -- 本地输出（--no-upload 时使用） --
 LOCAL_OUTPUT_DIR = Path(os.environ.get("LOCAL_OUTPUT_DIR", str(Path(__file__).parent / "output")))
 LOCAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# -- HTTP cache server (serves LOCAL_OUTPUT_DIR) --
+# -- HTTP 缓存服务（对外提供 LOCAL_OUTPUT_DIR） --
 HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
-HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))  # 0 = disable
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))  # 0 = 关闭
 
-# -- FFmpeg & CPU encode --
+# -- ffmpeg 与 CPU 编码 --
 _default_ffmpeg = "ffmpeg"
 if sys.platform == "win32":
     _default_ffmpeg = r"C:\Users\10279\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1.2-full_build\bin\ffmpeg.exe"
 FFMPEG = os.environ.get("FFMPEG_PATH", _default_ffmpeg)
 
 CPU_CONCURRENCY = int(os.environ.get("CPU_CONCURRENCY", os.environ.get("GPU_CONCURRENCY", "12")))
-# Hard per-job ffmpeg cap (e.g. 12 slots / 4 per job → up to 3 jobs saturate the pod).
+# 单任务 ffmpeg 硬上限（例如 12 槽 / 每任务 4 → 最多 3 个任务占满 Pod）。
 try:
     ENCODE_JOB_MAX_CONCURRENT = max(
         1, int(os.environ.get("ENCODE_JOB_MAX_CONCURRENT", "4") or "4")
     )
 except ValueError:
     ENCODE_JOB_MAX_CONCURRENT = 4
-# After a job is playable it may yield slots to newer (not-yet-playable) jobs.
-# Must stay >= 4 for quad-cam realtime: 1 slot serializes 4 ffmpeg and drops
-# publish rate below ~30fps, so the playhead catches the encoder frontier.
+# 任务可播后，可以把槽让给更新的、还没可播的任务。
+# 四路实时必须保持 >= 4：只给 1 个槽会把 4 路 ffmpeg 串起来，发布速率掉到
+# ~30fps 以下，播放头就会追上编码前沿。
 try:
     ENCODE_PLAYABLE_MAX_CONCURRENT = max(
         1, int(os.environ.get("ENCODE_PLAYABLE_MAX_CONCURRENT", "4") or "4")
@@ -186,24 +186,24 @@ try:
     )
 except ValueError:
     ENCODE_FOREGROUND_RESERVE = 0
-# Publish interval after the first playable chunk. 30 = 1 GOP / 1s @ 30fps so
-# the player sees a steady frontier instead of a 5s burst then a stall.
+# 第一个可播块之后的发布间隔。30 就是 30fps 下 1 个 GOP / 1 秒，
+# 播放端看到的前沿是稳的，不会先冲 5 秒再卡住。
 CHUNK_FRAMES = int(os.environ.get("CHUNK_FRAMES", "30"))
-# Orin JPEG→H264 progressive chunk size (smaller → earlier first playable frame).
+# 边转边播块大小（Orin JPEG→H.264，越小首帧可播越早）。
 ORIN_CHUNK_FRAMES = max(1, int(os.environ.get("ORIN_CHUNK_FRAMES", "30")))
-# Hold per-camera encode slots for the whole job so a playable job cannot be
-# serialized down to 1 camera (which drops publish rate below ~30fps).
+# 整个任务都占着每路相机的编码槽，免得可播之后被
+# 收成 1 路串行（发布速率会掉到 ~30fps 以下）。
 LIVE_ENCODE = os.environ.get("LIVE_ENCODE", "1").lower() in ("1", "true", "yes", "on")
 
 
 class FairEncodeGate:
-    """Pod-wide ffmpeg slot gate: fair per-job caps + throttle after playable.
+    """全 Pod 的 ffmpeg 槽门闩：单任务有上限，可播后再限流。
 
-    1) every job is hard-capped at ENCODE_JOB_MAX_CONCURRENT (and fair share).
-    2) playable jobs are further limited to ENCODE_PLAYABLE_MAX_CONCURRENT
-       (default 4 so quad-cam stays parallel / realtime) and cannot eat the
-       foreground reserve.
-    Waiters are granted in FIFO order among those that currently pass _grant_ok.
+    1) 每个任务硬顶 ENCODE_JOB_MAX_CONCURRENT（再加均分）。
+    2) 已可播任务再限到 ENCODE_PLAYABLE_MAX_CONCURRENT
+       （默认 4，四路保持并行、跟得上实时），也不能占掉
+       前台预留。
+    当前能通过 _grant_ok 的等待者，按 FIFO 发放。
     """
 
     def __init__(
@@ -266,7 +266,7 @@ class FairEncodeGate:
             return 0
         if self.foreground_reserve > 0:
             return min(self.capacity, self.foreground_reserve)
-        # Auto: keep ~25% (at least 1) for not-yet-playable jobs.
+        # 自动：给还没可播的任务留约 25%（至少 1 个）。
         return max(1, self.capacity // 4)
 
     def _job_limit(self, job_id: str) -> int:
@@ -277,14 +277,14 @@ class FairEncodeGate:
         if st is None:
             return min(hard, fair)
         if st.get("playable"):
-            # Only throttle playable jobs when a not-yet-playable job needs slots.
-            # Keep playable_max (default 4) so quad-cam stays parallel — 1 slot
-            # serializes cameras and publish rate falls below realtime (~30fps).
+            # 只有还没可播的任务要槽时，才限流已经可播的任务。
+            # 保持 playable_max（默认 4），四路继续并行 — 只给 1 个槽
+            # 会把各路串行，发布速率低于实时（~30fps）。
             if self._fg_ids():
                 return min(self.playable_max, hard, fair)
             return min(hard, fair)
         fg = self._fg_ids()
-        # Foreground share among other foreground jobs (usually larger than bg).
+        # 前台任务之间的份额（通常比后台大）。
         fg_fair = max(1, self._math.ceil(self.capacity / max(1, len(fg))))
         return min(hard, self.capacity, max(fair, fg_fair))
 
@@ -292,7 +292,7 @@ class FairEncodeGate:
         if self._total_holding() >= self.capacity:
             return False
         if job_id not in self._jobs:
-            # Unregistered callers (scripts): only global capacity.
+            # 未登记的调用方（脚本）：只受全局容量限制。
             return True
         st = self._jobs[job_id]
         if st["holding"] >= self._job_limit(job_id):
@@ -310,7 +310,7 @@ class FairEncodeGate:
         return True
 
     def holding_count(self) -> int:
-        """Currently granted ffmpeg slots (for sizing x264 threads)."""
+        """当前已发放的 ffmpeg 槽数（用来算 x264 线程）。"""
         with self._cv:
             return self._total_holding()
 
@@ -324,7 +324,7 @@ class FairEncodeGate:
             self._waiters.append((jid, ready))
             try:
                 while True:
-                    # Grant to the earliest waiter that is currently allowed.
+                    # 发给当前允许运行、排队最早的等待者。
                     grant_idx = None
                     for i, (wj, _ev) in enumerate(self._waiters):
                         if self._grant_ok(wj):
@@ -382,19 +382,19 @@ encode_gate = FairEncodeGate(
     playable_max=ENCODE_PLAYABLE_MAX_CONCURRENT,
     foreground_reserve=ENCODE_FOREGROUND_RESERVE,
 )
-# Back-compat alias for benches that monkeypatch cpu_encode_lock.
+# 兼容旧压测：它们会 monkeypatch cpu_encode_lock。
 cpu_encode_lock = encode_gate
 
-# -- Transcode resolution & quality (all overridable via env / CLI) --
-# Resolution:
-#   TRANSCODE_SIZE > 0     → square output (e.g. 720 → 720x720)
-#   TRANSCODE_WIDTH/HEIGHT → rectangular output (either alone keeps other from source)
-#   all 0                  → keep source camera resolution
-# Quality (applied whenever ffmpeg re-encodes):
-#   TRANSCODE_CRF / TRANSCODE_CQ, TRANSCODE_BITRATE, TRANSCODE_MAXRATE,
-#   TRANSCODE_BUFSIZE, TRANSCODE_PRESET
-# TRANSCODE_FORCE_REENCODE=1 → even if H.264 + no resize, still re-encode so quality
-#   knobs take effect (default 0 = H.264 passthrough when size unchanged).
+# -- 转码分辨率与质量（环境变量 / CLI 都可覆盖） --
+# 分辨率：
+#   正方形输出：TRANSCODE_SIZE > 0（例如 720 → 720x720）
+#   矩形输出：TRANSCODE_WIDTH/HEIGHT（只设一边时，另一边跟源）
+#   全为 0                 → 保持相机源分辨率
+# 质量（ffmpeg 重编码时生效）：
+#   参数有 TRANSCODE_CRF / TRANSCODE_CQ、TRANSCODE_BITRATE、TRANSCODE_MAXRATE、
+#   还有 TRANSCODE_BUFSIZE、TRANSCODE_PRESET
+# 即使已是 H.264 且不缩放，TRANSCODE_FORCE_REENCODE=1 仍重编码，质量
+#   参数才会生效（默认 0 = 尺寸不变时 H.264 直通）。
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in ("1", "true", "yes", "on")
@@ -408,30 +408,30 @@ def _env_int(name: str, default: str = "0") -> int:
         return int(default)
 
 
-# Orin JPEG→H.264 uses the same TRANSCODE_* knobs as head-cam / Orin H.264.
-# ORIN_DIRECT=1: JPEG CRF-only (no ABR), still applies TRANSCODE_SIZE + TRANSCODE_CRF.
+# 与头显 / Orin H.264 一样，Orin 的 JPEG→H.264 也用这套 TRANSCODE_*。
+# 设 ORIN_DIRECT=1 时，JPEG 只走 CRF（不加 ABR），仍应用 TRANSCODE_SIZE + TRANSCODE_CRF。
 ORIN_DIRECT = _env_bool("ORIN_DIRECT", "0")
-ORIN_CRF = max(1, min(51, _env_int("ORIN_CRF", "23")))  # unused; kept for env compat
+ORIN_CRF = max(1, min(51, _env_int("ORIN_CRF", "23")))  # 未使用；留给环境变量兼容
 
-# HD compress defaults: 1080 square + CRF28 + force re-encode (no H.264 passthrough).
-# Set TRANSCODE_SIZE=0 to keep source resolution; TRANSCODE_BITRATE=0 → CRF+VBV (no ABR).
+# 高清压缩默认：1080 正方形 + CRF28 + 强制重编码（不走 H.264 直通）。
+# 设 TRANSCODE_SIZE=0 保持源分辨率；TRANSCODE_BITRATE=0 → CRF+VBV（不加 ABR）。
 TRANSCODE_SIZE = max(0, _env_int("TRANSCODE_SIZE", "1080"))
 TRANSCODE_WIDTH = max(0, _env_int("TRANSCODE_WIDTH", "0"))
 TRANSCODE_HEIGHT = max(0, _env_int("TRANSCODE_HEIGHT", "0"))
-# Prefer TRANSCODE_CRF; fall back to TRANSCODE_CQ for CLI/env parity with GPU version.
+# 优先 TRANSCODE_CRF；没有再用 TRANSCODE_CQ，与 GPU 版的 CLI / 环境变量对齐。
 TRANSCODE_CRF = max(0, min(51, _env_int("TRANSCODE_CRF", os.environ.get("TRANSCODE_CQ", "28"))))
-TRANSCODE_BITRATE = os.environ.get("TRANSCODE_BITRATE", "0")  # 0/empty = CRF mode
+TRANSCODE_BITRATE = os.environ.get("TRANSCODE_BITRATE", "0")  # 0/空 = CRF 模式
 TRANSCODE_MAXRATE = os.environ.get("TRANSCODE_MAXRATE", "1.5M")
 TRANSCODE_BUFSIZE = os.environ.get("TRANSCODE_BUFSIZE", "3M")
-TRANSCODE_PRESET = os.environ.get("TRANSCODE_PRESET", "ultrafast")  # libx264 preset
+TRANSCODE_PRESET = os.environ.get("TRANSCODE_PRESET", "ultrafast")  # 预设（libx264）
 TRANSCODE_FORCE_REENCODE = _env_bool("TRANSCODE_FORCE_REENCODE", "1")
-# Cap threads per ffmpeg so N concurrent encodes do not oversubscribe the pod.
+# 限制每个 ffmpeg 的线程，避免 N 路同时编码把 Pod 打满。
 try:
     X264_THREADS = max(1, int(os.environ.get("X264_THREADS", "2") or "2"))
 except ValueError:
     X264_THREADS = 2
-# Soft budget for *all* in-flight x264 threads. Live 4-cam (holding=4) gets
-# budget/4 each so a single 边转边播 job can use the whole pod instead of 2×4=8.
+# 所有在途 x264 线程的软预算。四路直播（holding=4）
+# 各分 budget/4，单个边转边播任务能吃满 Pod，不必停在 2×4=8。
 try:
     X264_THREAD_BUDGET = max(
         X264_THREADS,
@@ -442,19 +442,19 @@ except ValueError:
 if X264_THREAD_BUDGET <= 0:
     X264_THREAD_BUDGET = max(CPU_CONCURRENCY, X264_THREADS * 4)
 
-# -- Progressive publish (边转边播 path A) --
-# When NO_UPLOAD + PROGRESSIVE_PUBLISH: write frames/manifest into LOCAL_OUTPUT_DIR
-# as soon as each frame is built so HTTP can serve them before job is ready.
+# -- 边转边播（路径 A） --
+# 同时开 NO_UPLOAD 和 PROGRESSIVE_PUBLISH：帧和清单写入 LOCAL_OUTPUT_DIR，
+# 每帧生成后 HTTP 就能读，不必等任务完成。
 PROGRESSIVE_PUBLISH = _env_bool("PROGRESSIVE_PUBLISH", "1")
 PARTIAL_MANIFEST_EVERY = max(1, _env_int("PARTIAL_MANIFEST_EVERY", "30"))
-# Frontend may start once Redis/API reports at least this many frames available.
+# 可用帧数达到这个值（Redis/API 报出）后，前端就可以起播。
 PLAYABLE_MIN_FRAMES = max(1, _env_int("PLAYABLE_MIN_FRAMES", "30"))
 
-# -- Redis worker concurrency (overlap after first job is playable) --
+# -- Redis worker 并发（首个任务可播后重叠） --
 MAX_INFLIGHT_JOBS = max(1, _env_int("MAX_INFLIGHT_JOBS", "3"))
 OVERLAP_AFTER_PLAYABLE = _env_bool("OVERLAP_AFTER_PLAYABLE", "1")
-# Progress log: emit when percent crosses this step (5 → 0/5/10/…/100).
-# Set 0 to log on every progress_cb (can be noisy).
+# 进度日志：百分比跨过这个步长才打（5 → 0/5/10/…/100）。
+# 设 0 则每次 progress_cb 都打（会很吵）。
 LOG_PROGRESS_EVERY_PCT = max(0.0, float(os.environ.get("LOG_PROGRESS_EVERY_PCT", "5") or "5"))
 
 
@@ -465,7 +465,7 @@ def _progress_pct(done: int, total: int) -> float:
 
 
 class _JobProgressLogger:
-    """Throttle per-job progress lines so logs stay readable under concurrency."""
+    """按任务节流进度日志，并发时才读得下去。"""
 
     def __init__(self, label: str, step_pct: float | None = None):
         self.label = label
@@ -524,7 +524,7 @@ class _JobProgressLogger:
         )
 
 
-# Per-thread overrides for bench jobs (safe with concurrent process_mcap).
+# 压测任务的线程级覆盖（并发 process_mcap 时互不影响）。
 _tls = threading.local()
 
 
@@ -554,12 +554,12 @@ def _tc_force_reencode() -> bool:
 
 
 def _resize_requested() -> bool:
-    """True when env/CLI/thread override asks to change output resolution."""
+    """环境变量、CLI 或线程覆盖要求改输出分辨率时为真。"""
     return _tc_size() > 0 or _tc_width() > 0 or _tc_height() > 0
 
 
 def _apply_output_scale(camera_metas: dict) -> tuple[int | None, int | None]:
-    """Stamp TRANSCODE_SIZE/W/H onto camera_metas; return (w, h) or (None, None)."""
+    """把 TRANSCODE_SIZE/W/H 写进 camera_metas；返回 (w, h)，没有则 (None, None)。"""
     if not _resize_requested() or not camera_metas:
         return None, None
     sw = _scale_dim(camera_metas, "w")
@@ -589,7 +589,7 @@ def temporary_transcode_settings(
     crf: int | None = None,
     force_reencode: int | bool | None = None,
 ):
-    """Apply per-job transcode knobs for the current thread only."""
+    """只给当前线程套上本任务的转码参数。"""
     prev = getattr(_tls, "override", None)
     cur = dict(prev) if prev else {}
     try:
@@ -605,7 +605,7 @@ def temporary_transcode_settings(
         _tls.override = prev
 
 
-# -- Temp working directory --
+# -- 临时工作目录 --
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", tempfile.gettempdir())) / "sview_worker"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -618,7 +618,7 @@ _oss_bucket = None
 _oss_sign_bucket = None
 
 def get_oss_bucket():
-    """SDK client for Pod↔OSS (may use VPC internal endpoint)."""
+    """给 Pod 访问 OSS 用的 SDK 客户端（可以用 VPC 内网端点）。"""
     global _oss_bucket
     if _oss_bucket is not None:
         return _oss_bucket
@@ -631,7 +631,7 @@ def get_oss_bucket():
 
 
 def get_oss_sign_bucket():
-    """SDK client for browser-facing signed URLs (must use public endpoint)."""
+    """给浏览器签 URL 的 SDK 客户端（必须用公网端点）。"""
     global _oss_sign_bucket
     if _oss_sign_bucket is not None:
         return _oss_sign_bucket
@@ -655,7 +655,7 @@ def upload_to_oss(local_path: Path, oss_key: str):
 
 
 def oss_play_base(job_id: str) -> str:
-    """HTTPS prefix browsers use to fetch manifest/segments from OSS cache."""
+    """浏览器拉清单和分段用的 HTTPS 前缀，指向 OSS 缓存。"""
     base = OSS_PUBLIC_BASE
     if not base:
         pub = OSS_PUBLIC_ENDPOINT
@@ -716,10 +716,10 @@ def upload_bytes_to_oss(oss_key: str, data: bytes, *, content_type: str = "appli
 
 
 def sign_oss_url(oss_key: str, expires: int = 7200) -> str:
-    """Presigned HTTPS GET for browsers — always public endpoint, never *-internal*.
+    """给浏览器的预签名 HTTPS GET — 永远用公网端点，不用 *-internal*。
 
-    Important: must sign with the public host. Rewriting host after signing can
-    invalidate the signature depending on OSS auth version.
+    必须用公网主机签名。签完再改主机，按 OSS 的鉴权版本
+    可能把签名签废。
     """
     bucket = get_oss_sign_bucket()
     url = bucket.sign_url("GET", oss_key, expires, slash_safe=True)
@@ -754,7 +754,7 @@ def _pack_segment_bytes(start_index: int, frame_blobs: list[bytes], segment_fram
 
 
 def _oss_cache_upload_segment(job_id: str, start: int, end: int, frame_dir: Path) -> bool:
-    """Upload frames [start, end) as one segment. True only after OSS PUT succeeds."""
+    """把帧 [start, end) 作为一个分段上传。只有 OSS PUT 成功才返回 True。"""
     if end <= start:
         return False
     blobs: list[bytes] = []
@@ -785,10 +785,10 @@ def _oss_cache_maybe_flush(
     frame_dir: Path,
     manifest: dict | None,
 ) -> None:
-    """Mirror a completed local segment to OSS, then advertise it in manifest.
+    """本地分段完成后镜像到 OSS，再写进清单。
 
-    Manifest is uploaded only after the segment PUT succeeds, so
-    frames_available never claims frames that are not on OSS.
+    分段 PUT 成功之后才上传清单，这样
+    frames_available 不会报 OSS 上还没有的帧。
     """
     if not OSS_CACHE:
         return
@@ -843,11 +843,11 @@ def _oss_cache_publish_done(
     frame_dir: Path,
     manifest: dict | None,
 ) -> None:
-    """After local status=done, push the last (possibly short) segment + manifest.
+    """本地 status=done 之后，推最后一段（可能不满）和清单。
 
-    In-loop flush only runs on SEGMENT_FRAMES boundaries or when
-    frames_done == min_frames. If min_frames was the MCAP summary count and
-    actual published frames are fewer, the tail never left the worker.
+    循环里只在 SEGMENT_FRAMES 边界，或
+    frames_done == min_frames 时才刷。若 min_frames 用的是 mcap 摘要帧数，
+    实际发布更少，尾巴就一直留在 worker 上。
     """
     if not OSS_CACHE or frames_done <= 0 or manifest is None:
         return
@@ -882,11 +882,11 @@ def get_redis():
 
 
 # ---------------------------------------------------------------------------
-#  Path mapping  (OSS URI / legacy queue path -> local mount; see path_map.py)
+#  路径映射（OSS URI / 旧队列路径 -> 本地挂载；见 path_map.py）
 # ---------------------------------------------------------------------------
 
 def local_path_to_oss_base(local_path: Path) -> str:
-    """Derive output key prefix from local source path (for optional OSS upload)."""
+    """从本地源路径推出输出 key 前缀（给可选的 OSS 上传用）。"""
     lp = str(local_path).replace("\\", "/")
     rel = None
     for mount in (HEAD_CAM_MOUNT, ORIN_MOUNT, LOCAL_MOUNT_PATH):
@@ -898,12 +898,12 @@ def local_path_to_oss_base(local_path: Path) -> str:
         rel = local_path.stem
     if rel.endswith(".mcap"):
         rel = rel[:-5]
-    # .../{job_id}/sview  — frames + manifest live under this prefix
+    # .../{job_id}/sview  — 帧和清单都在这个前缀下
     return f"{OSS_OUTPUT_PREFIX}/{OSS_OUTPUT_SUB}/{rel}/sview"
 
 
 # ---------------------------------------------------------------------------
-#  CPU transcoding (libx264)
+#  转码（CPU / libx264）
 # ---------------------------------------------------------------------------
 
 def _rate_control_empty(value: str | None) -> bool:
@@ -912,11 +912,11 @@ def _rate_control_empty(value: str | None) -> bool:
 
 
 def _x264_threads_now() -> int:
-    """Fair-share x264 threads across granted ffmpeg slots.
+    """按已发放的 ffmpeg 槽均分 x264 线程。
 
-    Floor is X264_THREADS. A lone 4-cam live job (holding≈4) gets about
-    X264_THREAD_BUDGET/4, so 边转边播 can use idle cores the gate reserved
-    for overlap jobs that are not running yet.
+    下限是 X264_THREADS。单独一个四路直播任务（holding≈4）大约分到
+    X264_THREAD_BUDGET/4，边转边播就能用上门闩留给
+    还没跑起来的重叠任务的空闲核。
     """
     floor = max(1, int(X264_THREADS))
     try:
@@ -929,11 +929,11 @@ def _x264_threads_now() -> int:
 
 
 def _ffmpeg_fast_input_flags() -> list[str]:
-    """Skip demux probing; format is already forced with -f hevc/h264/mjpeg.
+    """跳过解复用探测；格式已经用 -f hevc/h264/mjpeg 指定。
 
-    Do not put ``-flags low_delay`` here: before ``-i`` it applies to the
-    *decoder*. HEVC/H.264 with B-frames would then emit decode order, and
-    the re-encoded AUs would play out of presentation order.
+    这里不要加 ``-flags low_delay``：写在 ``-i`` 前面会作用到
+    *解码器*。带 B 帧的 HEVC/H.264 会按解码序吐出，
+    重编码后的 AU 播放顺序就乱了。
     """
     return [
         "-fflags", "nobuffer",
@@ -943,11 +943,11 @@ def _ffmpeg_fast_input_flags() -> list[str]:
 
 
 def _ffmpeg_annexb_input_flags() -> list[str]:
-    """Probe enough of a raw Annex-B pipe to see SPS/PPS.
+    """原始 Annex-B 管道多探一点，才能看到 SPS/PPS。
 
-    ``_ffmpeg_fast_input_flags`` uses probesize=32. An H.264 SPS NAL is often
-    already >32 bytes, so ffmpeg starts the decoder before PPS and fails with
-    ``non-existing PPS 0 referenced``. The whole chunk is already in stdin.
+    ``_ffmpeg_fast_input_flags`` 用 probesize=32。H.264 的 SPS NAL 经常
+    已经超过 32 字节，ffmpeg 会在 PPS 之前启动解码，报
+    ``non-existing PPS 0 referenced``。整块数据其实已经在 stdin 里。
     """
     return [
         "-fflags", "+genpts+discardcorrupt",
@@ -957,13 +957,13 @@ def _ffmpeg_annexb_input_flags() -> list[str]:
 
 
 def _x264_encode_flags(*, threads: int | None = None, sliced_threads: bool = False) -> list[str]:
-    """libx264 flags for live progressive encode (no B-frames).
+    """直播边转边播用的 libx264 参数（无 B 帧）。
 
-    The one-shot annex-B path keeps sliced_threads off so each picture is one
-    VCL NAL and `_split_h264_access_units` can cut frames. The persistent
-    pipe turns sliced threads on: frame threads would hold the tail pictures
-    until ffmpeg exits, and the FLV tag already groups every slice of a
-    picture into one frame.
+    一次性 Annex-B 路径关掉 sliced_threads，这样每幅图像只有一个
+    VCL NAL，`_split_h264_access_units` 才能切帧。常驻
+    管道打开切片线程：帧线程会把末尾图像攥到
+    ffmpeg 退出，而 FLV tag 已经把一幅图像的
+    各个切片收成一帧。
     """
     n = int(threads) if threads is not None else _x264_threads_now()
     n = max(1, n)
@@ -972,8 +972,8 @@ def _x264_encode_flags(*, threads: int | None = None, sliced_threads: bool = Fal
         f"threads={n}:sliced_threads={sliced}:rc-lookahead=0:sync-lookahead=0:"
         "aq-mode=0:mbtree=0:weightp=0:8x8dct=0"
     )
-    # preset/tune reset x264 defaults. Params must come after them so
-    # lookahead stays 0 and the live pipe flushes every picture.
+    # 参数必须写在 preset/tune 后面，它们会把 x264 默认值重置掉，
+    # 这样 lookahead 才能保持 0，直播管道才会每幅图像都刷出来。
     return [
         "-c:v", "libx264",
         "-threads", str(n),
@@ -988,10 +988,10 @@ def _x264_encode_flags(*, threads: int | None = None, sliced_threads: bool = Fal
 
 
 def _ffmpeg_x264_rate_args(*, crf: int | None = None) -> list[str]:
-    """Build libx264 rate-control args.
+    """拼 libx264 的码控参数。
 
-    Default HD path: CRF + optional VBV (-maxrate/-bufsize). Avoid -b:v unless an
-    explicit ABR bitrate is configured — ABR largely overrides CRF and balloons size.
+    默认高清路径：CRF，可选 VBV（-maxrate/-bufsize）。除非显式配了
+    ABR 码率，否则不要加 -b:v — ABR 会盖过 CRF，体积也会胀。
     """
     use_crf = _tc_crf() if crf is None else max(0, min(51, int(crf)))
     args = ["-crf", str(use_crf)]
@@ -1014,21 +1014,21 @@ def cpu_transcode_chunk(raw_data: bytes, output_path: Path,
                         codec: str = "hevc", job_id: str | None = None,
                         acquire_gate: bool = True,
                         output_skip: int = 0) -> float:
-    """Transcode raw video -> H.264 using libx264 (CPU), resize to (scale_w, scale_h).
+    """用 libx264（CPU）把原始视频转成 H.264，缩放到 (scale_w, scale_h)。
 
-    codec: source codec ('hevc'/'h265' or 'h264'/'avc'); selects ffmpeg -f input.
-    Quality knobs: TRANSCODE_CRF / BITRATE / MAXRATE / BUFSIZE / PRESET.
-    Output: baseline, GOP 30, dump_extra on keyframes (AU split needs sliced_threads=0).
+    codec：源编码（'hevc'/'h265' 或 'h264'/'avc'），决定 ffmpeg 的 -f。
+    质量参数：TRANSCODE_CRF / BITRATE / MAXRATE / BUFSIZE / PRESET。
+    输出：baseline，GOP 30，关键帧 dump_extra（切 AU 需要 sliced_threads=0）。
     """
     if not scale_w:
         scale_w = _tc_size() if _tc_size() > 0 else (_tc_width() or 2096)
     if not scale_h:
         scale_h = _tc_size() if _tc_size() > 0 else (_tc_height() or 2096)
     t0 = time.time()
-    # fast_bilinear: much cheaper than default bicubic for live progressive encode.
+    # 缩放用 fast_bilinear：边转边播比默认 bicubic 便宜很多。
     scale_filter = f"scale={scale_w}:{scale_h}:flags=fast_bilinear"
     skip = max(0, int(output_skip or 0))
-    # select runs after decode and before x264, so GOP warmup is not encoded.
+    # 滤镜 select 在解码之后、x264 之前，GOP 预热帧不会被编码。
     video_filter = (
         f"select='gte(n\\,{skip})',setpts=N/30/TB,{scale_filter}"
         if skip
@@ -1042,7 +1042,7 @@ def cpu_transcode_chunk(raw_data: bytes, output_path: Path,
         cmd = [
             FFMPEG, "-y", "-hide_banner", "-loglevel", "error",
             *_ffmpeg_annexb_input_flags(),
-            # Decoder threads (HEVC decode is often the live-path bottleneck).
+            # 解码线程（HEVC 解码常常是直播路径的瓶颈）。
             "-threads", str(n_threads),
             "-f", in_format, "-r", "30", "-i", "pipe:0",
             "-vf", video_filter,
@@ -1137,7 +1137,7 @@ def _transcode_chunk_worker(ch_name, chunk_idx, frames_slice, work_dir,
     if not raw_data:
         log.warning("[%s chunk %d] Empty %s data, skipping transcode", ch_name, chunk_idx, codec)
         return ch_name, chunk_idx, str(chunk_path), 0.0
-    # Fast path: H.264 + no resize + not forcing quality re-encode → copy bytes
+    # 快路径：H.264 且不缩放、也不强制按质量重编码 → 直接拷贝字节
     if (
         codec.lower() in ("h264", "avc")
         and not _resize_requested()
@@ -1172,7 +1172,7 @@ def _concat_h264_chunks(chunk_paths: list, output_path: Path):
 
 
 def _encode_rate_suffix(n_frames: int, elapsed: float, fps: float = 30.0) -> str:
-    """Log helper: ` (41.7 fps, 1.39x realtime)`."""
+    """日志辅助：` (41.7 fps, 1.39x realtime)`。"""
     if elapsed <= 0 or n_frames <= 0:
         return ""
     out_fps = n_frames / elapsed
@@ -1181,7 +1181,7 @@ def _encode_rate_suffix(n_frames: int, elapsed: float, fps: float = 30.0) -> str
 
 
 def _iter_annexb_nals(data: bytes):
-    """Yield Annex-B NAL units including their start codes."""
+    """逐个产出 Annex-B NAL（含起始码）。"""
     if not data:
         return
     starts = []
@@ -1218,7 +1218,7 @@ def _annexb_nal_header_byte(nal: bytes) -> int | None:
 
 
 def _collect_annexb_param_sets(data: bytes, *, hevc: bool) -> dict:
-    """Map NAL type → latest parameter-set NAL (with start code)."""
+    """按 NAL 类型记下最新的参数集（含起始码）。"""
     want = (32, 33, 34) if hevc else (7, 8)
     found = {}
     for nal in _iter_annexb_nals(data):
@@ -1238,12 +1238,12 @@ def _param_sets_bytes(ps: dict, *, hevc: bool) -> bytes:
 
 def _has_required_param_sets(ps: dict, *, hevc: bool) -> bool:
     if hevc:
-        return 33 in ps and 34 in ps  # SPS + PPS (VPS optional but usual)
+        return 33 in ps and 34 in ps  # 参数集是 SPS + PPS（VPS 可选，但通常有）
     return 7 in ps and 8 in ps
 
 
 def _annexb_has_leading_ps(data: bytes, *, hevc: bool) -> bool:
-    """True if SPS+PPS appear before the first VCL NAL."""
+    """第一个 VCL NAL 之前已经有 SPS+PPS 则为真。"""
     skip = {35, 39, 6} if hevc else {6, 9}
     vcl = {0, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 21} if hevc else {1, 5}
     seen: list[int] = []
@@ -1264,20 +1264,20 @@ def _annexb_has_leading_ps(data: bytes, *, hevc: bool) -> bool:
     return 7 in seen and 8 in seen
 
 
-# Annex-B demuxer emits a picture when the next start code arrives. A trailing
-# AUD closes the last VCL without adding a picture, so a chunk can be read back
-# before the following chunk (or EOF) shows up.
+# 解复用 Annex-B 时，要等下一个起始码才吐出图像。末尾
+# 放一个 AUD 就能收掉最后一个 VCL，而且不多一幅图像，当前块
+# 不用等下一块（或 EOF）就能读回来。
 _H264_AUD_CLOSER = b"\x00\x00\x00\x01\x09\xf0"
 _HEVC_AUD_CLOSER = b"\x00\x00\x00\x01\x46\x01\x50"
 
 
 def _live_worker_threads(cameras: int) -> int:
-    """Threads for one persistent camera ffmpeg.
+    """一路常驻相机 ffmpeg 用的线程数。
 
-    Same split as the old per-chunk encoder: ``X264_THREAD_BUDGET`` across the
-    cameras started together (and any slots already held), at least
-    ``X264_THREADS``, at most 8. Decode and encode both use this count as
-    slice threads, so a picture is emitted without closing the process.
+    算法和原来的按块编码器一样：``X264_THREAD_BUDGET`` 分给
+    一起拉起的各路相机（加上已经占着的槽），至少
+    ``X264_THREADS``，最多 8。解码和编码都用这个数做
+    切片线程，这样不退出进程也能吐出图像。
     """
     floor = max(1, int(X264_THREADS))
     cameras = max(1, int(cameras))
@@ -1291,10 +1291,10 @@ def _live_worker_threads(cameras: int) -> int:
 
 
 class _FlvH264Reader:
-    """Pull complete H.264 pictures out of an FLV byte stream.
+    """从 FLV 字节流里抽出完整的 H.264 图像。
 
-    Each video tag carries its payload length, so the last picture of a chunk
-    is finished without waiting for the next frame.
+    每个视频 tag 自带载荷长度，所以一块的最后一幅
+    不用等下一帧也能收完。
     """
 
     def __init__(self) -> None:
@@ -1411,14 +1411,14 @@ class _FlvH264Reader:
 
 
 class LiveX264Encoder:
-    """One ffmpeg process for the whole job, fed a chunk at a time.
+    """整个任务共用一个 ffmpeg，一块一块地喂。
 
-    A free encode-gate slot is taken until close(); if the job cap is already
-    full the process still starts, so the other cameras are not stuck waiting.
-    Decode and x264 both use the old per-chunk thread share as slice threads.
-    Frame threads would keep the last pictures inside the process until it
-    exits. Annex-B input is closed with an AUD so this chunk's pictures are
-    readable before the next chunk arrives.
+    有空闲编码槽就占到 close()；任务上限已经
+    满了也照样启动，免得别的相机干等。
+    解码和 x264 都把原来的按块线程份额用作切片线程。
+    帧线程会把最后几幅图像留在进程里，直到进程
+    退出。Annex-B 输入用 AUD 收尾，这样本块的图像
+    在下一块到来之前就能读到。
     """
 
     def __init__(
@@ -1459,7 +1459,7 @@ class LiveX264Encoder:
         self._jpeg_hold = False
 
     def seed_param_sets(self, ps: dict | bytes | None) -> None:
-        """Prime SPS/PPS (and HEVC VPS) from a later keyframe / full-bag scan."""
+        """从后面的关键帧或整包扫描里补上 SPS/PPS（HEVC 还有 VPS）。"""
         if not ps:
             return
         if isinstance(ps, (bytes, bytearray)):
@@ -1538,8 +1538,8 @@ class LiveX264Encoder:
         if self._sniffed:
             return
         self._sniffed = True
-        # Explicit H.264 must not be reclassified: NAL header 0x41 is a
-        # non-IDR slice, but (0x41 >> 1) & 0x3F == 32 looks like HEVC VPS.
+        # 已经标明是 H.264 就不能再改判：NAL 头 0x41 是
+        # 非 IDR 切片，但 (0x41 >> 1) & 0x3F == 32 看着像 HEVC VPS。
         if not self._hevc and self._codec in ("h264", "avc"):
             return
         for nal in _iter_annexb_nals(raw):
@@ -1591,8 +1591,8 @@ class LiveX264Encoder:
         if skip <= 0:
             return scale
         fps = max(1, int(round(self._fps or 30)))
-        # select runs after decode and before x264, so warmup is not encoded
-        # and the first kept picture is an IDR.
+        # 滤镜 select 在解码之后、x264 之前，预热帧不会被编码，
+        # 留下的第一幅图像是 IDR。
         return f"select='gte(n\\,{skip})',setpts=N/{fps}/TB,{scale}"
 
     def _worker_threads(self) -> int:
@@ -1603,8 +1603,8 @@ class LiveX264Encoder:
     def _command(self, probesize: int, output_skip: int) -> list[str]:
         n_threads = self._worker_threads()
         fps_i = max(1, int(round(self._fps or 30)))
-        # JPEG chunks are closed with an extra picture that is discarded.
-        # All-intra keeps that picture from becoming a P-frame reference.
+        # 每个 JPEG 块用一幅额外图像收尾，这幅会被丢掉。
+        # 全 I 帧避免这幅图像变成 P 帧的参考。
         gop = 1 if self._kind == "jpeg" else self._gop
         cmd = [
             FFMPEG, "-hide_banner", "-loglevel", "error", "-nostats",
@@ -1612,9 +1612,9 @@ class LiveX264Encoder:
             "-analyzeduration", "0",
         ]
         if self._kind == "jpeg":
-            # image2pipe emits an image when the next SOI arrives. The caller
-            # repeats the last JPEG so this chunk is released and that copy
-            # stays buffered. No input -framerate: it holds more than one image.
+            # 解复用 image2pipe 要等下一个 SOI 才吐出图像。调用方
+            # 会重复最后一张 JPEG，当前块才能放行，这份拷贝
+            # 留在缓冲里。输入侧不加 -framerate：加了会囤住多张图。
             cmd += [
                 "-f", "image2pipe",
                 "-vcodec", "mjpeg",
@@ -1648,11 +1648,11 @@ class LiveX264Encoder:
         return cmd
 
     def _hold_slot(self) -> None:
-        """Account for this ffmpeg when a slot is free.
+        """有空闲槽时把这个 ffmpeg 记进去。
 
-        Quad-cam keeps one process per camera for the whole segment. Those
-        four must start together. Waiting out the job cap (often 2 while two
-        siblings already hold slots) times out the segment after 120s.
+        四路在整个分段里每路一个进程，这
+        四个必须一起启动。若死等任务上限（常常是 2，另外两路
+        已经占着槽），120 秒后这段会超时。
         """
         if self._acquired:
             return
@@ -1673,12 +1673,12 @@ class LiveX264Encoder:
 
     def _start_proc(self, payload_len: int, output_skip: int) -> None:
         self._hold_slot()
-        # Raw H.264/HEVC probe reads until probesize or EOF. A persistent
-        # stdin never EOFs, and a read larger than the bytes already written
-        # blocks. Keep probesize strictly under the first write.
+        # 原始 H.264/HEVC 探测会读到 probesize 或 EOF。常驻 stdin
+        # 不会 EOF，读取一旦超过已经写入的字节就会
+        # 堵住。probesize 必须严格小于第一次写入。
         if self._kind == "jpeg":
-            # image2pipe only needs the SOI marker; a large probesize makes
-            # the demuxer block for more bytes than this chunk contains.
+            # 解复用 image2pipe 只要 SOI 标记；probesize 太大时
+            # 会去等超出本块已有的字节。
             probe = 32
         else:
             probe = min(8192, max(32, (int(payload_len) * 3) // 4))
@@ -1820,14 +1820,14 @@ class LiveX264Encoder:
             payload = raw + closer
             release_flush = 0
         else:
-            # Repeat the last JPEG. A tiny synthetic JPEG is not enough for
-            # image2pipe to release the previous picture; a real SOI is.
+            # 重复最后一张 JPEG。合成的小 JPEG 不够，
+            # 得是真实 SOI，image2pipe 才放行上一幅。
             payload = raw + frames[-1]
-            # That repeated picture is emitted at the start of the next chunk.
+            # 这幅重复图像会在下一块开头吐出。
             release_flush = 1 if self._jpeg_hold else 0
             self._jpeg_hold = True
-        # First call bakes warmup into the filter graph (decode, don't encode).
-        # Later calls already have decoder state; drop encoded pictures instead.
+        # 第一次调用把预热写进滤镜图（只解码，不编码）。
+        # 之后解码器已有状态，改为丢掉已编码图像。
         baked_skip = skip if first else 0
         drop_after = 0 if first else skip
         to_read = n - baked_skip
@@ -1953,7 +1953,7 @@ def _start_live_jpeg_encoders(
 
 
 def _is_h264_passthrough(camera_metas: dict, channels) -> bool:
-    """True when we can emit camera Annex-B AUs without ffmpeg re-encode."""
+    """可以不经 ffmpeg 重编码、直接吐出相机 Annex-B AU 时为真。"""
     if _resize_requested() or _tc_force_reencode():
         return False
     chs = list(channels)
@@ -1967,14 +1967,14 @@ def _is_h264_passthrough(camera_metas: dict, channels) -> bool:
 
 
 def _headcam_chunk_len(chunk_idx: int) -> int:
-    """First chunk is small so large files become playable sooner."""
+    """第一块切小一点，大文件能更早可播。"""
     if chunk_idx <= 0:
         return PLAYABLE_MIN_FRAMES
     return max(1, CHUNK_FRAMES)
 
 
 def _annexb_vcl_offsets(data: bytes) -> list[int]:
-    """Byte offsets of H.264 primary pictures (NAL types 1 and 5)."""
+    """主图像的字节偏移（H.264 NAL 类型 1 和 5）。"""
     offsets: list[int] = []
     pos = 0
     dlen = len(data)
@@ -1998,7 +1998,7 @@ def _annexb_vcl_offsets(data: bytes) -> list[int]:
 
 
 def _drop_leading_annexb_pictures(data: bytes, count: int) -> bytes:
-    """Keep encoded output starting at the count-th primary picture."""
+    """编码输出从第 count 幅主图像开始保留。"""
     skip = max(0, int(count or 0))
     if skip <= 0 or not data:
         return data
@@ -2017,7 +2017,7 @@ def _encode_stem(ch: str) -> str:
 
 
 def _tls_call(override, fn, *args, **kwargs):
-    """Run fn on a worker thread with the caller's transcode overrides."""
+    """在工作线程里跑 fn，并带上调用方的转码覆盖参数。"""
     prev = getattr(_tls, "override", None)
     _tls.override = override
     try:
@@ -2027,12 +2027,12 @@ def _tls_call(override, fn, *args, **kwargs):
 
 
 # ---------------------------------------------------------------------------
-#  Processing
+#  处理
 # ---------------------------------------------------------------------------
 
 
 def _known_frame_total(value) -> int | None:
-    """Positive full-job frame_count, or None when still unknown."""
+    """整个任务的正 frame_count；还不知道则为 None。"""
     try:
         n = int(value)
     except (TypeError, ValueError):
@@ -2046,11 +2046,11 @@ def _progressive_frame_count(
     *,
     final: bool,
 ) -> int | None:
-    """Stable full-job total for progressive publish; None until known.
+    """边转边播用的稳定总帧数；还不知道则为 None。
 
-    MCAP summary (min of video topic counts) is the seek max while encoding.
-    Without a summary, do not advertise the growing published prefix as the
-    total. The done manifest always uses the actual aligned count.
+    编码期间，seek 上限用 mcap 摘要（各视频 topic 帧数的最小值）。
+    没有摘要时，不要把正在增长的已发布前缀当成
+    总数。完成时的清单始终用对齐后的实际帧数。
     """
     have = int(aligned_n or 0)
     if final:
@@ -2079,7 +2079,7 @@ def _write_bundle_range(
     progress_cb=None,
     progress_base: int | None = None,
 ) -> int:
-    """Write frame bins for [f_start, f_end). Returns updated IMU scan index."""
+    """写 [f_start, f_end) 的帧 bin。返回更新后的 IMU 扫描下标。"""
     for fidx in range(f_start, f_end):
         streams_data = {}
         for ch in sorted(channel_aus.keys()):
@@ -2175,7 +2175,7 @@ def _write_bundle_range(
         if progressive and OSS_CACHE and (
             frames_done % SEGMENT_FRAMES == 0 or job_complete
         ):
-            # Prefer freshly built manifest; otherwise rebuild a light one for OSS.
+            # 优先用刚生成的清单；否则为 OSS 重做一份轻量清单。
             man = published_manifest
             if man is None and (
                 frames_done % PARTIAL_MANIFEST_EVERY == 0 or job_complete
@@ -2203,9 +2203,9 @@ def _write_bundle_range(
                 job_id, frames_done, known_total or 0, output_frame_dir, man,
             )
 
-        # Must fire exactly at PLAYABLE_MIN_FRAMES so the Redis scheduler can
-        # overlap the next job. Throttling every 10 frames alone can skip it
-        # (e.g. first chunk ends at frame 30 when min_frames is the full length).
+        # 必须正好在 PLAYABLE_MIN_FRAMES 触发，Redis 调度才能
+        # 叠上下一个任务。光按每 10 帧节流可能把它跳过
+        # （比如首块停在第 30 帧，而 min_frames 是全长）。
         if progress_cb and (
             fidx == f_start
             or fidx % 10 == 0
@@ -2258,11 +2258,11 @@ def _publish_headcam_chunk(
     decode_only_prefix: int = 0,
     progress_origin: int = 0,
 ) -> int:
-    """Encode/passthrough one aligned chunk and write frame bins immediately.
+    """编码或直通一块对齐后的数据，并马上写帧 bin。
 
-    decode_only_prefix frames are fed to the same ffmpeg decode so the target
-    frame is reconstructed, then their encoded pictures are discarded. x264
-    output therefore starts at the target segment.
+    decode_only_prefix 那些帧送进同一个 ffmpeg 解码，把目标
+    帧重建出来，再丢掉它们的编码图像。x264
+    的输出因此从目标分段开始。
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -2353,7 +2353,7 @@ def _publish_headcam_chunk(
                 except OSError:
                     pass
 
-    # Drop raw packet bytes for this range (keep list length for indexing).
+    # 丢掉这段的原始包字节（列表长度保留，方便按下标取）。
     for ch in channels:
         frames = video_frames[ch]
         for i in range(start, min(end, len(frames))):
@@ -2393,7 +2393,7 @@ def _publish_headcam_chunk(
 
 
 def _raise_teleop_no_video(local_path: Path, *, robot: str | None = None) -> None:
-    """Teleop bags must not be read as head-cam protobuf."""
+    """遥操作包不能按头显 protobuf 来读。"""
     from sview.ingest.orin_images import mcap_channel_overview
 
     overview = mcap_channel_overview(local_path)
@@ -2417,15 +2417,15 @@ def process_mcap(
     sparse_encode_offset: int = 0,
     sparse_encode_count: int = 0,
 ):
-    """CPU transcode HEVC->H264, upload to OSS (or save locally if no_upload).
+    """用 CPU 把 HEVC 转成 H.264，上传 OSS（no_upload 时存本地）。
 
-    progress_cb: optional callable(frames_done: int, frames_total: int) invoked
-    while writing per-frame bins (throttled). Used for Redis progress polling.
-    job_id: optional output/cache id (default: source file stem). Bench types use
-    distinct ids (e.g. stem__t3) so scenarios do not overwrite each other.
-    origin_sec: skip this many seconds from bag start (encode-from-T).
-    sparse_encode_offset: frames decoded only, before x264 starts.
-    sparse_encode_count: frames encoded after the decode-only lead.
+    progress_cb：可选，签名 callable(frames_done: int, frames_total: int)，
+    写逐帧 bin 时调用（有节流）。给 Redis 进度轮询用。
+    job_id：可选的输出/缓存 id（默认源文件名主干）。压测类型用
+    不同 id（如 stem__t3），场景之间不会互相覆盖。
+    origin_sec：从包起点跳过的秒数（从 T 开始编码）。
+    sparse_encode_offset：x264 开始前只解码的帧数。
+    sparse_encode_count：这段前导之后要编码的帧数。
     """
     from sview.jobs.origin import (
         cut_log_time_ns,
@@ -2451,9 +2451,9 @@ def process_mcap(
     sparse_floor = min(sparse_anchors.values()) if sparse_anchors else None
     if sparse_floor is not None:
         cut_ns = sparse_floor
-    # A sparse window is a few dozen frames. Without an end time the reader
-    # keeps going through the rest of the bag when that window never fills,
-    # and output_frames stays 0 for the whole scan.
+    # 稀疏窗口只有几十帧。不给结束时间的话，窗口填不满时
+    # 读取会把包里剩下的都扫完，
+    # 整次扫描 output_frames 一直是 0。
     sparse_end_ns = None
     if int(sparse_encode_count or 0) > 0 and sparse_anchors:
         slack_s = max(5.0, int(sparse_encode_count) / 30.0)
@@ -2510,16 +2510,16 @@ def process_mcap(
     work_dir = TEMP_DIR / f"job_{local_path.stem}_{int(time.time())}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # Accumulators
-    video_frames = defaultdict(list)  # ch_name -> [bytes, ...]
-    video_timestamps = defaultdict(list)  # ch_name -> [log_time_ns of each frame]
-    imu_rows = []          # all raw IMU samples
-    camera_metas = {}      # ch_name -> {width, height, fps, position}
+    # 累加器
+    video_frames = defaultdict(list)  # 每通道的 bytes 列表，键为 ch_name
+    video_timestamps = defaultdict(list)  # 每帧 log_time_ns 的列表，键为 ch_name
+    imu_rows = []          # 全部原始 IMU 采样
+    camera_metas = {}      # 含 width、height、fps、position，键为 ch_name
     futures = []
     channel_found = set()
     chunk_idx = 0
     total_imu = 0
-    channel_aus = {}  # ch_name -> list of AU byte arrays (filled below)
+    channel_aus = {}  # 下面填充的 AU 字节数组列表，键为 ch_name
     # h264_ps_cache: 非 live 模式下按通道缓存 SPS/PPS，给缺参数集的后续 chunk 补头。
     h264_ps_cache: dict = {}
 
@@ -2534,7 +2534,7 @@ def process_mcap(
             return raw
         return prefix + raw
 
-    orin_published = False  # Orin path writes bins while encoding chunks
+    orin_published = False  # 走 Orin 路径时，编码块的同时写 bin
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     _prev_encode_jid = getattr(_tls, "encode_job_id", None)
@@ -2556,8 +2556,8 @@ def process_mcap(
         )
         from sview.ingest.hdf5_images import is_hdf5_file, parse_hdf5_image_streams
 
-        # Path family first: head_cam never uses the ROS2/HDF5 readers;
-        # teleoperation/* never falls through to protobuf.
+# 先认路径族：head_cam 不用 ROS2/HDF5 读取器；
+# 也不会让 teleoperation/* 掉进 protobuf。
         orin_kind = None
         orin_ok = False
         if family == "head_cam":
@@ -2598,15 +2598,15 @@ def process_mcap(
                             "(stream, same TRANSCODE_* as head-cam, chunk=%d)",
                             fname, ORIN_CHUNK_FRAMES,
                         )
-                        # Parsed incrementally in the encode loop so the first
-                        # GOP is published without waiting to scan the whole bag.
+                        # 在编码循环里增量解析，第一个 GOP
+                        # 不用等整包扫完就能发出去。
                     else:
                         log.info(
                             "[%s]  Format=Orin ROS2 CompressedImage JPEG "
                             "(stream encode, first GOP without full-bag scan, chunk=%d)",
                             fname, ORIN_CHUNK_FRAMES,
                         )
-                        # Parsed incrementally in the JPEG stream loop below.
+                        # 在下面的 JPEG 流循环里增量解析。
                     orin_ok = True
                 except Exception as exc:
                     if family == "teleop":
@@ -2684,7 +2684,7 @@ def process_mcap(
                         channels = sorted(have)
                     else:
                         return False
-                    # Same knobs as head-cam: TRANSCODE_SIZE/CRF/BITRATE/FORCE_REENCODE.
+                    # 与头显同一套：TRANSCODE_SIZE/CRF/BITRATE/FORCE_REENCODE。
                     passthrough = _is_h264_passthrough(camera_metas, channels)
                     sw = _scale_dim(camera_metas, "w")
                     sh = _scale_dim(camera_metas, "h")
@@ -2751,8 +2751,8 @@ def process_mcap(
 
                     if enc is not None:
                         t0 = time.time()
-                        # The session already decoded earlier pictures. Re-feeding
-                        # from the previous source IDR would encode them again.
+                        # 这个会话已经解过更早的图像。再从
+                        # 上一个源 IDR 喂进去，会把它们重新编码一遍。
                         aus = list(enc.encode_frames(jpeg_frames[ch][f0:f1]))
                         if len(aus) > want:
                             aus = aus[:want]
@@ -3364,7 +3364,7 @@ def process_mcap(
 
                 if enc is not None:
                     t0 = time.time()
-                    # Persistent decoder state replaces the per-chunk IDR prefix.
+                    # 常驻解码器状态取代每块单独的 IDR 前缀。
                     aus = list(enc.encode_frames(jpeg_frames[ch][start:end]))
                     if len(aus) > want:
                         aus = aus[:want]
@@ -3427,7 +3427,7 @@ def process_mcap(
             cidx = 0
             start = 0
             while start < n:
-                # First chunk uses PLAYABLE_MIN_FRAMES for earlier playable.
+                # 首块用 PLAYABLE_MIN_FRAMES，好更早可播。
                 step = (
                     PLAYABLE_MIN_FRAMES if cidx == 0
                     else max(1, ORIN_CHUNK_FRAMES)
@@ -3452,7 +3452,7 @@ def process_mcap(
                             "[%s]  %s chunk %d [%d:%d] %d AUs %.1fKB %.2fs",
                             fname, ch, cidx, start, end, len(aus), nbytes / 1024, elapsed,
                         )
-                # Align this chunk across channels (defensive).
+                # 各通道对齐这一块（防御性）。
                 chunk_len = end - start
                 for ch in channels:
                     have = len(channel_aus[ch])
@@ -3462,7 +3462,7 @@ def process_mcap(
                     while len(channel_aus[ch]) < expect:
                         channel_aus[ch].append(b"")
                     if orin_kind == "h264":
-                        # Stateless ffmpeg still re-decodes from the last source IDR.
+                        # 无状态 ffmpeg 仍从最近的源 IDR 重新解码。
                         origin = _h264_last_idr_index(jpeg_frames[ch], start)
                         if origin < 0:
                             origin = start
@@ -3525,8 +3525,8 @@ def process_mcap(
         if not orin_published:
             if family == "teleop":
                 _raise_teleop_no_video(local_path, robot=robot)
-            # Head-cam: stream-read → per-chunk encode/passthrough → publish immediately
-            # (same progressive model as Orin; first chunk = PLAYABLE_MIN_FRAMES).
+            # 头显：流式读 → 按块编码或直通 → 马上发布
+            # （和 Orin 一样边转边播；首块 = PLAYABLE_MIN_FRAMES）。
             summary_frames = _scale_summary_n(read_headcam_video_frame_count(local_path))
             job_id = out_job_id
             progressive = bool(no_upload and PROGRESSIVE_PUBLISH)
@@ -3547,7 +3547,7 @@ def process_mcap(
             imu_idx = 0
             ts_rebased = False
             ts_wall_offset = 0
-            passthrough = None  # decided once metas+channels are ready
+            passthrough = None  # 等 metas 和通道齐了再定
             channels = []
             declared_total = _known_frame_total(summary_frames)
             if declared_total:
@@ -3577,7 +3577,7 @@ def process_mcap(
                 nonlocal ts_rebased, ts_wall_offset
                 if ts_rebased or not imu_rows:
                     return
-                # Peek whether wall-domain rebase is needed (same rules as helper).
+                # 先看要不要把墙钟域换算过来（规则和辅助函数一样）。
                 offsets = []
                 for row in imu_rows:
                     mono = _parse_ns(row.get("monotonic_ns"))
@@ -3586,7 +3586,7 @@ def process_mcap(
                         continue
                     offsets.append(wall - mono)
                 if not offsets:
-                    # Still normalize IMU log_time when possible.
+                    # 能归一化时，仍把 IMU 的 log_time 对齐。
                     if _rebase_timestamps_to_monotonic(video_timestamps, imu_rows):
                         log.info("[%s]  Rebased timestamps onto monotonic_raw_ns", fname)
                     ts_rebased = True
@@ -3631,17 +3631,17 @@ def process_mcap(
                     return False
                 if final:
                     return True
-                # Lock progressive publish only after the full SView quad is present.
-                # Waiting on camera_metas alone is unsafe: a single early /meta
-                # (often FL) would freeze channel_aus to one cam and the other
-                # three streams stay empty forever.
+                # 四路 SView 都到齐后才锁定边转边播。
+                # 只等 camera_metas 不安全：过早的单个 /meta
+                # （常常是 FL）会把 channel_aus 冻成一路，另外
+                # 三路就永远是空的。
                 return HEADCAM_CHANNEL_SET.issubset(channel_found)
 
             def _select_channels(final: bool = False) -> list:
                 if HEADCAM_CHANNEL_SET.issubset(channel_found):
                     return list(HEADCAM_CHANNELS)
                 if final:
-                    # Non-standard bag: publish whatever cams actually appeared.
+                    # 非标准包：实际出现哪些相机就发布哪些。
                     return sorted(channel_found)
                 return []
 
@@ -3668,7 +3668,7 @@ def process_mcap(
                         CHUNK_FRAMES,
                     )
                 else:
-                    # Channel set is immutable after the first progressive lock.
+                    # 第一次边转边播锁定之后，通道集合不再变。
                     channels = [ch for ch in channels if ch in channel_aus]
                     if not channels:
                         return
@@ -3680,9 +3680,9 @@ def process_mcap(
                             break
                     else:
                         if encode_count > 0:
-                            # Keep the source GOP and the target segment in one
-                            # ffmpeg process. A warmup-only chunk would discard
-                            # decoder state before x264 starts.
+                            # 源 GOP 和目标分段放在同一个 ffmpeg
+                            # 进程里。只做预热的块会在 x264 开始前
+                            # 丢掉解码器状态。
                             target_end = encode_offset + encode_count
                             if published_upto >= target_end or min_count < target_end:
                                 break
@@ -3839,7 +3839,7 @@ def process_mcap(
             if min_frames < 1:
                 raise ValueError(f"Head-cam MCAP has no aligned video frames: {local_path}")
 
-            # Apply output size to camera metas for manifest (resize path).
+            # 把输出尺寸写进相机 meta，供清单使用（缩放路径）。
             if _resize_requested():
                 sw = _scale_dim(camera_metas, "w")
                 sh = _scale_dim(camera_metas, "h")
@@ -3870,9 +3870,9 @@ def process_mcap(
                     progress_cb(min_frames, min_frames)
                 except Exception:
                     log.exception("progress_cb failed at end")
-            orin_published = True  # frames already on disk (reuse Orin post-path)
+            orin_published = True  # 帧已经在盘上（复用 Orin 的后处理）
 
-        # --- Save/upload outputs ---
+        # --- 保存/上传输出 ---
         if no_upload:
             import shutil as _shutil
             for cb in work_dir.glob("*_concat.bin"):
@@ -3881,14 +3881,14 @@ def process_mcap(
                 except OSError:
                     pass
             if progressive:
-                # Frames + manifest already under LOCAL_OUTPUT_DIR/{job_id}
+                # 帧和清单已经在 LOCAL_OUTPUT_DIR/{job_id} 下
                 log.info("  -> progressive cache  %s  (%d frames)", publish_dir, min_frames)
             else:
                 out_dir = LOCAL_OUTPUT_DIR / job_id
                 _shutil.copytree(str(work_dir), str(out_dir), dirs_exist_ok=True)
                 log.info("  -> saved  %s  (%d frames)", out_dir, min_frames)
         else:
-            # Upload each frame bin + manifest under .../{job_id}/sview/
+            # 把每帧 bin 和清单上传到 .../{job_id}/sview/
             if manifest_path.exists():
                 oss_key = f"{oss_base}/manifest.json"
                 upload_to_oss(manifest_path, oss_key)
@@ -3898,7 +3898,7 @@ def process_mcap(
 
 
         total_elapsed = round(time.time() - t_start, 1)
-        # Ensure a final 100% line even if the last progress_cb was throttled away.
+        # 即使最后一次 progress_cb 被节流丢掉，也补一行 100%。
         try:
             progress_log.update(min_frames, min_frames)
         except Exception:
@@ -3925,11 +3925,11 @@ def process_mcap(
 
 
 # ---------------------------------------------------------------------------
-#  Timestamp rebase (wall / MCAP log_time → monotonic_raw_ns)
+#  时间戳换算（墙钟 / mcap log_time → monotonic_raw_ns）
 # ---------------------------------------------------------------------------
 
 def _parse_ns(value):
-    """Parse a nanosecond timestamp from int/str; return None if missing/invalid."""
+    """从 int/str 解析纳秒时间戳；缺失或非法则返回 None。"""
     if value is None or value == "":
         return None
     try:
@@ -3939,17 +3939,17 @@ def _parse_ns(value):
 
 
 def _rebase_timestamps_to_monotonic(video_timestamps: dict, imu_rows: list) -> bool:
-    """Use monotonic_raw_ns as the shared timeline (same as local_full_mcap_flow_verify).
+    """用 monotonic_raw_ns 做统一时间轴（与 local_full_mcap_flow_verify 相同）。
 
-    Production MCAPs often stamp msg.log_time with wall-clock ns (~1e18), which
-    exceeds JS Number.MAX_SAFE_INTEGER and breaks SView IMU plots. Verify-style
-    recordings already use monotonic log_time (~1e11).
+    线上 mcap 经常把 msg.log_time 打成墙钟纳秒（约 1e18），超过
+    JS Number.MAX_SAFE_INTEGER，SView 的 IMU 曲线会坏。校验风格的
+    录制已经用单调 log_time（约 1e11）。
 
-    - If MCAP log_time is in the wall domain: subtract median(wall - mono) from
-        video timestamps, and set each IMU log_time_ns = monotonic_raw_ns.
-    - If already monotonic: only normalize IMU log_time_ns to monotonic_raw_ns.
+    - mcap log_time 在墙钟域：视频时间戳减去 median(wall - mono)，
+        每条 IMU 的 log_time_ns 设为 monotonic_raw_ns。
+    - 已经是单调时间：只把 IMU 的 log_time_ns 归一成 monotonic_raw_ns。
 
-    Mutates video_timestamps and imu_rows in place. Returns True if any change.
+    就地改 video_timestamps 和 imu_rows。有改动则返回 True。
     """
     if not imu_rows:
         return False
@@ -4004,30 +4004,30 @@ def _rebase_timestamps_to_monotonic(video_timestamps: dict, imu_rows: list) -> b
 
 
 # ---------------------------------------------------------------------------
-#  Per-frame H264 access unit splitting & bundle serialization
+#  逐帧 H.264 AU 切分与 bundle 序列化
 # ---------------------------------------------------------------------------
 
 def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
-    """Split raw H.264 Annex B into per-frame AUs by NAL scan (no ffprobe).
+    """按 NAL 扫描把原始 H.264 Annex-B 切成逐帧 AU（不用 ffprobe）。
 
-    Correct access-unit grouping for this encode path (single-slice libx264):
+    这条编码路径的 AU 分组（单切片 libx264）：
 
-      - Each primary picture is one VCL NAL (type 1 or 5).
-      - Non-VCL that *follow* a VCL (SEI/SPS/PPS/AUD) start the *next* AU —
-        they prefix the following picture (H.264 AU order).
-      - Consecutive VCLs with nothing between them each start a new AU.
+      - 每幅主图像是一个 VCL NAL（类型 1 或 5）。
+      - 跟在 VCL 后面的非 VCL（SEI/SPS/PPS/AUD）算 *下一个* AU 的开头 —
+        它们是后一幅图像的前缀（H.264 的 AU 顺序）。
+      - 中间没有别的 NAL 的连续 VCL，各自新开一个 AU。
 
-    Result for dump_extra=freq=keyframe bitstreams::
+    dump_extra=freq=keyframe 码流的结果::
 
       [SPS][PPS][SEI][IDR] | [P] | ... | [P] | [SPS][PPS][SEI][IDR] | ...
 
-    Keyframes keep their parameter sets (better for seek/decode than ffprobe's
-    habit of attaching SPS/PPS to the previous P packet). Do not re-inject
-    SPS/PPS — that previously wrote corrupt 1-byte parameter sets.
+    关键帧留着自己的参数集（比 ffprobe 把 SPS/PPS
+    贴到前一个 P 包上更利于跳转和解码）。不要再注入
+    SPS/PPS — 以前这样写出会坏掉的 1 字节参数集。
 
-    work_dir is unused; kept for call-site parity with server_cpu.py.
+    work_dir 没用；留着是为了和 server_cpu.py 的调用点对齐。
     """
-    del work_dir  # API parity with ffprobe variant
+    del work_dir  # 与 ffprobe 那一版的 API 对齐
     if not data:
         return []
 
@@ -4060,12 +4060,12 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
     for nal_start, _, nal_type in nal_starts:
         if nal_type in (1, 5):
             if seen_vcl:
-                # Next primary picture with no prefix NALs between VCLs
+                # 下一幅主图像，VCL 之间没有前缀 NAL
                 aus.append(data[au_start:nal_start])
                 au_start = nal_start
             seen_vcl = True
         elif seen_vcl and nal_type in (6, 7, 8, 9):
-            # SEI / SPS / PPS / AUD after a picture → prefix of the next AU
+            # 图像后面的 SEI / SPS / PPS / AUD → 下一个 AU 的前缀
             aus.append(data[au_start:nal_start])
             au_start = nal_start
             seen_vcl = False
@@ -4074,8 +4074,16 @@ def _split_h264_access_units(data: bytes, work_dir: Path) -> list:
     return aus
 
 
+def _frames_before_random_access(frames: list) -> int:
+    """窗口里第一张 IDR 之前有多少帧。没有 IDR 时整段都算解不出。"""
+    for i, frame in enumerate(frames):
+        if frame and _au_has_random_access(frame):
+            return i
+    return len(frames)
+
+
 def _au_has_random_access(data: bytes) -> bool:
-    """H.264 IDR or HEVC IDR/CRA. Source seek must start on one of these."""
+    """是否为 H.264 IDR 或 HEVC 的 IDR/CRA。源的 seek 必须从这里开始。"""
     if _h264_payload_has_idr(data):
         return True
     pos = 0
@@ -4099,7 +4107,7 @@ def _au_has_random_access(data: bytes) -> bool:
 
 
 def _h264_payload_has_idr(data: bytes) -> bool:
-    """Check if H.264 payload contains an IDR NAL unit (type 5)."""
+    """检查 H.264 载荷里有没有 IDR NAL（类型 5）。"""
     pos = 0
     while pos < len(data) - 4:
         if data[pos:pos+4] == b'\x00\x00\x00\x01':
@@ -4118,10 +4126,10 @@ def _h264_payload_has_idr(data: bytes) -> bool:
 def _idr_aligned_chunk_end(
     frames_by_ch: dict, channels: list, start: int, n: int, step: int
 ) -> int:
-    """End index for a fresh-ffmpeg H.264 chunk: next shared IDR (or n).
+    """新开 ffmpeg 时，H.264 块的结束下标：下一个共用 IDR（或 n）。
 
-    Each live chunk is a new ffmpeg process. Cutting on a P-frame makes the
-    next chunk fail (no reference pictures) even if SPS/PPS are prefixed.
+    每个直播块都是新的 ffmpeg 进程。切在 P 帧上，下一块
+    会失败（没有参考图像），即使前面补了 SPS/PPS 也一样。
     """
     end = min(start + max(1, step), n)
     if end >= n:
@@ -4153,7 +4161,7 @@ def _h264_last_idr_index(frames: list, at_or_before: int) -> int:
     return -1
 
 def _write_bytes_atomic(target_path: Path, payload: bytes):
-    """Write bytes atomically: write to .tmp first, then rename to target."""
+    """原子写字节：先写到 .tmp，再重命名到目标。"""
     tmp_path = target_path.with_suffix(target_path.suffix + '.tmp')
     with open(tmp_path, 'wb') as f:
         f.write(payload)
@@ -4161,12 +4169,12 @@ def _write_bytes_atomic(target_path: Path, payload: bytes):
 
 
 def _estimate_timeline(video_timestamps: dict, channel_aus: dict, upto_frame: int):
-    """Timeline start/end for `upto_frame` frames (1-based count).
+    """给出 upto_frame 帧的时间轴起止（计数从 1 开始）。
 
-    Prefer full timestamp span when enough samples exist; otherwise fall back to
-    last-interval extrapolation (spec 4.1). If ``upto_frame`` is the full-job
-    count but only a prefix of timestamps is in memory, extrapolate end_ns so
-    duration_sec stays stable during progressive publish.
+    样本够就用完整时间戳跨度；否则退回
+    最后间隔外推（规格 4.1）。若 ``upto_frame`` 已是全任务
+    帧数，但内存里只有一段前缀时间戳，就外推 end_ns，让
+    边转边播期间 duration_sec 保持稳定。
     """
     if upto_frame <= 0 or not channel_aus or not video_timestamps:
         return 0, 0
@@ -4194,9 +4202,9 @@ def _duration_sec(
     frame_count: int | None,
     camera_metas: dict,
 ) -> float:
-    """Stable total duration for manifest (never shrink/grow during progressive).
+    """清单用的稳定总时长（边转边播期间不缩也不涨）。
 
-    When frame_count is still unknown, duration follows the published prefix.
+    frame_count 还不知道时，时长跟着已发布前缀走。
     """
     if timeline_start_ns and timeline_end_ns and timeline_end_ns > timeline_start_ns:
         return round((timeline_end_ns - timeline_start_ns) / 1e9, 6)
@@ -4232,11 +4240,11 @@ def _build_manifest_dict(
     status: str,
     origin_sec: float = 0.0,
 ) -> dict:
-    """status: 'partial' while publishing, 'done' when complete.
+    """发布中 status 为 'partial'，完成时为 'done'。
 
-    timeline/duration_sec always reflect the *full* job (frame_count), not the
-    currently published prefix — so progressive clients get a stable seek range.
-    When frame_count is still unknown (no MCAP summary), it is JSON null.
+    timeline/duration_sec 始终表示 *整个* 任务（frame_count），不是
+    当前已发布前缀 — 边转边播的客户端才能拿到稳定的跳转范围。
+    还没有 mcap 摘要、frame_count 未知时，JSON 里是 null。
     """
     manifest = {
         "job_id": job_id,
@@ -4245,7 +4253,7 @@ def _build_manifest_dict(
         "bundle": {
             "frame_count": frame_count,
             "frames_available": frames_available,
-            # Transport segment size consumed by Master and the web player.
+            # 传输分段大小，Master 和网页播放器都用它。
             "gop_size": SEGMENT_FRAMES,
             "key_frame_indices": list(key_frame_indices),
             "timeline": {
@@ -4279,7 +4287,7 @@ def _publish_manifest(manifest_path: Path, manifest: dict) -> None:
 
 
 def _prepare_publish_dir(job_id: str) -> Path:
-    """Create/clear LOCAL_OUTPUT_DIR/{job_id} for progressive frame publish."""
+    """创建或清空 LOCAL_OUTPUT_DIR/{job_id}，供边转边播写帧。"""
     import shutil as _shutil
     out_dir = LOCAL_OUTPUT_DIR / job_id
     if out_dir.exists():
@@ -4293,7 +4301,7 @@ def _build_bundle_frame(frame_idx: int, streams_data: dict, timestamp_ns: int,
                         time_window_ns: list, is_keyframe: bool,
                         imu_json: dict, events_json: dict,
                         stream_codecs: dict | None = None) -> bytes:
-    """Build a single bundle frame bin (v1 quad-cam or v2 named streams)."""
+    """打一个 bundle 帧 bin（v1 四路或 v2 命名流）。"""
     return pack_bundle_frame(
         frame_idx,
         streams_data,
@@ -4318,31 +4326,31 @@ def _resolve_path(raw_path: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-#  Redis queue loop
+#  队列循环（Redis）
 # ---------------------------------------------------------------------------
 
 class JobCancelled(Exception):
-    """Raised from progress_cb when Redis cancel flag is set."""
+    """在 progress_cb 里看到 Redis 取消标记时抛出。"""
 
 
 class LostJobLock(Exception):
-    """Raised when another worker stole / expired our job lock."""
+    """别的 worker 抢走或让我们的任务锁过期时抛出。"""
 
 
 class SparseSegmentComplete(BaseException):
-    """Internal non-Exception sentinel used to stop a bounded sparse encode."""
+    """内部用的非 Exception 哨兵，用来停掉有界稀疏编码。"""
 
 
 class SparseSegmentAborted(BaseException):
-    """Stop a sparse segment without publishing it."""
+    """停掉这个稀疏分段，并且不发布它。"""
 
 
 class McapEnded(Exception):
-    """The open MCAP yielded no more messages before the segment was full."""
+    """打开的 mcap 在分段填满之前就没有更多消息了。"""
 
 
 def _rewrite_bundle_global_index(blob: bytes, frame_index: int) -> bytes:
-    """Rewrite only bundle header.frame_index, preserving encoded payload bytes."""
+    """只改 bundle header.frame_index，编码后的载荷字节保持不动。"""
     if len(blob) < 8:
         raise ValueError("bundle too small")
     header_len = struct.unpack_from("<I", blob, 0)[0]
@@ -4358,7 +4366,7 @@ def _rewrite_bundle_global_index(blob: bytes, frame_index: int) -> bytes:
 
 
 def _bundle_all_streams_keyframe(blob: bytes) -> bool:
-    """Require every non-null stream in a sparse segment's first frame to be IDR."""
+    """稀疏分段第一帧里，每个非空流都必须是 IDR。"""
     if len(blob) < 8:
         return False
     header_len = struct.unpack_from("<I", blob, 0)[0]
@@ -4381,8 +4389,8 @@ def _bundle_all_streams_keyframe(blob: bytes) -> bool:
 
 
 def _load_sparse_manifest(job_id: str) -> dict | None:
-    # In a multi-pod worker pool OSS is the shared authority. Reading a pod's
-    # stale local manifest first can overwrite ranges published by another pod.
+    # 多 Pod 的 worker 池里以 OSS 为准。先读本 Pod
+    # 过期的本地清单，会盖掉别的 Pod 已经发布的区间。
     if OSS_CACHE:
         try:
             key = oss_cache_key(job_id, "manifest.json")
@@ -4411,7 +4419,7 @@ def _publish_sparse_segment(
     epoch: int,
     upload_index: bool = True,
 ) -> dict:
-    """PUT segment first, then merge and publish sparse manifest under a lock."""
+    """先 PUT 分段，再在锁里合并并发布稀疏清单。"""
     from sview.cache.oss_cache_gc import (
         contiguous_prefix_from_ranges,
         merge_available_ranges,
@@ -4556,7 +4564,7 @@ def _publish_sparse_segment(
 
 
 class _RedisValueLockRenewer:
-    """Renew an arbitrary Redis value lock while its owner still matches."""
+    """持有者还对得上时，给任意 Redis 值锁续期。"""
 
     def __init__(self, r, key: str, owner: str, *, ttl: int, also=None):
         self._r = r
@@ -4605,9 +4613,9 @@ class _RedisValueLockRenewer:
 
 
 def _sparse_job_busy(r, job_id: str) -> bool:
-    """True when this shared Job already has a live sparse segment.
+    """这个共享 Job 已经有一段在播的稀疏分段时为真。
 
-    A lock whose worker heartbeat no longer lists the Job is stale and is removed.
+    锁的 worker 心跳里已经没有这个 Job，就算过期，删掉。
     """
     from sview.jobs.job_status import job_active_key, list_workers
 
@@ -4638,7 +4646,7 @@ def _sparse_job_busy(r, job_id: str) -> bool:
         ttl = int(r.ttl(key))
     except Exception:
         return True
-    # A fresh claim can beat the next heartbeat. Leave it alone until then.
+    # 新认领可能抢在下一次心跳之前。在那之前先别动。
     if ttl > 160:
         return True
     log.info("[%s] clearing stale sparse job lock %s", job_id, text)
@@ -4647,7 +4655,7 @@ def _sparse_job_busy(r, job_id: str) -> bool:
 
 
 def _drop_segment_behind_frontier(r, item: dict) -> bool:
-    """Drop a queued segment that a newer seek moved the frontier past."""
+    """丢掉被更新的 seek 把前沿推过去的排队分段。"""
     from sview.jobs.job_status import get_job_fields, segment_pending_key
 
     try:
@@ -4675,7 +4683,7 @@ def _schedule_forward_after_segment(
     end: int,
     segment_frames: int,
 ) -> None:
-    """Keep encoding the next missing segments after the playback frontier."""
+    """播放前沿之后，继续编后面还缺的分段。"""
     from sview.jobs.job_status import (
         SPARSE_FORWARD_SEGMENTS,
         enqueue_forward_from,
@@ -4714,7 +4722,7 @@ def _run_one_segment_job(
     session_client: str = "",
     bound_frontier: int | None = None,
 ) -> None:
-    """Encode and atomically publish one independently decodable sparse segment."""
+    """编码并原子发布一个可以独立解码的稀疏分段。"""
     import shutil
 
     from sview.ingest.frame_index import (
@@ -4867,7 +4875,7 @@ def _run_one_segment_job(
             log.info("[%s] window %s seek moved before locating segment %d", job_id, session_client, start)
             return
 
-        # Segment start comes from the index table. No payload scan.
+        # 分段起点来自索引表，不扫载荷。
         decode_start = find_sparse_decode_start(
             local_path,
             frame_index_data,
@@ -5031,7 +5039,7 @@ def _clear_job_cache(job_id: str, *, purge_oss: bool = True) -> None:
 
 
 class _JobLockRenewer:
-    """Background renew so long ffmpeg chunks cannot let the lock expire."""
+    """后台续期，免得长 ffmpeg 块把锁拖过期。"""
 
     def __init__(self, r, job_id: str):
         from sview.jobs.job_status import SVIEW_LOCK_TTL_SEC, renew_job_lock
@@ -5080,12 +5088,12 @@ def _next_session_segment(
     locked_fn,
     cooling_fn,
 ) -> tuple[int | None, bool, list[int]]:
-    """Pick the next unpublished segment at or after the frontier.
+    """取前沿处或之后的下一个未发布分段。
 
-    The first missing segment is the one playback is waiting on. If it is
-    locked or cooling down, return no segment so the caller waits and retries
-    it. Skipping ahead opens a hole the playhead cannot cross.
-    ``blocked`` means that segment exists but cannot be taken yet.
+    第一段缺口就是播放正在等的那段。它要是
+    锁着或在冷却，就先不返回分段，让调用方等着重试
+    这一段。跳到更后面会开一个播放头过不去的洞。
+    ``blocked`` 表示这段在，但现在还拿不到。
     """
     from sview.cache.oss_cache_gc import frame_range_ready
 
@@ -5100,8 +5108,8 @@ def _next_session_segment(
         missing = total <= 0 or (
             end > seg and not frame_range_ready(ranges, seg, end)
         )
-        # The playhead cannot cross a hole. Encoding a later segment while
-        # this one is locked or cooling leaves playback stuck on the gap.
+        # 播放头过不了空洞。这段还锁着或在冷却时去编后面的分段，
+        # 播放会卡在这个缺口上。
         if missing and locked_fn(seg):
             return None, True, [seg]
         if missing and cooling_fn(seg):
@@ -5115,7 +5123,7 @@ def _next_session_segment(
 
 
 def _same_forward_cursor(cursor: int | None, nxt: int) -> bool:
-    """True when the next segment continues the already-open read and ffmpeg."""
+    """下一段能接上已经打开的读取和 ffmpeg 时为真。"""
     return cursor is not None and int(cursor) == int(nxt)
 
 
@@ -5127,12 +5135,12 @@ def _frontier_left_forward_run(
     seg_n: int,
     reading: int | None = None,
 ) -> bool:
-    """True when the client now wants a different missing segment.
+    """客户端现在要的缺失分段已经变了则为真。
 
-    The playhead stays inside published frames while encoding walks the next
-    hole, so a frontier behind ``opened`` is normal. Abort when that frontier
-    points at an earlier hole, or when a new seek asks for some other segment
-    than the one currently being read.
+    编码去补下一个洞时，播放头还停在已发布帧里，
+    所以前沿落在 ``opened`` 后面是正常的。前沿指向
+    更早的洞，或新的 seek 要的是当前正在读的
+    另一段时，才中止。
     """
     current = int(opened if reading is None else reading)
     nxt, _blocked, _skipped = _next_session_segment(
@@ -5149,7 +5157,7 @@ def _frontier_left_forward_run(
 
 
 def _forward_read_floor(anchors: dict) -> int:
-    """Earliest positive per-channel timestamp. A 0 must not rewind to byte 0."""
+    """各通道里最早的正时间戳。0 不能把位置倒回字节 0。"""
     vals: list[int] = []
     for raw in anchors.values():
         try:
@@ -5162,7 +5170,7 @@ def _forward_read_floor(anchors: dict) -> int:
 
 
 def _headcam_forward_topic(topic: str) -> bool:
-    """Video, camera meta, and IMU. Other protobuf topics stay out of the read."""
+    """视频、相机 meta 和 IMU。其他 protobuf topic 不读。"""
     from sview.ingest.orin_images import sview_channel_for_topic
 
     raw = (topic or "").strip()
@@ -5176,7 +5184,7 @@ def _headcam_forward_topic(topic: str) -> bool:
 
 
 def _headcam_forward_topics(path: Path) -> list[str]:
-    """Topic allow-list for one head-cam forward read. IMU is included."""
+    """一次头显前向读取的 topic 白名单。包含 IMU。"""
     from mcap.reader import make_reader
 
     found: list[str] = []
@@ -5206,10 +5214,10 @@ def _headcam_forward_topics(path: Path) -> list[str]:
 
 
 class _HeadcamForwardRun:
-    """One open mcap and one set of live ffmpeg processes for a forward play.
+    """一次前向播放：一个打开的 mcap，一组常驻 ffmpeg。
 
-    Opened at a seek. Contiguous later segments keep feeding that reader and
-    those encoders. A backward seek, a hole, or session end closes it.
+    在 seek 处打开。后面连续的分段继续喂这个读取器和
+    这些编码器。往后跳、遇到洞、或会话结束就关掉。
     """
 
     def __init__(self, *, local_path: Path, job_id: str, source: str, seg_n: int):
@@ -5230,6 +5238,12 @@ class _HeadcamForwardRun:
         self._anchors: dict[str, int] = {}
         self._seg_anchors: dict[str, int] = {}
         self._primed = False
+        # 这一路的解码器是否已经吃到过关键帧（之后的 P 帧都能解）。
+        self._decodable: dict[str, bool] = {}
+        # 上一段只喂了关键帧之后的尾巴，ffmpeg 的关键帧计数错位了：
+        # 下一段先重开这一路，用这些帧预热解码再对齐。
+        self._realign: dict[str, list] = {}
+        self._enc_args: tuple = (None, None, 0)
         self._floor = 0
         self._seek_check_at = 0.0
         self._index_uploaded = False
@@ -5260,8 +5274,8 @@ class _HeadcamForwardRun:
         total = int(frame_index.get("frame_count") or 0)
         if total and start >= total:
             raise ValueError(f"segment start {start} past frame_count {total}")
-        # Open on the previous source IDR, not on the segment boundary.
-        # A P-frame there does not decode, so 30 inputs come back as fewer pictures.
+        # 从上一个源 IDR 打开，而不是分段边界。
+        # 边界如果是 P 帧就解不出，30 个输入会少吐图像。
         lookback = min(int(start), 120)
         origin = int(start) - lookback
         self._seg_anchors = sparse_anchor_map(frame_index, start)
@@ -5273,6 +5287,8 @@ class _HeadcamForwardRun:
         self._anchors = origin_anchors
         self._floor = _forward_read_floor(origin_anchors)
         self._primed = False
+        self._decodable = {}
+        self._realign = {}
         self._seek_check_at = 0.0
         self.open_frame = int(start)
         self.next_frame = int(start)
@@ -5308,12 +5324,6 @@ class _HeadcamForwardRun:
         if not self.channels:
             self.channels = list(HEADCAM_CHANNELS)
         while min(len(self.frames[ch]) for ch in self.channels) < need:
-            self._read_one(seek_back)
-
-    def _pull_segment(self, need: int, seek_back) -> None:
-        if not self.channels:
-            self.channels = list(HEADCAM_CHANNELS)
-        while not self._segment_ready(need):
             self._read_one(seek_back)
 
     def _read_one(self, seek_back) -> None:
@@ -5376,25 +5386,17 @@ class _HeadcamForwardRun:
             return
         if _resize_requested():
             _apply_output_scale(self.metas)
-        sw = _scale_dim(self.metas, "w")
-        sh = _scale_dim(self.metas, "h")
+        self._enc_args = (
+            _scale_dim(self.metas, "w"),
+            _scale_dim(self.metas, "h"),
+            _live_worker_threads(len(self.channels)),
+        )
+        n_threads = self._enc_args[2]
         ovr = getattr(_tls, "override", None)
         encoders: dict = {}
-        n_threads = _live_worker_threads(len(self.channels))
 
         def _one(ch: str):
-            meta = self.metas.get(ch) or {}
-            codec = meta.get("codec") or "hevc"
-            fps = float(meta.get("fps") or 30)
-            return ch, LiveX264Encoder.annexb(
-                codec=str(codec),
-                scale_w=sw,
-                scale_h=sh,
-                job_id=self.job_id,
-                fps=fps,
-                gop=self.seg_n,
-                threads=n_threads,
-            )
+            return ch, self._make_encoder(ch)
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -5412,6 +5414,28 @@ class _HeadcamForwardRun:
         except Exception:
             _close_live_encoders(encoders)
             raise
+
+    def _make_encoder(self, ch: str):
+        sw, sh, n_threads = self._enc_args
+        meta = self.metas.get(ch) or {}
+        return LiveX264Encoder.annexb(
+            codec=str(meta.get("codec") or "hevc"),
+            scale_w=sw,
+            scale_h=sh,
+            job_id=self.job_id,
+            fps=float(meta.get("fps") or 30),
+            gop=self.seg_n,
+            threads=n_threads,
+        )
+
+    def _restart_encoder(self, ch: str):
+        """单独重开这一路 ffmpeg，让关键帧计数从 0 重新对齐分段边界。"""
+        old = (self.encoders or {}).pop(ch, None)
+        if old is not None:
+            _close_live_encoders({ch: old})
+        enc = self._make_encoder(ch)
+        self.encoders[ch] = enc
+        return enc
 
     def _segment_ready(self, need: int) -> bool:
         if not self.channels:
@@ -5431,9 +5455,11 @@ class _HeadcamForwardRun:
         return True
 
     def _pull_segment(self, need: int, seek_back) -> None:
-        # One message at a time. The previous helper treated the sum of every
-        # channel as a per-channel target, so the last segment read to EOF and
-        # then failed even when this segment was already complete.
+        # 一次一条消息。旧辅助函数把各通道之和
+        # 当成了单通道目标，最后一段就会读到 EOF，
+        # 这段其实已经齐了也会失败。
+        if not self.channels:
+            self.channels = list(HEADCAM_CHANNELS)
         while not self._segment_ready(need):
             try:
                 self._read_one(seek_back)
@@ -5474,12 +5500,42 @@ class _HeadcamForwardRun:
                         "[%s] %s warmup %d frames from source IDR before frame %s",
                         self.job_id, ch, skip, self.next_frame,
                     )
-            feed = frames[cut - skip:cut + need]
-            aus = self.encoders[ch].encode_frames(feed, output_skip=skip)
+            window = list(frames[cut:cut + need])
+            warm = self._realign.pop(ch, None)
+            if warm is not None:
+                enc = self._restart_encoder(ch)
+                aus = enc.encode_frames(warm + window, output_skip=len(warm))
+                self._decodable[ch] = True
+            elif skip:
+                aus = self.encoders[ch].encode_frames(
+                    frames[cut - skip:cut + need], output_skip=skip
+                )
+                self._decodable[ch] = True
+            elif (
+                getattr(self, "kind", "") == "jpeg"
+                or self._decodable.get(ch)
+                or (window and _au_has_random_access(window[0] or b""))
+            ):
+                aus = self.encoders[ch].encode_frames(window)
+                self._decodable[ch] = True
+            else:
+                # 第一张 IDR 之前的 P 帧解不出：这些位置留空不发，
+                # 只编 IDR 及之后的帧，放回原来的帧号上。
+                lead = _frames_before_random_access(window)
+                tail = window[lead:]
+                aus = [b""] * lead
+                if tail:
+                    aus += self.encoders[ch].encode_frames(tail)
+                    self._decodable[ch] = True
+                    self._realign[ch] = tail
+                log.info(
+                    "[%s] %s leaves %d frames empty before first IDR at segment frame %s",
+                    self.job_id, ch, lead, self.next_frame,
+                )
             if len(aus) > need:
                 aus = aus[:need]
-            while len(aus) < need:
-                aus.append(b"")
+            if len(aus) < need:
+                aus.extend([b""] * (need - len(aus)))
             return ch, aus, cut + need, ts[cut:cut + need]
 
         with ThreadPoolExecutor(max_workers=max(1, len(self.channels))) as pool:
@@ -5544,7 +5600,7 @@ class _HeadcamForwardRun:
         seek_back,
         on_playable=None,
     ) -> str:
-        """Encode and publish [start, end) on the already-open run."""
+        """在已经打开的这一轮上编码并发布 [start, end)。"""
         from sview.jobs.job_status import (
             POD_IP,
             job_active_key,
@@ -5652,10 +5708,10 @@ class _HeadcamForwardRun:
 
 
 class _TeleopForwardRun(_HeadcamForwardRun):
-    """ROS2 teleop forward read. Same persistent file and ffmpeg as head-cam.
+    """遥操作 ROS2 的前向读取。文件和 ffmpeg 与头显一样常驻。
 
-    HDF5 never uses this path. Video, camera info, and IMU are the only
-    topics decoded; IMU samples are packed into each segment bin.
+    HDF5 不走这条路径。只解码视频、相机信息和 IMU；
+    IMU 采样打进每个分段 bin。
     """
 
     def __init__(self, *, kind: str, local_path: Path, job_id: str, source: str, seg_n: int):
@@ -5688,6 +5744,8 @@ class _TeleopForwardRun(_HeadcamForwardRun):
         self._anchors = origin_anchors
         self._floor = _forward_read_floor(origin_anchors)
         self._primed = False
+        self._decodable = {}
+        self._realign = {}
         self._seek_check_at = 0.0
         self.open_frame = int(start)
         self.next_frame = int(start)
@@ -5757,35 +5815,17 @@ class _TeleopForwardRun(_HeadcamForwardRun):
             return
         if _resize_requested():
             _apply_output_scale(self.metas)
-        sw = _scale_dim(self.metas, "w")
-        sh = _scale_dim(self.metas, "h")
+        self._enc_args = (
+            _scale_dim(self.metas, "w"),
+            _scale_dim(self.metas, "h"),
+            _live_worker_threads(len(self.channels) or 1),
+        )
+        n_threads = self._enc_args[2]
         ovr = getattr(_tls, "override", None)
         encoders: dict = {}
-        n_threads = _live_worker_threads(len(self.channels) or 1)
 
         def _one(ch: str):
-            meta = self.metas.get(ch) or {}
-            fps = float(meta.get("fps") or 30)
-            if self.kind == "jpeg":
-                return ch, LiveX264Encoder.jpeg(
-                    scale_w=sw,
-                    scale_h=sh,
-                    job_id=self.job_id,
-                    fps=fps,
-                    crf=_tc_crf(),
-                    direct=ORIN_DIRECT,
-                    threads=n_threads,
-                )
-            codec = meta.get("codec") or "h264"
-            return ch, LiveX264Encoder.annexb(
-                codec=str(codec),
-                scale_w=sw,
-                scale_h=sh,
-                job_id=self.job_id,
-                fps=fps,
-                gop=self.seg_n,
-                threads=n_threads,
-            )
+            return ch, self._make_encoder(ch)
 
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -5804,12 +5844,37 @@ class _TeleopForwardRun(_HeadcamForwardRun):
             _close_live_encoders(encoders)
             raise
 
+    def _make_encoder(self, ch: str):
+        sw, sh, n_threads = self._enc_args
+        meta = self.metas.get(ch) or {}
+        fps = float(meta.get("fps") or 30)
+        if self.kind == "jpeg":
+            return LiveX264Encoder.jpeg(
+                scale_w=sw,
+                scale_h=sh,
+                job_id=self.job_id,
+                fps=fps,
+                crf=_tc_crf(),
+                direct=ORIN_DIRECT,
+                threads=n_threads,
+            )
+        return LiveX264Encoder.annexb(
+            codec=str(meta.get("codec") or "h264"),
+            scale_w=sw,
+            scale_h=sh,
+            job_id=self.job_id,
+            fps=fps,
+            gop=self.seg_n,
+            threads=n_threads,
+        )
+
 
 def _run_sparse_session(r, item: dict, on_playable=None) -> None:
-    """One encode thread for one playback window. Seek only moves its frontier."""
+    """一个播放窗口一条编码线程。seek 只移动它的前沿。"""
     from sview.jobs.job_status import (
         POD_IP,
         claim_segment_slot,
+        fail_job,
         first_unencoded_segment,
         get_job_fields,
         read_client_frontier,
@@ -5818,6 +5883,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
         segment_slot_key,
         session_alive_key,
         session_pending_key,
+        set_job_fields,
     )
 
     job_id = item["job_id"]
@@ -5833,7 +5899,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
     r.delete(session_pending_key(job_id, client_id))
     target = first_unencoded_segment(r, job_id, client_id, seg_n)
     if target is None or not claim_segment_slot(r, job_id, target, client_id):
-        # Another window already holds this segment's only worker slot.
+        # 另一个窗口已经占着这段唯一的 worker 槽。
         current = r.get(alive)
         if isinstance(current, bytes):
             current = current.decode("utf-8", errors="replace")
@@ -5862,18 +5928,33 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
     fail_counts: dict[int, int] = {}
     retry_after: dict[int, float] = {}
     forward: _HeadcamForwardRun | None = None
-    local_path = redis_path_to_local(source)
-    family = ingest_family(source)
-    from sview.ingest.hdf5_images import is_hdf5_file
-
-    teleop_kind = ""
-    use_forward = family == "head_cam" and not is_hdf5_file(local_path)
-    if family == "teleop" and not is_hdf5_file(local_path):
-        from sview.ingest.orin_images import orin_stream_kind
-
-        teleop_kind = orin_stream_kind(local_path, skip_headcam_guard=True) or ""
-        use_forward = teleop_kind in ("h264", "jpeg")
     try:
+        try:
+            local_path = redis_path_to_local(source)
+            family = ingest_family(source)
+            from sview.ingest.hdf5_images import is_hdf5_file
+
+            teleop_kind = ""
+            use_forward = family == "head_cam" and not is_hdf5_file(local_path)
+            if family == "teleop" and not is_hdf5_file(local_path):
+                from sview.ingest.orin_images import orin_stream_kind
+
+                if get_job_fields(r, job_id).get("status") in ("", "queued"):
+                    set_job_fields(
+                        r,
+                        job_id,
+                        status="processing",
+                        publish_mode="sparse",
+                        encode_status="probing_streams",
+                        owner_pod=POD_IP,
+                        error="",
+                    )
+                teleop_kind = orin_stream_kind(local_path, skip_headcam_guard=True) or ""
+                use_forward = teleop_kind in ("h264", "jpeg")
+        except Exception as exc:
+            log.exception("[%s] sparse session probe failed", job_id)
+            fail_job(r, job_id, f"probe failed: {exc}", source=source, publish_mode="sparse")
+            return
         idle = 0
         while idle < 10:
             try:
@@ -5932,9 +6013,9 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                         time.sleep(0.4)
                 continue
             if not claim_segment_slot(r, job_id, nxt, client_id):
-                # This window does not get a second inflight thread for a
-                # segment someone else is already encoding. Playback waits
-                # on the published segment.
+                # 别人已经在编的分段，这个窗口不再另开一条
+                # 在途线程。播放等待
+                # 已发布的分段。
                 log.info(
                     "[%s] window %s leaves; segment %d already has an encode slot",
                     job_id,
@@ -5949,18 +6030,29 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
             idle = 0
             seg_end = min(total, nxt + seg_n) if total > 0 else nxt + seg_n
             if use_forward:
+                opening = False
                 try:
                     if forward is None or not forward.continues(nxt):
+                        opening = True
                         if forward is not None:
                             log.info(
                                 "[%s] forward run reopen at %d (cursor was %s)",
                                 job_id, nxt, forward.next_frame,
                             )
                             forward.close()
+                            forward = None
                         from sview.ingest.frame_index import load_or_build_frame_index
 
                         index_path = LOCAL_OUTPUT_DIR / job_id / "frame_index.json"
                         index_path.parent.mkdir(parents=True, exist_ok=True)
+                        if not index_path.exists():
+                            set_job_fields(
+                                r,
+                                job_id,
+                                publish_mode="sparse",
+                                encode_status="reading_mcap_index",
+                                owner_pod=POD_IP,
+                            )
                         frame_index = load_or_build_frame_index(local_path, index_path)
                         if family == "teleop":
                             forward = _TeleopForwardRun(
@@ -5978,6 +6070,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                                 seg_n=seg_n,
                             )
                         forward.open_at(nxt, frame_index)
+                        opening = False
                     else:
                         log.info(
                             "[%s] forward run continues at frame %d without reopening mcap",
@@ -6008,11 +6101,25 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                     )
                     if forward.closed:
                         forward = None
-                except Exception:
+                except Exception as exc:
                     log.exception("[%s] forward run failed at %d", job_id, nxt)
                     if forward is not None:
                         forward.close()
                         forward = None
+                    if opening and isinstance(exc, ValueError) and not ranges:
+                        # 索引缺失或没有可识别的视频流，重试也一样，直接判失败。
+                        fail_job(r, job_id, str(exc), source=source, publish_mode="sparse")
+                        break
+                    try:
+                        set_job_fields(
+                            r,
+                            job_id,
+                            publish_mode="sparse",
+                            encode_status="failed",
+                            error=str(exc)[:500],
+                        )
+                    except Exception:
+                        pass
                     result = "error"
             else:
                 log.info("[%s] window %s encodes segment %d", job_id, client_id, nxt)
@@ -6032,8 +6139,8 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                     bound_frontier=frontier,
                 )
             if result == "end":
-                # Decodable messages stopped before this index frame. Retrying
-                # the same seek just reopens the file and hits EOF again.
+                # 可解码消息在这个索引帧之前就停了。重试
+                # 同一次 seek 只会重新打开文件，再次撞上 EOF。
                 log.info(
                     "[%s] window %s stops at frame %d; no more decodable messages",
                     job_id, client_id, nxt,
@@ -6067,7 +6174,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
 
 
 def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
-    """Process a single dequeued Redis item (runs in a worker thread)."""
+    """处理一条从 Redis 取出的任务（跑在 worker 线程里）。"""
     if item.get("kind") == "sparse_session":
         _run_sparse_session(r, item, on_playable=on_playable)
         return
@@ -6096,7 +6203,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
         kind, item.get("kind"), redis_path, local_path, job_id, POD_IP, SVIEW_CLUSTER,
     )
 
-    # Cancelled before start → skip (do not steal lock).
+    # 开始前已取消 → 跳过（不去抢锁）。
     try:
         if is_cancel_requested(get_job_fields(r, job_id)):
             set_job_fields(
@@ -6114,10 +6221,10 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
         log.exception("Cancel pre-check failed for %s", job_id)
 
     if not acquire_job_lock(r, job_id):
-        # Another worker holds the lock — avoid double-transcode.
+        # 另一个 worker 持有锁 — 避免转码两遍。
         if SVIEW_CLUSTER:
             time.sleep(0.2)
-            # Re-queue only if lock vanished (winner crashed before claiming).
+            # 只有锁消失才重新入队（赢家在认领前崩溃）。
             from sview.jobs.job_status import get_lock_owner
             if get_lock_owner(r, job_id) is None and not is_cancel_requested(
                 get_job_fields(r, job_id)
@@ -6138,7 +6245,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
     started_at = time.time()
     encode_gate.register(job_id)
     _tls.encode_job_id = job_id
-    # Always start from a clean play cache so cancel/Lifecycle orphans cannot leave a hole.
+    # 总是从干净的播放缓存开始，避免取消或生命周期残留留下空洞。
     try:
         _clear_job_cache(job_id, purge_oss=True)
     except Exception:
@@ -6249,7 +6356,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
 
         if renewer.lost():
             raise LostJobLock("job lock lost")
-        # Final cancel check after encode returns.
+        # 编码返回后再做一次取消检查。
         if is_cancel_requested(get_job_fields(r, job_id)):
             raise JobCancelled("cancel requested")
 
@@ -6334,7 +6441,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
         except Exception:
             log.exception("Failed to finalize lost-lock for %s", job_id)
         log.error("Lost job lock, stopped: %s", job_id)
-        lock_held = False  # do not delete another pod's lock
+        lock_held = False  # 不要删掉别的 Pod 的锁
         if on_playable is not None and not playable_notified[0]:
             on_playable(job_id)
     except Exception as exc:
@@ -6349,7 +6456,7 @@ def _run_one_queue_job(r, item: dict, on_playable=None) -> None:
         except Exception:
             pass
         log.exception("Failed processing: %s", redis_path)
-        # Unblock scheduler so a failed pre-playable job does not stall the queue.
+        # 放开调度，避免可播前就失败的任务卡住队列。
         if on_playable is not None and not playable_notified[0]:
             on_playable(job_id)
     finally:
@@ -6409,7 +6516,7 @@ def run_redis_loop():
     from sview.jobs.job_status import POD_IP as _POD, parse_queue_item, set_worker_heartbeat
 
     lock = threading.Lock()
-    active: dict = {}  # job_id -> {"playable": bool, "thread": Thread}
+    active: dict = {}  # 键为 job_id，值是 {"playable": bool, "thread": Thread}
     wake = threading.Event()
     worker_id = f"{_POD}-{os.getpid()}"
     last_hb = [0.0]
@@ -6459,7 +6566,7 @@ def run_redis_loop():
 
     def _can_start_more() -> bool:
         with lock:
-            # Drop dead threads first so a finished job cannot block the queue.
+            # 先丢掉已死线程，避免结束的任务堵住队列。
             dead = [jid for jid, info in active.items() if not info["thread"].is_alive()]
             for jid in dead:
                 active.pop(jid, None)
@@ -6470,9 +6577,9 @@ def run_redis_loop():
                 return True
             if not OVERLAP_AFTER_PLAYABLE:
                 return False
-            # Start next once *every* currently running job is already playable
-            # (or only one running and it is playable). Avoids piling a 3rd job
-            # while an early job is still warming up.
+            # 当前每个在跑的任务都已经可播，才开下一个
+            # （或者只跑着一个，而且它可播）。避免更早的任务
+            # 还在预热时再叠上第三个。
             return all(info.get("playable") for info in active.values())
 
     while True:
@@ -6542,7 +6649,7 @@ def run_redis_loop():
                 )
                 t.start()
             else:
-                # Wait for playable/finished; timed wake keeps reaping healthy.
+                # 等到可播或结束；定时醒来，回收才不会停。
                 wake.wait(timeout=0.5)
                 wake.clear()
 
@@ -6564,11 +6671,11 @@ def run_redis_loop():
 
 
 # ---------------------------------------------------------------------------
-#  Entry point
+#  入口
 # ---------------------------------------------------------------------------
 
 def _start_http_server():
-    """Serve LOCAL_OUTPUT_DIR on HTTP_HOST:HTTP_PORT (see sview_http.py)."""
+    """在 HTTP_HOST:HTTP_PORT 上提供 LOCAL_OUTPUT_DIR（见 sview_http.py）。"""
     from sview.http.server import start_sview_http_server
     return start_sview_http_server(LOCAL_OUTPUT_DIR, host=HTTP_HOST, port=HTTP_PORT)
 
@@ -6629,7 +6736,7 @@ def main():
         TRANSCODE_BITRATE = args.bitrate
     if args.maxrate is not None:
         TRANSCODE_MAXRATE = args.maxrate
-        # Keep bufsize roughly in line with maxrate when overridden via CLI
+        # 用 CLI 覆盖时，让 bufsize 大致跟上 maxrate
         if args.bitrate and not os.environ.get("TRANSCODE_BUFSIZE") and args.bufsize is None:
             TRANSCODE_BUFSIZE = args.maxrate
     if args.bufsize is not None:
@@ -6663,7 +6770,7 @@ def main():
         raise SystemExit(f"Invalid SVIEW_ROLE={SVIEW_ROLE!r}; use all|master|worker")
 
     if role == "master":
-        # API / enqueue only — workers consume Redis.
+        # 只做 API / 入队 — worker 去消费 Redis。
         if _start_http_server() is None:
             raise SystemExit("HTTP server disabled (set HTTP_PORT>0)")
         log.info("Master mode: HTTP API only (no encode). Queue=%s", REDIS_QUEUE_KEY)
@@ -6683,10 +6790,10 @@ def main():
             log.info("Shutting down.")
         return
 
-    # Worker or all: Redis consumer. HTTP optional.
+    # 角色为 worker 或 all：消费 Redis。HTTP 可选。
     env_off = os.environ.get("HTTP_ENABLED", "1").lower() in ("0", "false", "no")
     if role == "worker":
-        # Encode-only by default; set HTTP_ENABLED=1 or --serve to also expose HTTP.
+        # 默认只编码；要同时提供 HTTP 就设 HTTP_ENABLED=1 或 --serve。
         want_http = (not args.no_serve) and (
             args.serve
             or os.environ.get("HTTP_ENABLED", "0").lower() in ("1", "true", "yes", "on")
@@ -6717,13 +6824,13 @@ def main():
 
 
 def _scale_dim(metas: dict, which: str) -> int:
-    """Output width/height for transcode + manifest.
+    """转码和清单用的输出宽高。
 
-    Priority:
-      1. TRANSCODE_SIZE > 0 → square (SIZE x SIZE)
-      2. TRANSCODE_WIDTH / TRANSCODE_HEIGHT if set for that axis
-      3. Source camera meta
-      4. Fallback 2096
+    优先级：
+      1. TRANSCODE_SIZE > 0 → 正方形（SIZE x SIZE）
+      2. 某一轴设了 TRANSCODE_WIDTH / TRANSCODE_HEIGHT 就用它
+      3. 相机源 meta
+      4. 兜底 2096
     """
     size = _tc_size()
     if size > 0:
@@ -6742,12 +6849,12 @@ def _scale_dim(metas: dict, which: str) -> int:
                 return int(m[key])
             except (TypeError, ValueError):
                 continue
-    # Fallback when meta not yet available
+    # 还没有 meta 时的兜底
     return 2096
 
 
 def _build_streams_manifest(metas: dict, fallback_w: int, fallback_h: int) -> dict:
-    """Build streams section of manifest; width/height are the transcoded output size."""
+    """生成清单里的 streams；宽高是转码后的输出尺寸。"""
     return build_streams_manifest(metas, fallback_w, fallback_h)
 
 

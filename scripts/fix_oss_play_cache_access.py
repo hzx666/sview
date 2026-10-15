@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Ensure browser can GET player-bin/* : merge CORS + public-read ACL on prefix.
+"""保证浏览器能 GET player-bin/*：合并 CORS，并给前缀加 public-read ACL。
 
-Uses env:
+使用环境变量：
   OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET
-  OSS_ENDPOINT (default https://oss-cn-shanghai.aliyuncs.com)
-  OSS_BUCKET (default ss-oss-data-platform)
-  OSS_CACHE_PREFIX (default player-bin)
+  OSS_ENDPOINT（默认 https://oss-cn-shanghai.aliyuncs.com）
+  OSS_BUCKET（默认 ss-oss-data-platform）
+  OSS_CACHE_PREFIX（默认 player-bin）
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ def main() -> int:
     auth = oss2.Auth(ak, sk)
     bucket = oss2.Bucket(auth, ENDPOINT, BUCKET)
 
-    # --- CORS merge ---
+    # --- 合并 CORS ---
     origins: list[str] = list(LOCAL_ORIGINS)
     methods = ["GET", "HEAD"]
     headers = ["*", "range", "origin", "content-type", "accept", "authorization", "x-oss-*"]
@@ -79,7 +79,7 @@ def main() -> int:
     bucket.put_bucket_cors(BucketCors([rule]))
     print("CORS updated origins=", origins)
 
-    # Public ACL often blocked (Block Public Access). Prefer Master signed redirect.
+    # 公共 ACL 经常被拦（Block Public Access）。优先走 Master 签名跳转。
     print(
         "Note: skip public-read ACL (bucket may deny). "
         "Use Master OSS_MEDIA_REDIRECT=1 → 302 signed GET instead."

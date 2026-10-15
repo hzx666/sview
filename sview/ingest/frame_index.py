@@ -1,4 +1,4 @@
-"""Exact aligned-frame timestamp index for sparse MCAP segment encoding."""
+"""按对齐帧精确记录时间戳，供稀疏 mcap 分段编码。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ INDEX_VERSION = 3
 
 
 class SparseIndexUnavailable(ValueError):
-    """The MCAP lacks native indexes required for bounded sparse seek."""
+    """mcap 缺少有界稀疏 seek 需要的原生索引。"""
 
 
 def _atomic_json(path: Path, data: dict[str, Any]) -> None:
@@ -38,7 +38,7 @@ def _atomic_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _annexb_has_random_access(data: bytes) -> bool:
-    """Recognize H.264 IDR and HEVC IDR/CRA access units."""
+    """识别 H.264 IDR 以及 HEVC 的 IDR/CRA AU。"""
     raw = bytes(data or b"")
     starts: list[tuple[int, int]] = []
     i = 0
@@ -71,8 +71,8 @@ def _aligned_payload(
         raise ValueError(f"no indexed video streams in {source}")
     frame_count = min(len(v) for v in nonempty.values())
     trimmed = {k: v[:frame_count] for k, v in sorted(nonempty.items())}
-    # Earliest per-stream timestamp lets process_mcap see every stream's frame N;
-    # per-stream anchors are applied again inside the ingest loop.
+    # 每路取最早时间戳，process_mcap 才能看到各流的第 N 帧；
+    # 各流锚点在 ingest 循环里会再套一次。
     anchors = [min(v[i] for v in trimmed.values()) for i in range(frame_count)]
     seg_n = 30
     return {
@@ -89,11 +89,10 @@ def _aligned_payload(
 
 
 def build_mcap_frame_index(source: str | Path) -> dict:
-    """Build exact ordinal timestamps from MCAP MessageIndex records only.
+    """只从 mcap MessageIndex 记录建精确的序号时间戳。
 
-    This reads the footer plus compact per-chunk indexes. It never walks or
-    decompresses video payloads. Segments are a fixed partition of those
-    indexed frames, so every frame belongs to exactly one segment.
+    只读文件尾和紧凑的逐 chunk 索引，不遍历、不解压视频 payload。
+    分段是这些已索引帧的固定切分，每一帧只属于一段。
     """
     path = Path(source)
     if path.suffix.lower() in (".hdf5", ".h5", ".hdf"):
@@ -193,7 +192,7 @@ def build_mcap_frame_index(source: str | Path) -> dict:
 
 
 def build_segment_table(frame_count: int, segment_frames: int = 30) -> list[list[int]]:
-    """Partition every frame into half-open segments. No MCAP payload is read."""
+    """把每一帧划进半开区间分段。不读 mcap payload。"""
     total = max(0, int(frame_count or 0))
     seg_n = max(1, int(segment_frames or 30))
     return [[start, min(total, start + seg_n)] for start in range(0, total, seg_n)]
@@ -204,7 +203,7 @@ def segment_for_frame(
     frame: int,
     segment_frames: int | None = None,
 ) -> tuple[int, int]:
-    """Return the one table segment that contains this global frame."""
+    """返回包含这一全局帧的那一段。"""
     total = int(index.get("frame_count") or 0)
     if total <= 0:
         raise ValueError("empty sparse frame index")
@@ -222,10 +221,9 @@ def find_sparse_decode_start(
     segment_frames: int,
     max_lookback_frames: int = 1800,
 ) -> int:
-    """Segment start from the index table.
+    """从索引表取分段起点。
 
-    The table is derived from MessageIndex frame counts. This does not open
-    the MCAP or inspect video payloads.
+    表来自 MessageIndex 的帧数。这里不打开 mcap，也不看视频 payload。
     """
     del source, max_lookback_frames
     start, _end = segment_for_frame(index, target_frame, segment_frames)
@@ -251,7 +249,7 @@ def load_or_build_frame_index(source: str | Path, index_path: str | Path) -> dic
 
 
 def sparse_anchor_map(index: dict, frame_index: int) -> dict[str, int]:
-    """Per-channel exact timestamp for one aligned global frame."""
+    """某一对齐全局帧在各通道上的精确时间戳。"""
     frame = max(0, min(int(frame_index), int(index["frame_count"]) - 1))
     return {
         str(ch): int(values[frame])

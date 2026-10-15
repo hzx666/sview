@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Map submitted source paths (OSS URI or legacy redis path) to local mount paths.
+把提交的源路径（OSS URI 或旧 redis 路径）映射到本地挂载路径。
 
-K8s is expected to mount:
-  original_data/ego_human_data/head_cam/  ->  HEAD_CAM_MOUNT  (default /head-data)
-  original_data/teleoperation/            ->  ORIN_MOUNT      (default /teleoperation)
-    (Orin / Agilex / Astribot / Franka / Unitree 同级，在挂载点下保留机体目录)
+K8s 应挂载：
+  original_data/ego_human_data/head_cam/  ->  HEAD_CAM_MOUNT  （默认 /head-data）
+  original_data/teleoperation/            ->  ORIN_MOUNT      （默认 /teleoperation）
+    （Orin / Agilex / Astribot / Franka / Unitree 同级，在挂载点下保留机体目录）
 
-Examples:
+示例：
   oss://ss-oss-data-platform/original_data/ego_human_data/head_cam/260706/001U_device/xxx.mcap
     -> /head-data/260706/001U_device/xxx.mcap
 
@@ -32,7 +32,7 @@ ORIN_MOUNT = Path(
 )
 _LEGACY_ORIN_MOUNT = Path("/orin-data")
 
-# Key prefixes after optional "oss://{bucket}/"
+# 可选 "oss://{bucket}/" 之后的 key 前缀
 _HEAD_CAM_KEY_PREFIXES = (
     "original_data/ego_human_data/head_cam/",
     "ego_human_data/head_cam/",
@@ -46,7 +46,7 @@ def _norm_mount(p: Path) -> str:
 
 
 def _strip_oss_scheme(raw: str) -> str:
-    """oss://bucket/key -> bucket/key; keep as path-like string."""
+    """oss://bucket/key → bucket/key；仍当路径字符串。"""
     s = raw.strip().replace("\\", "/")
     if s.startswith("oss://"):
         s = s[len("oss://") :]
@@ -55,15 +55,15 @@ def _strip_oss_scheme(raw: str) -> str:
 
 def _relative_after_prefix(key: str, prefixes: Tuple[str, ...]) -> Optional[str]:
     """
-    Match key as:
+    按下面两种形式匹配 key：
       {prefix}{rel}
       {bucket}/{prefix}{rel}
-    Return rel, or None.
+    返回 rel，否则 None。
     """
     for pref in prefixes:
         if key.startswith(pref):
             return key[len(pref) :].lstrip("/")
-        # bucket/prefix...
+        # bucket/前缀...
         slash = key.find("/")
         if slash > 0:
             rest = key[slash + 1 :]
@@ -73,7 +73,7 @@ def _relative_after_prefix(key: str, prefixes: Tuple[str, ...]) -> Optional[str]
 
 
 def _teleop_robot_and_rel(key: str) -> Optional[Tuple[str, str]]:
-    """Match teleoperation/{Robot}/{rel} → (Robot, rel)."""
+    """匹配 teleoperation/{Robot}/{rel} → (Robot, rel)。"""
     for name in _TELEOP_ROBOTS:
         prefixes = (
             f"original_data/teleoperation/{name}/",
@@ -86,12 +86,12 @@ def _teleop_robot_and_rel(key: str) -> Optional[Tuple[str, str]]:
 
 
 def ingest_family(raw_path: str) -> str:
-    """Which ingest pipeline this source belongs to.
+    """这条源走哪条 ingest 管线。
 
-    Returns ``head_cam`` | ``teleop`` | ``unknown``.
-    Path wins: ``ego_human_data/head_cam`` is always head-ring protobuf;
-    ``teleoperation/{Orin,Agilex,...}`` is always teleop (never protobuf fallback).
-    ``unknown`` is a file copied off the mount tree (CLI); callers may auto-detect.
+    返回 ``head_cam`` | ``teleop`` | ``unknown``。
+    路径优先：``ego_human_data/head_cam`` 一定是头环 protobuf；
+    ``teleoperation/{Orin,Agilex,...}`` 一定是遥操（不会回退成 protobuf）。
+    ``unknown`` 是拷出挂载树的文件（CLI）；调用方可自行探测。
     """
     kind, _mount, _rel = classify_source(raw_path)
     if kind in ("head_cam", "legacy"):
@@ -112,7 +112,7 @@ def ingest_family(raw_path: str) -> str:
 
 
 def teleop_robot(raw_path: str) -> Optional[str]:
-    """Orin / Agilex / Astribot / Franka / Unitree, or None."""
+    """Orin / Agilex / Astribot / Franka / Unitree，否则 None。"""
     kind, _mount, rel = classify_source(raw_path)
     if kind == "orin" and rel:
         name = rel.split("/")[0]
@@ -124,9 +124,9 @@ def teleop_robot(raw_path: str) -> Optional[str]:
 
 def classify_source(raw_path: str) -> Tuple[str, Path, str]:
     """
-    Returns (kind, mount_root, relative).
-    kind: 'head_cam' | 'orin' | 'legacy' | 'raw'
-    Teleop relative keeps the robot folder: ``Orin/260701/...``, ``Agilex/260825/...``.
+    返回 (kind, mount_root, relative)。
+    kind：'head_cam' | 'orin' | 'legacy' | 'raw'
+    遥操的 relative 保留机体目录：``Orin/260701/...``、``Agilex/260825/...``。
     """
     s = raw_path.strip().replace("\\", "/")
 
@@ -151,7 +151,7 @@ def classify_source(raw_path: str) -> Tuple[str, Path, str]:
         inner = f"{robot}/{rel}" if rel else robot
         return "orin", ORIN_MOUNT, inner
 
-    # Legacy queue path: /head-cam/...
+    # 旧队列路径：/head-cam/...
     legacy = s.lstrip("/")
     if legacy.startswith("head-cam/"):
         return "legacy", HEAD_CAM_MOUNT, legacy[len("head-cam/") :]
@@ -160,7 +160,7 @@ def classify_source(raw_path: str) -> Tuple[str, Path, str]:
 
 
 def source_to_local(raw_path: str) -> Path:
-    """Map OSS URI / legacy queue path / local path to a filesystem Path."""
+    """把 OSS URI / 旧队列路径 / 本地路径映射成文件系统 Path。"""
     kind, mount, rel = classify_source(raw_path)
     if not rel:
         p = Path(raw_path)
@@ -184,7 +184,7 @@ def source_to_local(raw_path: str) -> Path:
 
 
 def redis_path_to_local(redis_path: str) -> Path:
-    """Alias for existing worker call sites."""
+    """给现有 worker 调用点用的别名。"""
     return source_to_local(redis_path)
 
 

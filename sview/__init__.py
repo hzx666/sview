@@ -1,9 +1,9 @@
-"""SView backend package.
+"""SView 后端包。
 
-Layout:
-  http/     Master HTTP (enqueue, status, play cache)
-  worker/   CPU / GPU encode workers
-  ingest/   MCAP / HDF5 / Orin readers
-  jobs/     Redis job status and bench types
-  cache/    OSS play-cache GC and align
+目录：
+  http/     Master HTTP（入队、状态、播放缓存）
+  worker/   CPU / GPU 编码 worker
+  ingest/   mcap / HDF5 / Orin 读取
+  jobs/     Redis 任务状态和 bench 类型
+  cache/    OSS 播放缓存 GC 与对齐
 """

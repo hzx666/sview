@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bundle_frame v1 quad vs v2 named streams."""
+"""bundle_frame v1 四路与 v2 命名流。"""
 import json
 import struct
 import sys

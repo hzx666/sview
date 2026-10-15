@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Encode-from-T origin helpers and queue JSON."""
+"""从 T 秒起转的 origin 辅助函数与队列 JSON。"""
 import sys
 from pathlib import Path
 
@@ -37,7 +37,7 @@ def test_parse_and_job_id():
 
 
 def test_remaining_frames():
-    # 1 hour bag, jump to 50 min → ~10 min left
+    # 1 小时包，跳到 50 分钟 → 大约还剩 10 分钟
     t0 = 1_000_000_000
     t1 = t0 + 3600 * 1_000_000_000
     n = estimate_remaining_frames(108_000, 3000, t0, t1, fps=30)
@@ -321,7 +321,7 @@ def test_same_segment_does_not_take_another_worker_slot():
     assert len(redis.lists[REDIS_QUEUE_KEY]) == 1
     item = parse_queue_item(redis.lists[REDIS_QUEUE_KEY][0])
     assert item["client_id"] == "tab-a"
-    # A different segment still gets its own encode thread.
+    # 另一段仍然单独开编码线程。
     assert set_client_frontier(redis, "j", "tab-c", 90, segment_frames=30) == 90
     assert ensure_sparse_session(
         redis, "j", "oss://b/a.mcap", "tab-c", segment_frames=30
@@ -740,7 +740,200 @@ def test_session_waits_on_the_first_missing_segment():
         cpu_mod.encode_gate = previous
 
 
+def test_frames_before_random_access_counts_leading_p_frames():
+    from sview.worker.cpu import _frames_before_random_access
+
+    idr = b"\x00\x00\x00\x01\x65" + b"\x11" * 8
+    pframe = b"\x00\x00\x00\x01\x41" + b"\x22" * 8
+    assert _frames_before_random_access([idr, pframe]) == 0
+    assert _frames_before_random_access([pframe] * 13 + [idr]) == 13
+    assert _frames_before_random_access([pframe] * 30) == 30
+
+
+def test_sparse_session_index_failure_marks_job_failed():
+    import fnmatch
+
+    import sview.ingest.frame_index as frame_index_mod
+    import sview.ingest.hdf5_images as hdf5_mod
+    import sview.ingest.orin_images as orin_mod
+    from sview.jobs.job_status import (
+        get_job_fields,
+        job_redis_key,
+        segment_slot_key,
+        session_alive_key,
+    )
+    from sview.worker import cpu as cpu_mod
+
+    class Store:
+        def __init__(self):
+            self.hashes = {}
+            self.values = {}
+            self.lists = {}
+
+        def hgetall(self, key):
+            return dict(self.hashes.get(key, {}))
+
+        def hset(self, key, *args, mapping=None):
+            row = self.hashes.setdefault(key, {})
+            if mapping is not None:
+                row.update({k: str(v) for k, v in mapping.items()})
+            elif len(args) == 2:
+                row[args[0]] = str(args[1])
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def expire(self, key, ttl):
+            return key in self.values
+
+        def delete(self, *keys):
+            for key in keys:
+                self.values.pop(key, None)
+            return len(keys)
+
+        def scan(self, cursor=0, match=None, count=10):
+            keys = list(self.values) + list(self.hashes)
+            if match:
+                keys = [key for key in keys if fnmatch.fnmatch(key, match)]
+            return 0, keys
+
+        def srem(self, key, member):
+            return 0
+
+        def decrby(self, key, amount):
+            return 0
+
+        def lrange(self, key, start, end):
+            return list(self.lists.get(key, []))
+
+        def lrem(self, key, count, value):
+            return 0
+
+    def no_index(path, index_path):
+        raise frame_index_mod.SparseIndexUnavailable("mcap has no chunk index")
+
+    source = "oss://bucket/original_data/teleoperation/Unitree/clip.mcap"
+    job_id = "unitree_clip_c1"
+    redis = Store()
+    redis.hashes[job_redis_key(job_id)] = {"status": "queued", "source": source}
+    saved = (
+        cpu_mod.redis_path_to_local,
+        cpu_mod.ingest_family,
+        hdf5_mod.is_hdf5_file,
+        orin_mod.orin_stream_kind,
+        frame_index_mod.load_or_build_frame_index,
+    )
+    cpu_mod.redis_path_to_local = lambda s: Path("/nonexistent/clip.mcap")
+    cpu_mod.ingest_family = lambda s: "teleop"
+    hdf5_mod.is_hdf5_file = lambda p: False
+    orin_mod.orin_stream_kind = lambda p, skip_headcam_guard=False: "h264"
+    frame_index_mod.load_or_build_frame_index = no_index
+    try:
+        cpu_mod._run_sparse_session(
+            redis,
+            {"job_id": job_id, "source": source, "client_id": "tab-a", "segment_frames": 30},
+        )
+    finally:
+        (
+            cpu_mod.redis_path_to_local,
+            cpu_mod.ingest_family,
+            hdf5_mod.is_hdf5_file,
+            orin_mod.orin_stream_kind,
+            frame_index_mod.load_or_build_frame_index,
+        ) = saved
+    fields = get_job_fields(redis, job_id)
+    assert fields["status"] == "failed", fields
+    assert "no chunk index" in fields["error"]
+    assert session_alive_key(job_id, "tab-a") not in redis.values
+    assert segment_slot_key(job_id, 0) not in redis.values
+
+
+def test_headcam_pull_segment_defaults_to_headcam_channels():
+    from sview.worker.cpu import HEADCAM_CHANNELS, _HeadcamForwardRun
+
+    run = _HeadcamForwardRun(
+        local_path=Path("/nonexistent/headcam.mcap"),
+        job_id="hc",
+        source="oss://b/head_cam/x.mcap",
+        seg_n=30,
+    )
+    for ch in HEADCAM_CHANNELS:
+        run.frames[ch] = [b"f"] * 30
+        run.timestamps[ch] = list(range(30))
+    run._primed = True
+    run._read_one = lambda seek_back: (_ for _ in ()).throw(AssertionError("read past a full segment"))
+    run._pull_segment(30, lambda: False)
+    assert run.channels == list(HEADCAM_CHANNELS)
+
+
+def test_frames_before_first_idr_stay_empty_and_encoder_realigns():
+    from sview.worker.cpu import _TeleopForwardRun
+
+    idr = b"\x00\x00\x00\x01\x65" + b"\x11" * 8
+    pframe = b"\x00\x00\x00\x01\x41" + b"\x22" * 8
+
+    class FakeEncoder:
+        def __init__(self, log):
+            self.log = log
+
+        def encode_frames(self, frames, timeout=None, *, output_skip=0):
+            self.log.append((len(frames), output_skip))
+            return [b"out%d" % i for i in range(len(frames) - output_skip)]
+
+        def close(self):
+            pass
+
+    calls = {"a": [], "b": []}
+    restarts = []
+    run = _TeleopForwardRun(
+        kind="h264",
+        local_path=Path("/nonexistent/x.mcap"),
+        job_id="j",
+        source="oss://b/teleoperation/Orin/x.mcap",
+        seg_n=4,
+    )
+    run.channels = ["a", "b"]
+    run._primed = True
+    run.encoders = {ch: FakeEncoder(calls[ch]) for ch in run.channels}
+
+    def make(ch):
+        restarts.append(ch)
+        return FakeEncoder(calls[ch])
+
+    run._make_encoder = make
+
+    def feed(ch, frames):
+        run.frames[ch] = list(frames)
+        run.timestamps[ch] = list(range(len(frames)))
+
+    # a 从第 0 帧就有 IDR；b 的 IDR 在第 3 帧。
+    feed("a", [idr, pframe, pframe, pframe])
+    feed("b", [pframe, pframe, pframe, idr])
+    run._encode_blobs(4)
+    assert calls["b"] == [(1, 0)]
+    assert run._realign["b"] == [idr]
+
+    # 下一段：b 重开 ffmpeg，用上一段的尾巴预热；P 帧照常编。
+    feed("a", [pframe] * 4)
+    feed("b", [pframe] * 4)
+    run._encode_blobs(4)
+    assert restarts == ["b"]
+    assert calls["b"][-1] == (5, 1)
+    assert calls["a"] == [(4, 0), (4, 0)]
+    assert "b" not in run._realign
+
+
 if __name__ == "__main__":
+    test_frames_before_first_idr_stay_empty_and_encoder_realigns()
+    test_headcam_pull_segment_defaults_to_headcam_channels()
+    test_sparse_session_index_failure_marks_job_failed()
+    test_frames_before_random_access_counts_leading_p_frames()
     test_parse_and_job_id()
     test_remaining_frames()
     test_queue_json_origin()

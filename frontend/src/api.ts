@@ -12,21 +12,21 @@ export type Manifest = {
   job_id: string;
   format: string;
   publish_mode?: "progressive" | "sparse";
-  /** Latest sparse encode request accepted by the publisher. */
+  /** 发布端已接受的最新稀疏编码请求。 */
   segment_epoch?: number;
-  /** Monotonic shared-cache publication revision. */
+  /** 共享缓存发布版本，单调递增。 */
   manifest_revision?: number;
-  /** partial = still writing frames; done = complete */
+  /** 状态 partial = 还在写帧；done = 已完成 */
   status: string;
-  /** Optional OSS/CDN prefix for progressive play cache. */
+  /** 可选。边转边播缓存的 OSS/CDN 前缀。 */
   play_base?: string;
-  /** Seconds skipped from bag start (encode-from-T). */
+  /** 从包起点跳过的秒数（从 T 秒起转）。 */
   origin_sec?: number;
   bundle: {
     frame_count: number;
-    /** How many frames are on disk and fetchable (grows during progressive publish). */
+    /** 盘上已有、可以拉取的帧数（边转边播过程中会增长）。 */
     frames_available?: number;
-    /** Published sparse frame ranges using half-open [start, end) semantics. */
+    /** 已发布的稀疏帧区间，半开区间 [start, end)。 */
     available_ranges?: [number, number][];
     gop_size: number;
     key_frame_indices: number[];
@@ -58,7 +58,7 @@ export type BundleHeader = {
   events: { payload_offset: number; payload_length: number };
 };
 
-/** Packed batch of single-frame bundles (~gop_size / SEGMENT_FRAMES). */
+/** 打好包的单帧 bundle 批次（约 gop_size / SEGMENT_FRAMES）。 */
 export type SegmentHeader = {
   packet_schema: string;
   start_index: number;
@@ -78,9 +78,9 @@ export type JobStatus = {
   cached?: boolean;
   local_path?: string;
   updated_at?: string;
-  /** When set, frontend should fetch manifest/segments from this OSS prefix. */
+  /** 有值时，前端应从该 OSS 前缀拉 manifest 和 segment。 */
   play_base?: string;
-  /** 0–100 progress when frames_total known. */
+  /** 已知 frames_total 时的进度，0–100。 */
   percent?: number | null;
   cache_bytes?: number | null;
   last_access_at?: string | number | null;
@@ -128,13 +128,13 @@ export type EncodeRequest = {
   error?: string;
 };
 
-/** Head-cam four-up; teleop v2 uses Object.keys(manifest.streams) instead. */
+/** 头显四路；遥操 v2 改用 Object.keys(manifest.streams)。 */
 export const CHANNELS = ["rr", "fr", "rl", "fl"] as const;
 export type Channel = string;
 
 const HEAD_CAM_IDS = new Set<string>(CHANNELS);
 
-/** `rr` / `camera_rr` only. `camera_f_l/color/image_raw` is a teleop topic. */
+/** 只认 `rr` / `camera_rr`。`camera_f_l/color/image_raw` 是遥操 topic。 */
 function isHeadcamStreamKey(key: string): boolean {
   const low = key.toLowerCase();
   if (HEAD_CAM_IDS.has(low)) return true;
@@ -216,7 +216,7 @@ export function isManifestComplete(m: Manifest | null | undefined): boolean {
   return s === "done" || s === "ready";
 }
 
-/** Frame exists in timeline but not on disk yet (progressive publish). */
+/** 时间轴上有这一帧，盘上还没有（边转边播）。 */
 export class FramePendingError extends Error {
   readonly index: number;
   readonly httpStatus: number;
@@ -245,13 +245,13 @@ class SignedMediaPendingError extends Error {
 
 export class SviewApi {
   /**
-   * Prefer Master ?proxy=1 streaming. Used as fallback after signed-OSS fails,
-   * or when preferSignedOss is false.
+   * 优先走 Master ?proxy=1 拉流。签名 OSS 失败后的回退，
+   * 或 preferSignedOss 为 false 时使用。
    */
   forceMasterProxy = false;
   /**
-   * Browser → public OSS with Master-issued presigned URLs (short RTT).
-   * Default on; disables itself after CORS/403 and falls back to Master proxy.
+   * 浏览器直连公网 OSS，用 Master 签发的预签名 URL（RTT 短）。
+   * 默认开；遇到 CORS/403 会自己关掉，回退到 Master 代理。
    */
   preferSignedOss = true;
   private signedUrlCache = new Map<string, { url: string; expMs: number }>();
@@ -259,10 +259,10 @@ export class SviewApi {
 
   constructor(
     public baseUrl: string,
-    /** When set, anonymous OSS prefix (rare; private buckets need signed). */
+    /** 有值时为匿名 OSS 前缀（少见；私有桶需要签名）。 */
     public mediaBase: string = "",
   ) {
-    // Opt out: ?media=proxy  → Master stream only; ?media=signed → force signed OSS
+    // 关掉：?media=proxy → 只走 Master 流；?media=signed → 强制签名 OSS
     try {
       const m = new URLSearchParams(location.search).get("media")?.toLowerCase();
       if (m === "proxy" || m === "master") {
@@ -273,7 +273,7 @@ export class SviewApi {
         this.forceMasterProxy = false;
       }
     } catch {
-      /* non-browser */
+      /* 非浏览器 */
     }
   }
 
@@ -294,8 +294,8 @@ export class SviewApi {
     if (!this.preferSignedOss) return;
     console.warn(`[sview] signed OSS disabled (${reason}); falling back to Master`);
     this.preferSignedOss = false;
-    // A same-origin Vite/Nginx proxy can follow Master's OSS redirect server-side,
-    // avoiding bucket CORS without forcing the slower ?proxy=1 path.
+    // 同源 Vite/Nginx 代理可以在服务端跟随 Master 的 OSS 跳转，
+    // 避开桶的 CORS，也不必走更慢的 ?proxy=1。
     try {
       const apiOrigin = new URL(this.baseUrl || location.origin, location.href).origin;
       this.forceMasterProxy = apiOrigin !== location.origin;
@@ -309,7 +309,7 @@ export class SviewApi {
     return `${jobId}:${startIndex}`;
   }
 
-  /** Presign upcoming segment starts (batched). Safe to call often — uses cache. */
+  /** 给即将用到的 segment 起点预签名（批量）。可频繁调用，走缓存。 */
   async prefetchSignedSegmentUrls(
     jobId: string,
     starts: number[],
@@ -329,7 +329,7 @@ export class SviewApi {
     if (need.length === 0) return;
 
     const run = async () => {
-      // Chunk to API max 32
+      // 按 API 上限 32 分批
       for (let i = 0; i < need.length; i += 32) {
         const batch = need.slice(i, i + 32);
         const q = new URLSearchParams({
@@ -364,7 +364,7 @@ export class SviewApi {
       }
     };
 
-    // Coalesce concurrent callers: join in-flight, then retry need (may be empty).
+    // 合并并发调用：先加入在途请求，再重试 need（可能已空）。
     while (this.signedInflight) {
       await this.signedInflight.catch(() => undefined);
       if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
@@ -415,7 +415,7 @@ export class SviewApi {
           fetchUrl = `${location.origin}/sview-oss${signed.pathname}${signed.search}`;
         }
       } catch {
-        /* use direct signed URL */
+        /* 直接用签名 URL */
       }
       const res = await fetch(fetchUrl, {
         cache: "no-store",
@@ -434,7 +434,7 @@ export class SviewApi {
       return { ok: false, fatal: true };
     } catch (e) {
       if (e instanceof DOMException && e.name === "AbortError") throw e;
-      // Typical: CORS missing on bucket
+      // 常见原因：桶没配 CORS
       this.disableSignedOss(e instanceof Error ? e.message : "OSS fetch failed");
       return { ok: false, fatal: true };
     }
@@ -519,8 +519,8 @@ export class SviewApi {
   }
 
   /**
-   * Wait until playable via SSE, then poll if SSE cannot connect (ACS Ingress
-   * often buffers EventSource until the stream ends).
+   * 先用 SSE 等到可播，连不上再轮询（ACS Ingress
+   * 经常把 EventSource 缓冲到流结束）。
    */
   async waitUntilPlayable(
     jobId: string,
@@ -530,7 +530,7 @@ export class SviewApi {
       minFrames?: number;
       onTick?: (s: JobStatus) => void;
       preferSse?: boolean;
-      /** Default true: EventSource 失败后改轮询 GET /api/jobs/{id}。 */
+      /** 默认 true：EventSource 失败后改轮询 GET /api/jobs/{id}。 */
       allowPollFallback?: boolean;
     } = {},
   ): Promise<JobStatus> {
@@ -544,7 +544,7 @@ export class SviewApi {
       if (s.status === "cancelled") throw new Error(s.error || "job cancelled");
       if (s.status === "ready" || s.cached) return true;
       const done = s.frames_done ?? 0;
-      // Require a real frame lead before start — API playable(~30) alone is too thin.
+      // 起播前要有真实的帧领先量——单靠 API playable（约 30）太薄。
       return done >= minFrames;
     };
 
@@ -638,7 +638,7 @@ export class SviewApi {
         onPayload((ev as MessageEvent).data);
       });
       es.onerror = () => {
-        // EventSource readyState: 0 CONNECTING, 1 OPEN, 2 CLOSED
+        // EventSource readyState：0 连接中，1 已打开，2 已关闭
         const state = es.readyState;
         finish(() =>
           reject(
@@ -678,7 +678,7 @@ export class SviewApi {
     throw new Error("timeout waiting for job ready");
   }
 
-  /** Drop anonymous OSS mediaBase after 403/CORS so later segment/frame calls hit Master. */
+  /** 403/CORS 后丢掉匿名 OSS mediaBase，之后的 segment/帧请求改打 Master。 */
   private disableOssMedia(reason: string) {
     if (!this.mediaBase) return;
     console.warn(`[sview] OSS media disabled (${reason}); falling back to Master`);
@@ -722,7 +722,7 @@ export class SviewApi {
         signal: opts.signal,
       });
       if (res.ok) {
-        // After a cross-origin 302, some browsers leave a non-JSON body — validate explicitly.
+        // 跨域 302 之后，有的浏览器会留下非 JSON 正文——这里显式校验。
         return await this.readJsonManifest(res);
       }
       const detail = await res.text();
@@ -808,7 +808,7 @@ export class SviewApi {
           joinUrl(this.baseUrl, `/api/jobs/${jobId}/frames/${name}`),
           joinUrl(this.baseUrl, `/${jobId}/frames/${name}`),
         ];
-    // Progressive publish: keep waiting longer; UI shows loading, not 404.
+    // 边转边播：多等一会儿；界面显示加载中，不当 404。
     const retries = opts.retries ?? 120;
     let lastStatus = 0;
     for (let attempt = 0; attempt <= retries; attempt++) {
@@ -837,8 +837,8 @@ export class SviewApi {
   }
 
   /**
-   * Fetch via Master. Prefer ?proxy=1 when forceMasterProxy (Vite /sview) or after
-   * a failed 302; otherwise try plain URL first then proxy fallback.
+   * 经 Master 拉取。forceMasterProxy（Vite /sview）或 302 失败后优先 ?proxy=1；
+   * 否则先试普通 URL，再回退代理。
    */
   private async fetchSegmentViaMaster(
     jobId: string,
@@ -884,7 +884,7 @@ export class SviewApi {
         }
         lastStatus = got.status;
         if (got.retryable) return got;
-        // Non-retryable on plain URL → try proxy next; on proxy already tried → fail.
+        // 普通 URL 上不可重试 → 再试代理；代理也试过了 → 失败。
       }
       if (lastStatus) return { ok: false, status: lastStatus, retryable: false };
     }
@@ -892,8 +892,8 @@ export class SviewApi {
   }
 
   /**
-   * Fetch a packed segment of ~30 consecutive frames.
-   * `startIndex` must be a multiple of segment size (0, 30, 60, …).
+   * 拉取打包好的一段，约 30 个连续帧。
+   * `startIndex` 必须是段长的倍数（0、30、60…）。
    */
   async fetchSegment(
     jobId: string,
@@ -908,7 +908,7 @@ export class SviewApi {
     const retries = opts.retries ?? 120;
     let lastStatus = 0;
     for (let attempt = 0; attempt <= retries; attempt++) {
-      // 1) Anonymous play_base (only if set and public-readable)
+      // 1) 匿名 play_base（仅当已设置且可公开读）
       const ossBase = (this.mediaBase || "").replace(/\/+$/, "");
       if (ossBase) {
         const ossPath = this.mediaUrl(`/segments/${name}`);
@@ -938,7 +938,7 @@ export class SviewApi {
         }
       }
 
-      // 2) Presigned public OSS (browser direct — preferred)
+      // 2) 预签名公网 OSS（浏览器直连，优先）
       if (this.preferSignedOss) {
         const signed = await this.fetchSegmentViaSignedOss(
           jobId,
@@ -946,7 +946,7 @@ export class SviewApi {
           opts.signal,
         );
         if ("fatal" in signed) {
-          // preferSignedOss already cleared; fall through to Master
+          // 此时 preferSignedOss 已经清掉；落到 Master
         } else if (signed.ok) {
           return signed.buf;
         } else if (signed.retryable) {
@@ -957,7 +957,7 @@ export class SviewApi {
         }
       }
 
-      // 3) Master stream / 302 fallback
+      // 3) Master 流 / 302 回退
       const got = await this.fetchSegmentViaMaster(jobId, name, opts.signal);
       if (got.ok) return got.buf;
       lastStatus = got.status;

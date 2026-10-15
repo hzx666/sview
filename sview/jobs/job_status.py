@@ -23,6 +23,9 @@ SEGMENT_PENDING_PREFIX = os.environ.get(
 SEGMENT_LOCK_PREFIX = os.environ.get(
     "SVIEW_SEGMENT_LOCK_PREFIX", "sview:segment:lock:"
 )
+SEGMENT_SLOT_PREFIX = os.environ.get(
+    "SVIEW_SEGMENT_SLOT_PREFIX", "sview:segment:slot:"
+)
 ENCODE_REQUEST_PREFIX = os.environ.get(
     "SVIEW_ENCODE_REQUEST_PREFIX", "sview:encode:request:"
 )
@@ -117,6 +120,11 @@ def segment_pending_key(job_id: str, start: int) -> str:
 
 def segment_lock_key(job_id: str, start: int) -> str:
     return f"{SEGMENT_LOCK_PREFIX}{job_id}:{int(start)}"
+
+
+def segment_slot_key(job_id: str, start: int) -> str:
+    """One worker slot for a segment, shared by every window waiting on it."""
+    return f"{SEGMENT_SLOT_PREFIX}{job_id}:{int(start)}"
 
 
 def encode_request_key(job_id: str, request_id: str) -> str:
@@ -500,6 +508,170 @@ def list_cache_jobs(r) -> list:
         if x:
             out.append(x)
     return sorted(out)
+
+
+def _scan_keys(r, pattern: str) -> list[str]:
+    """Return keys matching a Redis glob. Empty when the client cannot scan."""
+    if not hasattr(r, "scan"):
+        return []
+    found: list[str] = []
+    cursor: Any = 0
+    while True:
+        cursor, keys = r.scan(cursor=cursor, match=pattern, count=200)
+        for key in keys or []:
+            if isinstance(key, bytes):
+                key = key.decode("utf-8", errors="replace")
+            found.append(str(key))
+        if cursor in (0, "0", b"0"):
+            break
+    return found
+
+
+def _delete_keys(r, keys: list[str]) -> None:
+    for key in keys:
+        try:
+            r.delete(key)
+        except Exception:
+            pass
+
+
+def _clear_job_runtime_keys(r, job_id: str) -> None:
+    """Drop locks, sessions, and segment claims. Keep the job hash itself."""
+    exact = [
+        lock_redis_key(job_id),
+        job_active_key(job_id),
+        f"sview:frame-index:lock:{job_id}",
+        f"sview:manifest:lock:{job_id}",
+    ]
+    patterns = [
+        f"{SEGMENT_PENDING_PREFIX}{job_id}:*",
+        f"{SEGMENT_LOCK_PREFIX}{job_id}:*",
+        f"{SEGMENT_SLOT_PREFIX}{job_id}:*",
+        f"{ENCODE_REQUEST_PREFIX}{job_id}:*",
+        f"{SEGMENT_SUBSCRIBERS_PREFIX}{job_id}:*",
+        f"sview:session:alive:{job_id}:*",
+        f"sview:session:pending:{job_id}:*",
+        f"sview:session:frontier:{job_id}:*",
+    ]
+    keys = list(exact)
+    for pattern in patterns:
+        keys.extend(_scan_keys(r, pattern))
+    _delete_keys(r, keys)
+
+
+def _drop_queued_job(r, job_id: str, source: str = "") -> None:
+    """Remove queue items that would start this job again."""
+    try:
+        items = r.lrange(REDIS_QUEUE_KEY, 0, -1) or []
+    except Exception:
+        return
+    source = (source or "").strip()
+    for raw in items:
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else str(raw)
+        matched = bool(source) and text.strip() == source
+        if not matched and text.startswith("{"):
+            try:
+                data = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                data = {}
+            matched = str(data.get("job_id") or "") == job_id
+        if matched:
+            try:
+                r.lrem(REDIS_QUEUE_KEY, 1, raw)
+            except Exception:
+                pass
+
+
+def jobs_matching_source(r, source: str) -> list[str]:
+    """Existing job ids whose stored source is this path.
+
+    Sparse ids include a file-stat digest, so a missing file computes a
+    different id than the job created when the file was present.
+    """
+    source = (source or "").strip()
+    if not source:
+        return []
+    stem = job_id_from_source(source)
+    ids: list[str] = []
+    for key in _scan_keys(r, f"{JOB_KEY_PREFIX}{stem}*"):
+        if not key.startswith(JOB_KEY_PREFIX):
+            continue
+        job_id = key[len(JOB_KEY_PREFIX) :]
+        if (get_job_fields(r, job_id).get("source") or "").strip() == source:
+            ids.append(job_id)
+    return ids
+
+
+def fail_job(
+    r,
+    job_id: str,
+    error: str,
+    *,
+    source: str = "",
+    publish_mode: str = "",
+) -> dict:
+    """Mark one job failed, keep the error, and drop its Redis playback state."""
+    message = (error or "failed").strip()[:500]
+    _clear_job_runtime_keys(r, job_id)
+    _drop_queued_job(r, job_id, source)
+    fields = get_job_fields(r, job_id)
+    try:
+        nbytes = int(fields.get("cache_bytes") or 0)
+    except (TypeError, ValueError):
+        nbytes = 0
+    try:
+        remove_cache_job(r, job_id, nbytes)
+    except Exception:
+        pass
+    patch: dict[str, Any] = {
+        "status": "failed",
+        "error": message,
+        "playable": 0,
+        "frames_done": 0,
+        "frames_total": 0,
+        "frame_count": 0,
+        "available_ranges": "[]",
+        "segments_ready_count": 0,
+        "encode_status": "failed",
+        "encode_window": "",
+        "encode_frontier": "",
+        "decode_start": "",
+        "input_frames": "",
+        "output_frames": "",
+        "play_base": "",
+        "cache_bytes": 0,
+        "cache_status": "",
+        "owner_pod": "",
+        "cancel": 0,
+        "finished_at": f"{time.time():.6f}",
+    }
+    if source:
+        patch["source"] = source
+    if publish_mode:
+        patch["publish_mode"] = publish_mode
+    set_job_fields(r, job_id, **patch)
+    return get_job_fields(r, job_id)
+
+
+def fail_submit(
+    r,
+    job_id: str,
+    source: str,
+    error: str,
+    *,
+    publish_mode: str = "",
+) -> list[str]:
+    """Fail this submit and any older Redis job for the same source."""
+    ids: list[str] = []
+    try:
+        ids = jobs_matching_source(r, source)
+    except Exception:
+        ids = []
+    if job_id and job_id not in ids:
+        ids.append(job_id)
+    for jid in ids:
+        fail_job(r, jid, error, source=source, publish_mode=publish_mode)
+    return ids
 
 
 def remove_cache_job(r, job_id: str, nbytes: int = 0) -> None:
@@ -1031,6 +1203,80 @@ def set_client_frontier(
     return origin
 
 
+def claim_segment_slot(
+    r,
+    job_id: str,
+    start: int,
+    client_id: str,
+    *,
+    ttl: int = 180,
+) -> bool:
+    """Claim the single worker slot for one segment.
+
+    The same window may renew its own claim. Another window must wait for the
+    published segment instead of taking a second inflight thread.
+    """
+    client_id = (client_id or "anonymous")[:128]
+    key = segment_slot_key(job_id, start)
+    ttl = max(30, int(ttl))
+    if r.set(key, client_id, nx=True, ex=ttl):
+        return True
+    current = r.get(key)
+    if isinstance(current, bytes):
+        current = current.decode("utf-8", errors="replace")
+    if current == client_id:
+        try:
+            r.expire(key, ttl)
+        except Exception:
+            r.set(key, client_id, ex=ttl)
+        return True
+    return False
+
+
+def release_segment_slot(r, job_id: str, start: int, client_id: str) -> None:
+    client_id = (client_id or "anonymous")[:128]
+    key = segment_slot_key(job_id, start)
+    current = r.get(key)
+    if isinstance(current, bytes):
+        current = current.decode("utf-8", errors="replace")
+    if current == client_id:
+        r.delete(key)
+
+
+def first_unencoded_segment(
+    r,
+    job_id: str,
+    client_id: str,
+    segment_frames: int = 30,
+) -> Optional[int]:
+    """First missing segment at or after this window's frontier.
+
+    None means every segment through frame_count is already published.
+    """
+    from sview.cache.oss_cache_gc import frame_range_ready
+
+    seg_n = max(1, int(segment_frames or 30))
+    frontier = read_client_frontier(r, job_id, client_id)
+    seg = (frontier // seg_n) * seg_n
+    fields = get_job_fields(r, job_id)
+    try:
+        total = int(fields.get("frame_count") or fields.get("frames_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        ranges = json.loads(fields.get("available_ranges") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        ranges = []
+    guard = 0
+    while guard < 10000 and (total <= 0 or seg < total):
+        end = min(total, seg + seg_n) if total > 0 else seg + seg_n
+        if total <= 0 or end <= seg or not frame_range_ready(ranges, seg, end):
+            return seg
+        seg += seg_n
+        guard += 1
+    return None
+
+
 def ensure_sparse_session(
     r,
     job_id: str,
@@ -1039,12 +1285,21 @@ def ensure_sparse_session(
     *,
     segment_frames: int = 30,
 ) -> bool:
-    """Queue at most one encode thread for this playback window.
+    """Queue one encode thread for this window's next missing segment.
 
-    A later seek only updates the frontier. A different client_id is another window.
+    A later seek on the same window only moves that window's frontier.
+    Another window whose next segment already has an encode slot does not
+    take a worker inflight place; it waits until that segment is published.
     """
     client_id = (client_id or "anonymous")[:128]
     if r.get(session_alive_key(job_id, client_id)):
+        return False
+    if r.get(session_pending_key(job_id, client_id)):
+        return False
+    target = first_unencoded_segment(r, job_id, client_id, segment_frames)
+    if target is None:
+        return False
+    if not claim_segment_slot(r, job_id, target, client_id):
         return False
     if not r.set(session_pending_key(job_id, client_id), "1", nx=True, ex=120):
         return False

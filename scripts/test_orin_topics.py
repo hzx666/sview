@@ -106,6 +106,27 @@ def test_unknown_teleop_topics_keep_names():
     assert not _harvest_channel_ok("/camera/RR/video", "headcam.Video")
     assert not _harvest_channel_ok("/master/joint_left", "sensor_msgs/msg/JointState")
 
+    from sview.ingest.orin_images import classify_teleop_forward_topic
+
+    assert classify_teleop_forward_topic(
+        "/camera/f_l/h264", "sensor_msgs/msg/CompressedImage", kind="h264",
+    ) == "video"
+    assert classify_teleop_forward_topic(
+        "/frontvideostream", "sensor_msgs/msg/Image", kind="jpeg",
+    ) == "video"
+    assert classify_teleop_forward_topic(
+        "/imu/data", "sensor_msgs/msg/Imu", kind="h264",
+    ) == "imu"
+    assert classify_teleop_forward_topic(
+        "/camera/f_l/camera_info", "sensor_msgs/msg/CameraInfo", kind="jpeg",
+    ) == "meta"
+    assert classify_teleop_forward_topic(
+        "/master/joint_left", "sensor_msgs/msg/JointState", kind="h264",
+    ) is None
+    assert classify_teleop_forward_topic(
+        "/camera/RR/video", "headcam.Video", kind="h264",
+    ) is None
+
     unitree = {"/frontvideostream": 100, "/joint_states": 5000}
     assert orin_frame_count_from_channel_counts(unitree, "jpeg") == 100
 

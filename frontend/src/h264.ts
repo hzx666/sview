@@ -32,7 +32,10 @@ export function hasIdr(data: Uint8Array): boolean {
   return findNals(data).some((n) => n.type === 5);
 }
 
-export function extractSpsPps(data: Uint8Array): { sps: Uint8Array; pps: Uint8Array } | null {
+export function extractSpsPps(
+  data: Uint8Array | undefined | null,
+): { sps: Uint8Array; pps: Uint8Array } | null {
+  if (!data?.length) return null;
   const nals = findNals(data);
   let sps: Uint8Array | null = null;
   let pps: Uint8Array | null = null;

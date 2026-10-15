@@ -4337,6 +4337,10 @@ class SparseSegmentAborted(BaseException):
     """Stop a sparse segment without publishing it."""
 
 
+class McapEnded(Exception):
+    """The open MCAP yielded no more messages before the segment was full."""
+
+
 def _rewrite_bundle_global_index(blob: bytes, frame_index: int) -> bytes:
     """Rewrite only bundle header.frame_index, preserving encoded payload bytes."""
     if len(blob) < 8:
@@ -5323,7 +5327,7 @@ class _HeadcamForwardRun:
         try:
             msg = next(self._messages)
         except StopIteration as exc:
-            raise RuntimeError(
+            raise McapEnded(
                 f"mcap ended before aligned frames at {self.next_frame}"
             ) from exc
         topic = msg.topic or ""
@@ -5427,10 +5431,16 @@ class _HeadcamForwardRun:
         return True
 
     def _pull_segment(self, need: int, seek_back) -> None:
+        # One message at a time. The previous helper treated the sum of every
+        # channel as a per-channel target, so the last segment read to EOF and
+        # then failed even when this segment was already complete.
         while not self._segment_ready(need):
-            before = sum(len(v) for v in self.frames.values())
-            self._pull_until(before + 1 if self.channels else need, seek_back)
-            # _pull_until waits for a raw count. Loop until the segment anchor is covered.
+            try:
+                self._read_one(seek_back)
+            except McapEnded:
+                if self._segment_ready(need):
+                    return
+                raise
 
     def _encode_blobs(self, need: int) -> list[bytes]:
         assert self.encoders is not None
@@ -5608,6 +5618,14 @@ class _HeadcamForwardRun:
             log.info("[%s] forward run dropped; seek left frame %d", self.job_id, self.open_frame)
             self.close()
             return "seek"
+        except McapEnded:
+            counts = {ch: len(self.frames.get(ch) or []) for ch in self.channels}
+            log.info(
+                "[%s] mcap ended before frame %d; buffered=%s",
+                self.job_id, start, counts,
+            )
+            self.close()
+            return "end"
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, SystemExit)):
                 raise
@@ -5633,13 +5651,171 @@ class _HeadcamForwardRun:
                 log.exception("[%s] release segment claim failed", self.job_id)
 
 
+class _TeleopForwardRun(_HeadcamForwardRun):
+    """ROS2 teleop forward read. Same persistent file and ffmpeg as head-cam.
+
+    HDF5 never uses this path. Video, camera info, and IMU are the only
+    topics decoded; IMU samples are packed into each segment bin.
+    """
+
+    def __init__(self, *, kind: str, local_path: Path, job_id: str, source: str, seg_n: int):
+        super().__init__(
+            local_path=local_path,
+            job_id=job_id,
+            source=source,
+            seg_n=seg_n,
+        )
+        self.kind = (kind or "").strip().lower()
+
+    def open_at(self, start: int, frame_index: dict) -> None:
+        from sview.ingest.frame_index import sparse_anchor_map
+        from sview.ingest.orin_images import iter_teleop_forward
+
+        self.close()
+        self.closed = False
+        self.index = frame_index
+        total = int(frame_index.get("frame_count") or 0)
+        if total and start >= total:
+            raise ValueError(f"segment start {start} past frame_count {total}")
+        lookback = 0 if self.kind == "jpeg" else min(int(start), 120)
+        origin = int(start) - lookback
+        self._seg_anchors = sparse_anchor_map(frame_index, start)
+        origin_anchors = (
+            sparse_anchor_map(frame_index, origin)
+            if origin != int(start)
+            else self._seg_anchors
+        )
+        self._anchors = origin_anchors
+        self._floor = _forward_read_floor(origin_anchors)
+        self._primed = False
+        self._seek_check_at = 0.0
+        self.open_frame = int(start)
+        self.next_frame = int(start)
+        self.frames = defaultdict(list)
+        self.timestamps = defaultdict(list)
+        self.imu = []
+        self.metas = {}
+        indexed = list((frame_index.get("channels") or {}).keys())
+        self.channels = [ch for ch in indexed if ch in self._seg_anchors] or list(self._seg_anchors)
+        self._messages = iter_teleop_forward(
+            self.path,
+            self.kind,
+            start_time_ns=self._floor or None,
+        )
+        log.info(
+            "[%s] teleop forward run opened at frame %d kind=%s floor=%d channels=%d",
+            self.job_id,
+            start,
+            self.kind,
+            self._floor,
+            len(self.channels),
+        )
+
+    def _pull_until(self, need: int, seek_back) -> None:
+        if not self.channels:
+            self._read_one(seek_back)
+            return
+        while min(len(self.frames[ch]) for ch in self.channels) < need:
+            self._read_one(seek_back)
+
+    def _read_one(self, seek_back) -> None:
+        now = time.monotonic()
+        if now - self._seek_check_at >= 0.1:
+            self._seek_check_at = now
+            if seek_back():
+                raise SparseSegmentAborted()
+        try:
+            event = next(self._messages)
+        except StopIteration as exc:
+            raise McapEnded(
+                f"mcap ended before aligned frames at {self.next_frame}"
+            ) from exc
+        tag = event[0]
+        if tag == "imu":
+            row = dict(event[1])
+            if not self._accept_ts(row.get("log_time_ns"), None):
+                return
+            row["sample_index"] = len(self.imu)
+            self.imu.append(row)
+            return
+        if tag != "video":
+            return
+        _tag, ch, data, ts, meta = event
+        if self.channels and ch not in self.channels:
+            return
+        if not self.channels:
+            self.channels = [ch]
+        if ch not in self.metas and meta:
+            self.metas[ch] = dict(meta)
+        if not self._accept_ts(ts, ch):
+            return
+        self.frames[ch].append(data)
+        self.timestamps[ch].append(int(ts))
+
+    def _ensure_encoders(self) -> None:
+        if self.encoders is not None:
+            return
+        if _resize_requested():
+            _apply_output_scale(self.metas)
+        sw = _scale_dim(self.metas, "w")
+        sh = _scale_dim(self.metas, "h")
+        ovr = getattr(_tls, "override", None)
+        encoders: dict = {}
+        n_threads = _live_worker_threads(len(self.channels) or 1)
+
+        def _one(ch: str):
+            meta = self.metas.get(ch) or {}
+            fps = float(meta.get("fps") or 30)
+            if self.kind == "jpeg":
+                return ch, LiveX264Encoder.jpeg(
+                    scale_w=sw,
+                    scale_h=sh,
+                    job_id=self.job_id,
+                    fps=fps,
+                    crf=_tc_crf(),
+                    direct=ORIN_DIRECT,
+                    threads=n_threads,
+                )
+            codec = meta.get("codec") or "h264"
+            return ch, LiveX264Encoder.annexb(
+                codec=str(codec),
+                scale_w=sw,
+                scale_h=sh,
+                job_id=self.job_id,
+                fps=fps,
+                gop=self.seg_n,
+                threads=n_threads,
+            )
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, len(self.channels))) as pool:
+                futs = [pool.submit(_tls_call, ovr, _one, ch) for ch in self.channels]
+                for fut in as_completed(futs):
+                    ch, enc = fut.result()
+                    encoders[ch] = enc
+            self.encoders = encoders
+            log.info(
+                "[%s] teleop forward ffmpeg x%d kind=%s gop=%d threads=%d",
+                self.job_id, len(encoders), self.kind, self.seg_n, n_threads,
+            )
+        except Exception:
+            _close_live_encoders(encoders)
+            raise
+
+
 def _run_sparse_session(r, item: dict, on_playable=None) -> None:
     """One encode thread for one playback window. Seek only moves its frontier."""
     from sview.jobs.job_status import (
         POD_IP,
+        claim_segment_slot,
+        first_unencoded_segment,
         get_job_fields,
         read_client_frontier,
+        release_segment_slot,
         segment_lock_key,
+        segment_slot_key,
         session_alive_key,
         session_pending_key,
     )
@@ -5655,17 +5831,48 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
         log.info("[%s] encode session already running for window %s", job_id, client_id)
         return
     r.delete(session_pending_key(job_id, client_id))
-    log.info("[%s] encode session started for window %s", job_id, client_id)
-    renewer = _RedisValueLockRenewer(r, alive, owner, ttl=60)
+    target = first_unencoded_segment(r, job_id, client_id, seg_n)
+    if target is None or not claim_segment_slot(r, job_id, target, client_id):
+        # Another window already holds this segment's only worker slot.
+        current = r.get(alive)
+        if isinstance(current, bytes):
+            current = current.decode("utf-8", errors="replace")
+        if current == owner:
+            r.delete(alive)
+        log.info(
+            "[%s] window %s waits for segment %s without taking a worker slot",
+            job_id,
+            client_id,
+            target,
+        )
+        return
+    log.info(
+        "[%s] encode session started for window %s segment %d",
+        job_id, client_id, target,
+    )
+    held = target
+    renewer = _RedisValueLockRenewer(
+        r,
+        alive,
+        owner,
+        ttl=60,
+        also=[(segment_slot_key(job_id, held), client_id)],
+    )
     renewer.start()
     fail_counts: dict[int, int] = {}
     retry_after: dict[int, float] = {}
     forward: _HeadcamForwardRun | None = None
     local_path = redis_path_to_local(source)
-    use_forward = (
-        ingest_family(source) == "head_cam"
-        and local_path.suffix.lower() not in (".hdf5", ".h5", ".hdf")
-    )
+    family = ingest_family(source)
+    from sview.ingest.hdf5_images import is_hdf5_file
+
+    teleop_kind = ""
+    use_forward = family == "head_cam" and not is_hdf5_file(local_path)
+    if family == "teleop" and not is_hdf5_file(local_path):
+        from sview.ingest.orin_images import orin_stream_kind
+
+        teleop_kind = orin_stream_kind(local_path, skip_headcam_guard=True) or ""
+        use_forward = teleop_kind in ("h264", "jpeg")
     try:
         idle = 0
         while idle < 10:
@@ -5699,6 +5906,22 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                     client_id,
                     skipped,
                 )
+            if (
+                nxt is None
+                and blocked
+                and skipped_locked
+                and any(
+                    not claim_segment_slot(r, job_id, seg, client_id)
+                    for seg in skipped_locked
+                )
+            ):
+                log.info(
+                    "[%s] window %s leaves; segment %d already has an encode slot",
+                    job_id,
+                    client_id,
+                    skipped_locked[0],
+                )
+                break
             if nxt is None or read_client_frontier(r, job_id, client_id) != frontier:
                 if nxt is None:
                     if blocked:
@@ -5708,6 +5931,21 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                         idle += 1
                         time.sleep(0.4)
                 continue
+            if not claim_segment_slot(r, job_id, nxt, client_id):
+                # This window does not get a second inflight thread for a
+                # segment someone else is already encoding. Playback waits
+                # on the published segment.
+                log.info(
+                    "[%s] window %s leaves; segment %d already has an encode slot",
+                    job_id,
+                    client_id,
+                    nxt,
+                )
+                break
+            if held != nxt:
+                release_segment_slot(r, job_id, held, client_id)
+                held = nxt
+                renewer._also = [(segment_slot_key(job_id, held), client_id)]
             idle = 0
             seg_end = min(total, nxt + seg_n) if total > 0 else nxt + seg_n
             if use_forward:
@@ -5724,12 +5962,21 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                         index_path = LOCAL_OUTPUT_DIR / job_id / "frame_index.json"
                         index_path.parent.mkdir(parents=True, exist_ok=True)
                         frame_index = load_or_build_frame_index(local_path, index_path)
-                        forward = _HeadcamForwardRun(
-                            local_path=local_path,
-                            job_id=job_id,
-                            source=source,
-                            seg_n=seg_n,
-                        )
+                        if family == "teleop":
+                            forward = _TeleopForwardRun(
+                                kind=teleop_kind,
+                                local_path=local_path,
+                                job_id=job_id,
+                                source=source,
+                                seg_n=seg_n,
+                            )
+                        else:
+                            forward = _HeadcamForwardRun(
+                                local_path=local_path,
+                                job_id=job_id,
+                                source=source,
+                                seg_n=seg_n,
+                            )
                         forward.open_at(nxt, frame_index)
                     else:
                         log.info(
@@ -5784,6 +6031,14 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                     session_client=client_id,
                     bound_frontier=frontier,
                 )
+            if result == "end":
+                # Decodable messages stopped before this index frame. Retrying
+                # the same seek just reopens the file and hits EOF again.
+                log.info(
+                    "[%s] window %s stops at frame %d; no more decodable messages",
+                    job_id, client_id, nxt,
+                )
+                break
             if result == "busy":
                 time.sleep(1.0)
             elif result == "error":
@@ -5802,6 +6057,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
         if forward is not None:
             forward.close()
         renewer.stop()
+        release_segment_slot(r, job_id, held, client_id)
         current = r.get(alive)
         if isinstance(current, bytes):
             current = current.decode("utf-8", errors="replace")

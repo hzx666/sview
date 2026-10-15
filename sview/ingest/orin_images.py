@@ -174,7 +174,11 @@ def _is_orin_jpeg_topic(topic: str) -> bool:
 
 
 def _iter_ros2_messages_tolerant(
-    path: str, topic_ok=None, channel_ok=None, start_time_ns: Optional[int] = None,
+    path: str,
+    topic_ok=None,
+    channel_ok=None,
+    start_time_ns: Optional[int] = None,
+    topics: Optional[List[str]] = None,
 ):
     """Yield ROS2 messages; skip protobuf/other encodings instead of aborting the bag.
 
@@ -192,6 +196,8 @@ def _iter_ros2_messages_tolerant(
     iter_kw = {}
     if start_time_ns is not None and int(start_time_ns) > 0:
         iter_kw["start_time"] = int(start_time_ns)
+    if topics:
+        iter_kw["topics"] = [t for t in topics if t]
     with open(path, "rb") as fh:
         reader = make_reader(fh)
         try:
@@ -285,6 +291,228 @@ def _stream_meta(
         "stored_codec": "h264",
         "source_topic": topic or ch,
     }
+
+
+def _schema_is_imu(schema_name: Optional[str]) -> bool:
+    n = _norm_schema_name(schema_name)
+    return bool(n) and (n.endswith(".imu") or n.endswith("msg.imu") or n == "imu")
+
+
+def _schema_is_camera_info(schema_name: Optional[str]) -> bool:
+    return "camerainfo" in _norm_schema_name(schema_name)
+
+
+def _topic_is_imu(topic: str) -> bool:
+    return "imu" in [p.lower() for p in (topic or "").split("/") if p]
+
+
+def classify_teleop_forward_topic(
+    topic: str,
+    schema_name: Optional[str] = None,
+    *,
+    kind: str,
+) -> Optional[str]:
+    """``video``, ``meta``, or ``imu`` for a teleop forward read. Else None.
+
+    Head-cam protobuf video stays out. IMU is kept, including ``/imu/sample``
+    when the schema is a ROS Imu or the topic path says imu.
+    """
+    raw = (topic or "").strip()
+    if not raw:
+        return None
+    kind_l = (kind or "").strip().lower()
+    if raw != "/imu/sample" and _is_headcam_protobuf_topic(raw):
+        return None
+    schema = schema_name or ""
+    if _schema_is_camera_info(schema):
+        return "meta"
+    video = _harvest_channel_ok(raw, schema) and not _is_headcam_protobuf_topic(raw)
+    if video:
+        if kind_l == "h264" and _is_orin_jpeg_topic(raw) and not _is_orin_h264_topic(raw):
+            video = False
+        elif kind_l == "jpeg" and _is_orin_h264_topic(raw):
+            video = False
+    if video:
+        return "video"
+    n = _norm_schema_name(schema)
+    if "image" in n:
+        return None
+    if _schema_is_imu(schema) or _topic_is_imu(raw):
+        return "imu"
+    return None
+
+
+def teleop_forward_topics(path: str | Path, *, kind: str) -> List[tuple]:
+    """``(topic, role)`` pairs to read. Role is video, meta, or imu."""
+    from mcap.reader import make_reader
+
+    p = Path(path)
+    if not p.is_file():
+        return []
+    try:
+        with open(p, "rb") as fh:
+            summary = make_reader(fh).get_summary()
+    except Exception:
+        log.debug("teleop_forward_topics failed for %s", p, exc_info=True)
+        return []
+    if not summary or not summary.channels:
+        return []
+    schemas = summary.schemas or {}
+    found: List[tuple] = []
+    seen: set = set()
+    for channel in summary.channels.values():
+        topic = (getattr(channel, "topic", "") or "").strip()
+        if not topic or topic in seen:
+            continue
+        schema = schemas.get(getattr(channel, "schema_id", None))
+        schema_name = getattr(schema, "name", "") if schema is not None else ""
+        role = classify_teleop_forward_topic(topic, schema_name, kind=kind)
+        if not role:
+            continue
+        seen.add(topic)
+        found.append((topic, role))
+    return found
+
+
+def _ros_imu_row(ros, log_time_ns: int) -> dict:
+    acc = getattr(ros, "linear_acceleration", None)
+    if acc is None:
+        x = getattr(ros, "x", 0)
+        y = getattr(ros, "y", 0)
+        z = getattr(ros, "z", 0)
+    else:
+        x, y, z = acc.x, acc.y, acc.z
+    try:
+        temp = float(getattr(ros, "temperature", 0) or 0)
+    except (TypeError, ValueError):
+        temp = 0.0
+    ts = int(log_time_ns)
+    return {
+        "log_time_ns": ts,
+        "monotonic_ns": str(ts),
+        "wall_ns": str(ts),
+        "x": x,
+        "y": y,
+        "z": z,
+        "temp_c": temp,
+        "unit": "m/s^2",
+        "scale": 1,
+        "sample_index": 0,
+    }
+
+
+def _camera_info_size(ros) -> Tuple[int, int]:
+    try:
+        w = int(getattr(ros, "width", 0) or 0)
+        h = int(getattr(ros, "height", 0) or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+    return w, h
+
+
+def _matching_camera_size(topic: str, sizes: Dict[str, Tuple[int, int]]) -> Tuple[int, int]:
+    best = ""
+    picked = (0, 0)
+    video_parts = [p for p in topic.split("/") if p]
+    for info_topic, wh in sizes.items():
+        if not wh[0] or not wh[1]:
+            continue
+        info_parts = [p for p in info_topic.split("/") if p]
+        common = 0
+        for a, b in zip(video_parts, info_parts):
+            if a != b:
+                break
+            common += 1
+        if common > len(best.split("/")):
+            best = info_topic
+            picked = wh
+    return picked
+
+
+def iter_teleop_forward(
+    path: str | Path,
+    kind: str,
+    start_time_ns: Optional[int] = None,
+):
+    """Yield ``("video", ch, data, ts, meta)`` or ``("imu", row)`` for one forward read.
+
+    Only video, camera info, and IMU topics are decoded. The file stays open
+    until the generator is closed.
+    """
+    kind_l = (kind or "").strip().lower()
+    selected = teleop_forward_topics(path, kind=kind_l)
+    video_topics = [topic for topic, role in selected if role == "video"]
+    topic_map = _stable_assign_topics(video_topics)
+    roles = {topic: role for topic, role in selected}
+    allow = list(roles)
+    sizes: Dict[str, Tuple[int, int]] = {}
+    sized: set = set()
+    for msg in _iter_ros2_messages_tolerant(
+        str(path),
+        topics=allow or None,
+        start_time_ns=start_time_ns,
+    ):
+        topic = msg.channel.topic if msg.channel else ""
+        schema = msg.schema.name if msg.schema else ""
+        role = roles.get(topic) or classify_teleop_forward_topic(topic, schema, kind=kind_l)
+        ros = msg.ros_msg
+        if role == "meta":
+            wh = _camera_info_size(ros)
+            if wh[0] and wh[1]:
+                sizes[topic] = wh
+            continue
+        if role == "imu":
+            yield ("imu", _ros_imu_row(ros, int(msg.log_time_ns)))
+            continue
+        if role != "video":
+            continue
+        data = b""
+        w = h = 0
+        codec = "h264"
+        if kind_l == "jpeg":
+            if _schema_is_raw_image(schema):
+                blob = _ros_image_to_jpeg(ros)
+                if not blob:
+                    continue
+                data = blob
+                try:
+                    w = int(getattr(ros, "width", 0) or 0)
+                    h = int(getattr(ros, "height", 0) or 0)
+                except (TypeError, ValueError):
+                    w = h = 0
+            else:
+                fmt = (getattr(ros, "format", "") or "").lower()
+                data = bytes(getattr(ros, "data", b"") or b"")
+                if not data or _compressed_payload_kind(fmt, data) != "jpeg":
+                    continue
+            codec = "jpeg"
+        else:
+            fmt = getattr(ros, "format", "") or ""
+            data = bytes(getattr(ros, "data", b"") or b"")
+            if not data:
+                continue
+            payload_kind = _compressed_payload_kind(fmt, data)
+            if payload_kind == "jpeg":
+                continue
+            if payload_kind not in ("h264", "hevc") and not _is_orin_h264_topic(topic):
+                continue
+            annexb = _coerce_annexb_h264(data)
+            if not annexb:
+                continue
+            data = annexb
+            codec = "hevc" if payload_kind == "hevc" else "h264"
+            w, h = _h264_sps_size(data)
+        ch = topic_map.get(topic)
+        if not ch:
+            continue
+        if not (w and h):
+            w, h = _matching_camera_size(topic, sizes)
+        if ch not in sized:
+            if codec == "jpeg" and not (w and h):
+                w, h = _jpeg_size(data)
+            sized.add(ch)
+        meta = _stream_meta(topic, ch, w or 0, h or 0, codec)
+        yield ("video", ch, data, int(msg.log_time_ns), meta)
 
 
 def _video_topics_from_summary(

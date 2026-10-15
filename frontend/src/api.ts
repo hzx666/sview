@@ -132,21 +132,29 @@ export type EncodeRequest = {
 export const CHANNELS = ["rr", "fr", "rl", "fl"] as const;
 export type Channel = string;
 
+const HEAD_CAM_IDS = new Set<string>(CHANNELS);
+
+/** `rr` / `camera_rr` only. `camera_f_l/color/image_raw` is a teleop topic. */
+function isHeadcamStreamKey(key: string): boolean {
+  const low = key.toLowerCase();
+  if (HEAD_CAM_IDS.has(low)) return true;
+  const prefixed = low.startsWith("camera_") ? low.slice("camera_".length) : "";
+  return HEAD_CAM_IDS.has(prefixed);
+}
+
 export function playChannels(m: Manifest | null | undefined): string[] {
   if (!m?.streams) return [...CHANNELS];
   const keys = Object.keys(m.streams);
   if (!keys.length) return [...CHANNELS];
   const format = (m.format || "").toLowerCase();
+  const quad =
+    format === "head_cam" ||
+    (format !== "teleop_nstream" && keys.every(isHeadcamStreamKey));
+  if (!quad) return keys;
   const v1Keys = CHANNELS.filter(
     (ch) => `camera_${ch}` in m.streams || ch in m.streams,
   );
-  if (format === "head_cam" || keys.every((k) => k.startsWith("camera_"))) {
-    return v1Keys.length ? v1Keys : [...CHANNELS];
-  }
-  if (v1Keys.length === keys.length && v1Keys.length > 0) {
-    return [...CHANNELS].filter((ch) => v1Keys.includes(ch));
-  }
-  return keys;
+  return v1Keys.length ? [...v1Keys] : [...CHANNELS];
 }
 
 export function manifestFps(m: Manifest | null | undefined): number {

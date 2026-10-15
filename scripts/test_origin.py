@@ -271,6 +271,164 @@ def test_one_window_reuses_one_encode_session():
     assert len(redis.lists[REDIS_QUEUE_KEY]) == 2
 
 
+def test_same_segment_does_not_take_another_worker_slot():
+    from sview.jobs.job_status import ensure_sparse_session, set_client_frontier
+
+    class Store:
+        def __init__(self):
+            self.hashes = {}
+            self.values = {}
+            self.lists = {}
+
+        def hgetall(self, key):
+            return self.hashes.get(key, {})
+
+        def hset(self, key, *args, mapping=None):
+            row = self.hashes.setdefault(key, {})
+            if mapping is not None:
+                row.update(mapping)
+            elif len(args) == 2:
+                row[args[0]] = args[1]
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.values:
+                return False
+            self.values[key] = value
+            return True
+
+        def expire(self, key, ttl):
+            return key in self.values
+
+        def delete(self, key):
+            self.values.pop(key, None)
+            return 1
+
+        def lpush(self, key, value):
+            self.lists.setdefault(key, []).insert(0, value)
+
+    redis = Store()
+    assert set_client_frontier(redis, "j", "tab-a", 0, segment_frames=30) == 0
+    assert set_client_frontier(redis, "j", "tab-b", 10, segment_frames=30) == 0
+    assert ensure_sparse_session(
+        redis, "j", "oss://b/a.mcap", "tab-a", segment_frames=30
+    )
+    assert not ensure_sparse_session(
+        redis, "j", "oss://b/a.mcap", "tab-b", segment_frames=30
+    )
+    assert len(redis.lists[REDIS_QUEUE_KEY]) == 1
+    item = parse_queue_item(redis.lists[REDIS_QUEUE_KEY][0])
+    assert item["client_id"] == "tab-a"
+    # A different segment still gets its own encode thread.
+    assert set_client_frontier(redis, "j", "tab-c", 90, segment_frames=30) == 90
+    assert ensure_sparse_session(
+        redis, "j", "oss://b/a.mcap", "tab-c", segment_frames=30
+    )
+    assert len(redis.lists[REDIS_QUEUE_KEY]) == 2
+
+
+def test_fail_submit_marks_failed_and_clears_redis_cache():
+    import fnmatch
+
+    from sview.jobs.job_status import (
+        JOB_KEY_PREFIX,
+        REDIS_QUEUE_KEY,
+        fail_submit,
+        get_job_fields,
+        job_redis_key,
+        segment_slot_key,
+        session_alive_key,
+    )
+
+    class Store:
+        def __init__(self):
+            self.hashes = {}
+            self.values = {}
+            self.lists = {}
+            self.sets = {}
+
+        def hgetall(self, key):
+            return dict(self.hashes.get(key, {}))
+
+        def hset(self, key, *args, mapping=None):
+            row = self.hashes.setdefault(key, {})
+            if mapping is not None:
+                row.update({k: str(v) for k, v in mapping.items()})
+            elif len(args) == 2:
+                row[args[0]] = str(args[1])
+
+        def get(self, key):
+            return self.values.get(key)
+
+        def set(self, key, value, nx=False, ex=None):
+            self.values[key] = value
+            return True
+
+        def delete(self, *keys):
+            for key in keys:
+                self.values.pop(key, None)
+            return len(keys)
+
+        def scan(self, cursor=0, match=None, count=10):
+            keys = list(self.values) + list(self.hashes)
+            if match:
+                keys = [key for key in keys if fnmatch.fnmatch(key, match)]
+            return 0, keys
+
+        def srem(self, key, member):
+            self.sets.setdefault(key, set()).discard(member)
+
+        def decrby(self, key, amount):
+            return 0
+
+        def lrange(self, key, start, end):
+            return list(self.lists.get(key, []))
+
+        def lrem(self, key, count, value):
+            items = self.lists.get(key, [])
+            if value in items:
+                items.remove(value)
+            return 1
+
+    source = "oss://bucket/original_data/teleoperation/Orin/clip.mcap"
+    job_id = "clip_cabc"
+    redis = Store()
+    redis.hashes[job_redis_key(job_id)] = {
+        "status": "processing",
+        "source": source,
+        "playable": "1",
+        "frames_done": "30",
+        "cache_bytes": "10",
+        "publish_mode": "sparse",
+    }
+    redis.values[session_alive_key(job_id, "tab-a")] = "worker"
+    redis.values[segment_slot_key(job_id, 0)] = "tab-a"
+    redis.lists[REDIS_QUEUE_KEY] = [
+        '{"v":2,"kind":"sparse_session","source":"%s","job_id":"%s","client_id":"tab-a"}'
+        % (source, job_id)
+    ]
+
+    failed_ids = fail_submit(
+        redis,
+        "clip_missing_version",
+        source,
+        "source not found on local mount",
+        publish_mode="sparse",
+    )
+    assert job_id in failed_ids
+    fields = get_job_fields(redis, job_id)
+    assert fields["status"] == "failed"
+    assert fields["error"] == "source not found on local mount"
+    assert fields["playable"] == "0"
+    assert fields["frames_done"] == "0"
+    assert session_alive_key(job_id, "tab-a") not in redis.values
+    assert segment_slot_key(job_id, 0) not in redis.values
+    assert redis.lists[REDIS_QUEUE_KEY] == []
+    assert job_redis_key(job_id).startswith(JOB_KEY_PREFIX)
+
+
 def test_one_active_segment_per_job():
     from sview.jobs.job_status import claim_job_segment, release_job_segment
 
@@ -588,6 +746,8 @@ if __name__ == "__main__":
     test_queue_json_origin()
     test_sparse_queue_item_and_priority_dedupe()
     test_one_window_reuses_one_encode_session()
+    test_same_segment_does_not_take_another_worker_slot()
+    test_fail_submit_marks_failed_and_clears_redis_cache()
     test_one_active_segment_per_job()
     test_targeted_encode_drops_warmup_pictures()
     test_forward_encode_follows_playhead_and_seek()

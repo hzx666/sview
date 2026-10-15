@@ -212,6 +212,32 @@ def _optional_frame_count(*values) -> Optional[int]:
     return None
 
 
+def _fail_submit_job(
+    job_id: str,
+    source: str,
+    error: str,
+    *,
+    publish_mode: str,
+) -> None:
+    """Persist status=failed and drop this job's Redis playback state.
+
+    The player stops on ``failed`` and shows ``error``. A literal status
+    ``error`` would leave the client waiting.
+    """
+    try:
+        from sview.jobs.job_status import fail_submit
+
+        fail_submit(
+            _get_redis(),
+            job_id,
+            source,
+            error,
+            publish_mode=publish_mode,
+        )
+    except Exception:
+        log.exception("record submit failure failed job=%s", job_id)
+
+
 def _purge_job_play_cache(cache_root: Path, job_id: str, *, reason: str) -> dict:
     """Wipe local /cache/{job_id}, OSS player-bin/{job_id}/, and Redis progress fields."""
     import shutil
@@ -662,26 +688,38 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                     {"error": "sparse seek is not supported for HDF5; use progressive"},
                 )
                 return
+            from sview.jobs.job_status import sparse_cache_job_id
+
+            job_id = sparse_cache_job_id(source, local)
+            if not _safe_job_id(job_id):
+                self._send_json(
+                    400,
+                    {"error": f"invalid sparse cache id: {job_id}"},
+                )
+                return
             if not local.exists():
+                message = "source not found on local mount"
+                _fail_submit_job(
+                    job_id,
+                    source,
+                    message,
+                    publish_mode="sparse",
+                )
                 self._send_json(
                     404,
                     {
-                        "error": "source not found on local mount",
+                        "job_id": job_id,
+                        "status": "failed",
+                        "error": message,
                         "source": source,
                         "local_path": str(local),
+                        "playable": False,
+                        "cached": False,
                     },
                 )
                 return
             try:
-                from sview.jobs.job_status import enqueue_sparse_job, sparse_cache_job_id
-
-                job_id = sparse_cache_job_id(source, local)
-                if not _safe_job_id(job_id):
-                    self._send_json(
-                        400,
-                        {"error": f"invalid sparse cache id: {job_id}"},
-                    )
-                    return
+                from sview.jobs.job_status import enqueue_sparse_job
 
                 r = _get_redis()
                 if not bool(body.get("force")):
@@ -846,12 +884,23 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         # Optional: verify local mount path exists (helps fail fast)
         local = source_to_local(source)
         if not local.exists():
+            message = "source not found on local mount"
+            _fail_submit_job(
+                job_id,
+                source,
+                message,
+                publish_mode=publish_mode,
+            )
             self._send_json(
                 404,
                 {
-                    "error": "source not found on local mount",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": message,
                     "source": source,
                     "local_path": str(local),
+                    "playable": False,
+                    "cached": False,
                     "hint": "check HEAD_CAM_MOUNT / ORIN_MOUNT PVC mounts",
                 },
             )

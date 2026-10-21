@@ -618,12 +618,22 @@ def test_queue_stats_show_session_and_waiting_job():
             "jobs": [f"{running}:client:window-a"],
         }
     )
+    redis.values[f"{WORKER_KEY_PREFIX}pod-2"] = _json.dumps(
+        {
+            "worker_id": "pod-2",
+            "pod_ip": "10.0.0.9",
+            "processing": 1,
+            "jobs": [f"{running}:client:window-b"],
+        }
+    )
     stats = collect_job_stats(redis)
     by_id = {item["job_id"]: item for item in stats["jobs"]}
     assert stats["queued"] == 1
-    assert stats["processing"] == 1
+    assert stats["processing"] == 2
     assert by_id[running]["status"] == "processing"
-    assert by_id[running]["clients"] == ["window-a"]
+    assert by_id[running]["clients"] == ["window-a", "window-b"]
+    assert [s["pod_ip"] for s in by_id[running]["sessions"]] == ["10.0.0.8", "10.0.0.9"]
+    assert len(stats["jobs"]) == 2
     assert by_id[waiting]["status"] == "queued"
 
 
@@ -929,7 +939,439 @@ def test_frames_before_first_idr_stay_empty_and_encoder_realigns():
     assert "b" not in run._realign
 
 
+class _HashStore:
+    def __init__(self):
+        self.hashes = {}
+        self.values = {}
+        self.sets = {}
+
+    def hgetall(self, key):
+        return dict(self.hashes.get(key, {}))
+
+    def hset(self, key, *args, mapping=None):
+        row = self.hashes.setdefault(key, {})
+        if mapping is not None:
+            row.update({k: str(v) for k, v in mapping.items()})
+        elif len(args) == 2:
+            row[args[0]] = str(args[1])
+
+    def get(self, key):
+        return self.values.get(key)
+
+    def srem(self, key, member):
+        self.sets.setdefault(key, set()).discard(member)
+
+    def decrby(self, key, amount):
+        return 0
+
+
+def test_redis_ranges_follow_oss_when_segments_were_deleted():
+    import json
+
+    from sview.jobs.job_status import (
+        first_unencoded_segment,
+        get_job_fields,
+        job_redis_key,
+        sync_sparse_ranges_from_oss,
+    )
+
+    redis = _HashStore()
+    job = "deleted_segments"
+    redis.hashes[job_redis_key(job)] = {
+        "status": "ready",
+        "publish_mode": "sparse",
+        "frame_count": "1206",
+        "available_ranges": "[[0,1206]]",
+        "frames_done": "1206",
+        "manifest_revision": "41",
+    }
+    assert first_unencoded_segment(redis, job, "tab", 30) is None
+
+    # 列举期间有新段发布：放弃这次同步。
+    assert not sync_sparse_ranges_from_oss(
+        redis, job, [[0, 30]], frame_count=1206, expect_revision="40"
+    )
+    assert sync_sparse_ranges_from_oss(
+        redis, job, [[0, 30]], frame_count=1206, expect_revision="41"
+    )
+    fields = get_job_fields(redis, job)
+    assert json.loads(fields["available_ranges"]) == [[0, 30]]
+    assert fields["status"] == "processing"
+    assert fields["frames_done"] == "30"
+    assert fields["segments_ready_count"] == "1"
+    assert first_unencoded_segment(redis, job, "tab", 30) == 30
+
+    # OSS 比 Redis 多（刚发布还没写 Redis）不算过期，不改。
+    assert not sync_sparse_ranges_from_oss(redis, job, [[0, 60]], frame_count=1206)
+
+
+def test_gc_purge_resets_sparse_ranges():
+    import json
+
+    import sview.cache.oss_cache_gc as gc
+    from sview.jobs.job_status import first_unencoded_segment, get_job_fields, job_redis_key
+
+    redis = _HashStore()
+    job = "gc_sparse"
+    redis.hashes[job_redis_key(job)] = {
+        "status": "ready",
+        "publish_mode": "sparse",
+        "frame_count": "1206",
+        "available_ranges": "[[0,1206]]",
+        "segments_ready_count": "41",
+        "frames_done": "1206",
+        "playable": "1",
+        "cache_bytes": "10",
+    }
+    saved = gc.delete_job_prefix
+    gc.delete_job_prefix = lambda job_id: 3
+    try:
+        gc.purge_job_play_cache(redis, job, reason="expired")
+    finally:
+        gc.delete_job_prefix = saved
+    fields = get_job_fields(redis, job)
+    assert json.loads(fields["available_ranges"]) == []
+    assert fields["segments_ready_count"] == "0"
+    assert fields["status"] == "queued"
+    assert first_unencoded_segment(redis, job, "tab", 30) == 0
+
+
+class _KvStore(_HashStore):
+    def __init__(self):
+        super().__init__()
+        self.lists = {}
+        self.ttls = {}
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        if ex is not None:
+            self.ttls[key] = int(ex)
+        return True
+
+    def expire(self, key, ttl):
+        if key in self.values:
+            self.ttls[key] = int(ttl)
+            return True
+        return False
+
+    def ttl(self, key):
+        return self.ttls.get(key, -1) if key in self.values else -2
+
+    def delete(self, *keys):
+        for key in keys:
+            self.values.pop(key, None)
+        return len(keys)
+
+    def scan(self, cursor=0, match=None, count=10):
+        import fnmatch
+
+        keys = [k for k in self.values if not match or fnmatch.fnmatch(k, match)]
+        return 0, keys
+
+    def lpush(self, key, value):
+        self.lists.setdefault(key, []).insert(0, value)
+
+
+def test_dead_slot_holder_can_be_replaced():
+    from sview.jobs.job_status import (
+        claim_segment_slot,
+        live_run_at,
+        segment_slot_key,
+        session_alive_key,
+        session_pending_key,
+    )
+
+    redis = _KvStore()
+    assert claim_segment_slot(redis, "j", 60, "a")
+    # a 的线程还在跑：b 不能抢，也能看出 a 正停在这一段。
+    redis.values[session_alive_key("j", "a")] = "worker"
+    assert not claim_segment_slot(redis, "j", 60, "b")
+    assert live_run_at(redis, "j", 60, "b")
+    assert live_run_at(redis, "j", 90, "b")
+    assert not live_run_at(redis, "j", 60, "a")
+    # 只在排队也算活着。
+    del redis.values[session_alive_key("j", "a")]
+    redis.values[session_pending_key("j", "a")] = "1"
+    assert not claim_segment_slot(redis, "j", 60, "b")
+    # 都没有了：b 直接接手，不用等槽过期。
+    del redis.values[session_pending_key("j", "a")]
+    assert not live_run_at(redis, "j", 60, "b")
+    assert claim_segment_slot(redis, "j", 60, "b")
+    assert redis.values[segment_slot_key("j", 60)] == "b"
+
+
+def test_hand_off_starts_recent_waiting_windows_only():
+    from sview.jobs.job_status import (
+        ENCODE_REQUEST_TTL_SEC,
+        HANDOFF_RECENT_SEC,
+        REDIS_QUEUE_KEY,
+        decode_end,
+        first_unencoded_segment,
+        hand_off_waiting_windows,
+        job_redis_key,
+        mark_decode_end,
+        session_frontier_key,
+        set_client_frontier,
+    )
+
+    redis = _KvStore()
+    job = "handoff"
+    redis.hashes[job_redis_key(job)] = {
+        "publish_mode": "sparse",
+        "frame_count": "300",
+        "available_ranges": "[[0,120]]",
+    }
+    # b 卡在 120 等；gone 很久没请求；playing 前沿那段已经有了，在播缓存。
+    set_client_frontier(redis, job, "b", 120, segment_frames=30)
+    set_client_frontier(redis, job, "gone", 150, segment_frames=30)
+    redis.ttls[session_frontier_key(job, "gone")] = (
+        ENCODE_REQUEST_TTL_SEC - HANDOFF_RECENT_SEC - 1
+    )
+    set_client_frontier(redis, job, "playing", 30, segment_frames=30)
+    set_client_frontier(redis, job, "a", 120, segment_frames=30)
+    started = hand_off_waiting_windows(redis, job, "oss://b/x.mcap", exclude="a")
+    assert started == ["b"]
+    assert len(redis.lists[REDIS_QUEUE_KEY]) == 1
+
+    # 后面没有可解码的帧了：不再给这里排线程。
+    mark_decode_end(redis, job, 120)
+    assert decode_end(redis, job) == 120
+    assert first_unencoded_segment(redis, job, "c", 30) is None
+
+
+def test_second_viewer_closes_its_encoder_when_it_reaches_a_live_run():
+    import json
+
+    from sview.jobs.job_status import (
+        REDIS_QUEUE_KEY,
+        job_redis_key,
+        segment_slot_key,
+        session_alive_key,
+        set_client_frontier,
+    )
+    from sview.worker import cpu as cpu_mod
+
+    redis = _KvStore()
+    job = "two_viewers"
+    key = job_redis_key(job)
+    # a 从 60 开始编，已经发布到 120，正在编 120。
+    redis.hashes[key] = {
+        "publish_mode": "sparse",
+        "frame_count": "300",
+        "available_ranges": "[[60,120]]",
+        "status": "processing",
+    }
+    redis.values[segment_slot_key(job, 120)] = "a"
+    redis.values[session_alive_key(job, "a")] = "worker"
+    set_client_frontier(redis, job, "b", 0, segment_frames=30)
+
+    encoded = []
+
+    def fake_segment(r, item, **kw):
+        start, end = int(item["seg_start"]), int(item["seg_end"])
+        encoded.append(start)
+        ranges = json.loads(redis.hashes[key]["available_ranges"])
+        ranges.append([start, end])
+        from sview.cache.oss_cache_gc import merge_available_ranges
+
+        redis.hashes[key]["available_ranges"] = json.dumps(merge_available_ranges(ranges))
+        return "ok"
+
+    saved = (cpu_mod._run_one_segment_job, cpu_mod.redis_path_to_local)
+    cpu_mod._run_one_segment_job = fake_segment
+    cpu_mod.redis_path_to_local = lambda s: Path("/nonexistent/x.mcap")
+    try:
+        cpu_mod._run_sparse_session(
+            redis,
+            {"job_id": job, "source": "oss://b/x.mcap", "client_id": "b", "segment_frames": 30},
+        )
+    finally:
+        cpu_mod._run_one_segment_job, cpu_mod.redis_path_to_local = saved
+    # b 只编了 0 和 30，接上 a 已有的 60 之后就关掉，不去抢 a 前面的 120。
+    assert encoded == [0, 30]
+    assert redis.values[segment_slot_key(job, 120)] == "a"
+    assert session_alive_key(job, "b") not in redis.values
+    assert REDIS_QUEUE_KEY not in redis.lists
+
+
+def test_single_viewer_jumps_over_its_own_cache():
+    import json
+
+    from sview.cache.oss_cache_gc import merge_available_ranges
+    from sview.jobs.job_status import job_redis_key, set_client_frontier
+    from sview.worker import cpu as cpu_mod
+
+    redis = _KvStore()
+    job = "one_viewer"
+    key = job_redis_key(job)
+    # 自己之前 seek 过，60-120 已经编好；没有别的窗口。
+    redis.hashes[key] = {
+        "publish_mode": "sparse",
+        "frame_count": "180",
+        "available_ranges": "[[60,120]]",
+        "status": "processing",
+    }
+    set_client_frontier(redis, job, "a", 0, segment_frames=30)
+    encoded = []
+
+    def fake_segment(r, item, **kw):
+        start, end = int(item["seg_start"]), int(item["seg_end"])
+        encoded.append(start)
+        ranges = json.loads(redis.hashes[key]["available_ranges"]) + [[start, end]]
+        redis.hashes[key]["available_ranges"] = json.dumps(merge_available_ranges(ranges))
+        return "ok"
+
+    saved = (cpu_mod._run_one_segment_job, cpu_mod.redis_path_to_local, cpu_mod.time.sleep)
+    cpu_mod._run_one_segment_job = fake_segment
+    cpu_mod.redis_path_to_local = lambda s: Path("/nonexistent/x.mcap")
+    cpu_mod.time.sleep = lambda s: None
+    try:
+        cpu_mod._run_sparse_session(
+            redis,
+            {"job_id": job, "source": "oss://b/x.mcap", "client_id": "a", "segment_frames": 30},
+        )
+    finally:
+        cpu_mod._run_one_segment_job, cpu_mod.redis_path_to_local, cpu_mod.time.sleep = saved
+    assert encoded == [0, 30, 120, 150]
+
+
+def test_oss_redirect_does_not_hang_keepalive():
+    import http.client
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    import sview.http.server as srv
+    import sview.worker.cpu as cpu_mod
+
+    class Handler(srv.SviewCacheHandler):
+        def _oss_cache_enabled(self):
+            return True
+
+        def do_GET(self):
+            if not self._redirect_oss_play("job", "segments", "000000.bin", body=True):
+                self._send_err(500, "no redirect")
+
+    saved = cpu_mod.sign_oss_url
+    cpu_mod.sign_oss_url = lambda key, expires=0: f"https://bucket.oss-cn-shanghai.aliyuncs.com/{key}?sig=x"
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        for _ in range(2):
+            conn.request("GET", "/api/jobs/job/segments/000000.bin")
+            resp = conn.getresponse()
+            assert resp.status == 302
+            assert resp.getheader("Content-Length") == "0"
+            assert resp.read() == b""
+        conn.close()
+    finally:
+        server.shutdown()
+        cpu_mod.sign_oss_url = saved
+
+
+def _serve(handler_cls):
+    import threading
+    from http.server import ThreadingHTTPServer
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def test_signed_media_signs_a_window_without_reading_oss():
+    import http.client
+    import json
+
+    import sview.http.server as srv
+    import sview.worker.cpu as cpu_mod
+    from sview.jobs.job_status import job_redis_key
+
+    redis = _KvStore()
+    redis.hashes[job_redis_key("job")] = {"frame_count": "3042", "publish_mode": "sparse"}
+
+    class Handler(srv.SviewCacheHandler):
+        def _oss_cache_enabled(self):
+            return True
+
+    def no_manifest(*a, **kw):
+        raise AssertionError("signed-media must not read the manifest")
+
+    saved = (srv._get_redis, srv._load_play_manifest, cpu_mod.sign_oss_url)
+    srv._get_redis = lambda: redis
+    srv._load_play_manifest = no_manifest
+    cpu_mod.sign_oss_url = lambda key, expires=0: f"https://b.oss-cn-shanghai.aliyuncs.com/{key}?e={expires}"
+    server = _serve(Handler)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        conn.request("GET", "/api/jobs/job/signed-media?kind=segments&start=2580&count=600&expires=1800")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        assert resp.status == 200, data
+        # 3042 帧：2580..3030 共 16 段，越界的全部略过。
+        assert [it["start"] for it in data["items"]] == list(range(2580, 3042, 30))
+        assert data["expires_in"] == 1800
+        assert data["items"][0]["url"].endswith("segments/002580.bin?e=1800")
+        assert data["skipped"][0] == 3060
+
+        conn.request("GET", "/api/jobs/job/signed-media?kind=segments&starts=2580,2581")
+        resp = conn.getresponse()
+        data = json.loads(resp.read())
+        assert [it["start"] for it in data["items"]] == [2580]
+        assert data["skipped"] == [2581]
+
+        conn.request("GET", "/api/jobs/missing/signed-media?kind=segments&starts=0")
+        resp = conn.getresponse()
+        resp.read()
+        assert resp.status == 404
+        conn.close()
+    finally:
+        server.shutdown()
+        srv._get_redis, srv._load_play_manifest, cpu_mod.sign_oss_url = saved
+
+
+def test_oss_manifest_read_error_is_retry_not_missing():
+    import oss2
+
+    import sview.http.server as srv
+    import sview.worker.cpu as cpu_mod
+
+    class Bucket:
+        def __init__(self, exc):
+            self.exc = exc
+
+        def get_object(self, key):
+            raise self.exc
+
+    saved = (cpu_mod.get_oss_bucket, srv._oss_cache_on)
+    srv._oss_cache_on = lambda: True
+    try:
+        cpu_mod.get_oss_bucket = lambda: Bucket(
+            oss2.exceptions.NoSuchKey(404, {}, b"", {})
+        )
+        assert srv._load_play_manifest(Path("/nonexistent"), "job") is None
+
+        cpu_mod.get_oss_bucket = lambda: Bucket(ConnectionError("reset by peer"))
+        man = srv._load_play_manifest(Path("/nonexistent"), "job")
+        assert man is not None
+        assert man["cache_align_failed"] is True
+        assert man["cache_align_reason"] == "oss_read_failed"
+    finally:
+        cpu_mod.get_oss_bucket, srv._oss_cache_on = saved
+
+
 if __name__ == "__main__":
+    test_signed_media_signs_a_window_without_reading_oss()
+    test_oss_manifest_read_error_is_retry_not_missing()
+    test_oss_redirect_does_not_hang_keepalive()
+    test_single_viewer_jumps_over_its_own_cache()
+    test_dead_slot_holder_can_be_replaced()
+    test_hand_off_starts_recent_waiting_windows_only()
+    test_second_viewer_closes_its_encoder_when_it_reaches_a_live_run()
+    test_redis_ranges_follow_oss_when_segments_were_deleted()
+    test_gc_purge_resets_sparse_ranges()
     test_frames_before_first_idr_stay_empty_and_encoder_realigns()
     test_headcam_pull_segment_defaults_to_headcam_channels()
     test_sparse_session_index_failure_marks_job_failed()

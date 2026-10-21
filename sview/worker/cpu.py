@@ -5877,6 +5877,9 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
         fail_job,
         first_unencoded_segment,
         get_job_fields,
+        hand_off_waiting_windows,
+        live_run_at,
+        mark_decode_end,
         read_client_frontier,
         release_segment_slot,
         segment_lock_key,
@@ -6012,6 +6015,16 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                         idle += 1
                         time.sleep(0.4)
                 continue
+            if nxt > held + seg_n and live_run_at(r, job_id, nxt, client_id, seg_n):
+                # 编到了别人已经编好的区间，区间末尾还有活着的线程在往后推，
+                # 两条线在这里接上：关掉这一条，后面的帧用对方的缓存。
+                log.info(
+                    "[%s] window %s joins the run at segment %d; closing this encoder",
+                    job_id,
+                    client_id,
+                    nxt,
+                )
+                break
             if not claim_segment_slot(r, job_id, nxt, client_id):
                 # 别人已经在编的分段，这个窗口不再另开一条
                 # 在途线程。播放等待
@@ -6145,6 +6158,7 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
                     "[%s] window %s stops at frame %d; no more decodable messages",
                     job_id, client_id, nxt,
                 )
+                mark_decode_end(r, job_id, nxt)
                 break
             if result == "busy":
                 time.sleep(1.0)
@@ -6171,6 +6185,14 @@ def _run_sparse_session(r, item: dict, on_playable=None) -> None:
         if current == owner:
             r.delete(alive)
         log.info("[%s] encode session ended for window %s", job_id, client_id)
+        try:
+            taken = hand_off_waiting_windows(
+                r, job_id, source, exclude=client_id, segment_frames=seg_n
+            )
+            if taken:
+                log.info("[%s] handed off to waiting windows %s", job_id, taken)
+        except Exception:
+            log.exception("[%s] hand-off to waiting windows failed", job_id)
 
 
 def _run_one_queue_job(r, item: dict, on_playable=None) -> None:

@@ -58,6 +58,10 @@ type CamState = {
 const PREFETCH_SEGMENTS = 8;
 /** 稀疏编码只留一小段前向窗口，服务端会接着编。 */
 const ENCODE_PREFETCH_SEGMENTS = 3;
+/** 等稀疏段时清单这么久没有新段，才补一次 /encode。 */
+const SPARSE_STALL_RETRY_MS = 10_000;
+/** 清单这么久没有任何新段才算超时。 */
+const SPARSE_STALL_TIMEOUT_MS = 2 * 60 * 1000;
 /** 内存里大约留这么多段的帧 bundle。 */
 const CACHE_SEGMENTS = 16;
 /** 自动播放前要整段缓存的段数（减少起播欠载）。 */
@@ -913,14 +917,38 @@ export class SviewPlayer {
         this.activeRequestId = response.request_id;
       }
     }
-    const started = performance.now();
+    // 正常由后端交接编码；只有清单长时间没有新段（比如编码所在的 worker 挂了）
+    // 才补一次请求。超时按「多久没进展」算，别人还在往前编就一直等。
+    let lastProgress = performance.now();
+    let lastRequest = lastProgress;
+    let lastRanges = JSON.stringify(this.manifest?.bundle.available_ranges ?? []);
     while (!this.isSparseSegmentReady(frameIndex)) {
       this.assertCurrent(epoch, signal);
-      if (performance.now() - started > 2 * 60 * 1000) {
+      const now = performance.now();
+      if (now - lastProgress > SPARSE_STALL_TIMEOUT_MS) {
         throw new Error(`等待稀疏段 ${segmentStartFor(frameIndex, this.segmentFrames())} 超时`);
+      }
+      if (now - lastProgress > SPARSE_STALL_RETRY_MS && now - lastRequest > SPARSE_STALL_RETRY_MS) {
+        lastRequest = now;
+        await this.api.requestEncode(
+          this.jobId,
+          {
+            frame_index: frameIndex,
+            prefetch_segments: ENCODE_PREFETCH_SEGMENTS,
+            client_epoch: epoch,
+            client_id: this.clientId,
+          },
+          signal,
+        );
+        this.assertCurrent(epoch, signal);
       }
       await this.waitAbortable(400, signal);
       await this.refreshManifest({ epoch, signal });
+      const ranges = JSON.stringify(this.manifest?.bundle.available_ranges ?? []);
+      if (ranges !== lastRanges) {
+        lastRanges = ranges;
+        lastProgress = performance.now();
+      }
     }
     this.assertCurrent(epoch, signal);
     this.activeRequestId = "";

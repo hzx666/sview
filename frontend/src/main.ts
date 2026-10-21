@@ -333,7 +333,18 @@ async function refreshQueueStats() {
     const stats = await currentApi().getJobStats();
     const ids = (stats.jobs || [])
       .slice(0, 4)
-      .map((j) => j.job_id)
+      .map((j) => {
+        const sessions = j.sessions || [];
+        if (sessions.length <= 1) return j.job_id;
+        const who = sessions
+          .map((s) => {
+            const whoId = (s.client_id || "").slice(0, 8);
+            const ip = (s.pod_ip || "").split(".").pop();
+            return ip ? `${whoId}@${ip}` : whoId;
+          })
+          .join(",");
+        return `${j.job_id}[${sessions.length}路 ${who}]`;
+      })
       .join(", ");
     const more =
       (stats.jobs?.length || 0) > 4

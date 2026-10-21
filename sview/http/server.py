@@ -97,6 +97,14 @@ if not _HANDVIS_WEB_DIR.is_dir():
         _HANDVIS_WEB_DIR = _local_web
 
 
+def _sign_batch_max() -> int:
+    """signed-media 单次最多签几段（默认 600 段，30 帧一段约 10 分钟视频）。"""
+    try:
+        return max(1, int(os.environ.get("OSS_SIGN_BATCH_MAX", "600") or "600"))
+    except ValueError:
+        return 600
+
+
 def _segment_frames() -> int:
     try:
         return max(1, int(os.environ.get("SEGMENT_FRAMES", "30")))
@@ -293,6 +301,37 @@ def _align_manifest_dict(job_id: str, data: dict) -> dict:
         return data
 
 
+def _sync_sparse_redis_from_manifest(r, job_id: str, man: Optional[dict], fields: dict) -> None:
+    """按 OSS 实际分段算出的清单，纠正 Redis 里已经被删掉的区间。
+
+    ``fields`` 必须在读清单（列举 OSS）之前取，用它的 manifest_revision
+    判断列举期间有没有新段发布。
+    """
+    if not man or man.get("cache_align_failed") or not man.get("cache_aligned"):
+        return
+    if (man.get("publish_mode") or "").lower() != "sparse":
+        return
+    from sview.jobs.job_status import sync_sparse_ranges_from_oss
+
+    bundle = man.get("bundle") or {}
+    try:
+        if sync_sparse_ranges_from_oss(
+            r,
+            job_id,
+            bundle.get("available_ranges") or [],
+            frame_count=_optional_int(bundle.get("frame_count")),
+            expect_revision=fields.get("manifest_revision"),
+            segment_frames=_segment_frames(),
+        ):
+            log.warning(
+                "[%s] redis ranges claimed segments missing on OSS; reset to %s",
+                job_id,
+                bundle.get("available_ranges"),
+            )
+    except Exception:
+        log.exception("[%s] sparse redis/OSS range sync failed", job_id)
+
+
 def _read_local_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
     path = _resolve_under(cache_root, job_id, "manifest.json")
     if path is None or not path.is_file():
@@ -304,15 +343,30 @@ def _read_local_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
         return None
 
 
+class _OssReadFailed(Exception):
+    """读 OSS 出错（网络、限流、凭证），不等于对象不存在。"""
+
+
 def _read_oss_manifest(job_id: str) -> Optional[dict]:
+    """OSS 上没有这个清单返回 None；其他读取错误抛 ``_OssReadFailed``。"""
     try:
         from sview.worker.cpu import get_oss_bucket, oss_cache_key
 
         key = oss_cache_key(job_id, "manifest.json")
         raw = get_oss_bucket().get_object(key).read()
+    except Exception as e:
+        try:
+            import oss2
+
+            if isinstance(e, oss2.exceptions.NoSuchKey):
+                return None
+        except Exception:
+            pass
+        raise _OssReadFailed(str(e)) from e
+    try:
         return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return None
+    except Exception as e:
+        raise _OssReadFailed(f"invalid manifest json: {e}") from e
 
 
 def _load_play_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
@@ -320,10 +374,19 @@ def _load_play_manifest(cache_root: Path, job_id: str) -> Optional[dict]:
 
     本地渐进文件可能把还没 PUT 的帧也算进去。
     签名播放必须以 OSS 上的内容为准，再收成连续片段。
+    OSS 读失败时返回带 ``cache_align_failed`` 的清单（调用方回 425 让客户端重试），
+    不要当成清单不存在回 404。
     """
     local = _read_local_manifest(cache_root, job_id)
     if _oss_cache_on():
-        oss = _read_oss_manifest(job_id)
+        try:
+            oss = _read_oss_manifest(job_id)
+        except _OssReadFailed as e:
+            log.warning("[%s] OSS manifest read failed: %s", job_id, e)
+            data = dict(local) if local is not None else {"job_id": job_id, "bundle": {}}
+            data["cache_align_failed"] = True
+            data["cache_align_reason"] = "oss_read_failed"
+            return data
         data = oss if oss is not None else local
     else:
         data = local
@@ -723,7 +786,9 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
 
                 r = _get_redis()
                 if not bool(body.get("force")):
+                    before = get_job_fields(r, job_id)
                     cached_manifest = _load_play_manifest(self.cache_root, job_id)
+                    _sync_sparse_redis_from_manifest(r, job_id, cached_manifest, before)
                     cached_bundle = (cached_manifest or {}).get("bundle") or {}
                     cached_ranges = cached_bundle.get("available_ranges") or []
                     cached_count = int(cached_bundle.get("frame_count") or 0)
@@ -1216,6 +1281,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             else start + seg_n
         )
         man = _load_play_manifest(self.cache_root, job_id)
+        _sync_sparse_redis_from_manifest(r, job_id, man, fields)
         ranges = ((man or {}).get("bundle") or {}).get("available_ranges")
         if ranges is None:
             raw_ranges = fields.get("available_ranges") or "[]"
@@ -1904,6 +1970,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             # 直接转到播放页（输入 ep_dir/item_name 或视频/posehand 路径即可）。
             self.send_response(302)
             self.send_header("Location", "/handvis/playback")
+            self.send_header("Content-Length", "0")
             self._cors()
             self.end_headers()
             return True
@@ -2224,10 +2291,11 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
 
         查询参数：
           starts=0,30,60          显式片段起点
-          start=0&count=8&step=30 区间形式（step 默认 SEGMENT_FRAMES）
+          start=0&count=600&step=30 区间形式（step 默认 SEGMENT_FRAMES）
+          expires=1800            有效期秒数，不超过 OSS_SIGN_EXPIRES
           kind=segments           只支持这一种；帧不放在 OSS 上
-        浏览器应直接请求返回的 HTTPS URL（桶需要 CORS）。
-        超出范围的 starts 会略过（见 `skipped`），不会签名。
+        单次最多 OSS_SIGN_BATCH_MAX 个。不检查段是否已生成：浏览器
+        取到 404 就当还没编好。越过总帧数或不在分段边界上的起点会略过（见 `skipped`）。
         """
         if not self._oss_cache_enabled():
             self._send_json(503, {"error": "OSS_CACHE disabled"})
@@ -2267,66 +2335,67 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             if step <= 0 or count <= 0:
                 self._send_err(400, "count/step must be positive")
                 return
-            count = min(32, count)
+            count = min(_sign_batch_max(), count)
             starts = [start + i * step for i in range(count)]
 
         if not starts:
             self._send_err(400, "no starts")
             return
-        if len(starts) > 32:
-            self._send_err(400, "max 32 urls per request")
+        if len(starts) > _sign_batch_max():
+            self._send_err(400, f"max {_sign_batch_max()} urls per request")
             return
         for s in starts:
             if s < 0:
                 self._send_err(400, "negative start")
                 return
 
-        man = _load_play_manifest(self.cache_root, job_id)
-        if man is None:
-            self._send_err(404, "manifest not found")
-            return
-        if man.get("cache_align_failed"):
-            self._send_retry(425, "play cache not aligned yet", retry_after=1)
-            return
-        if (man.get("publish_mode") or "").lower() != "sparse" and man.get("cache_aligned") and (
-            _optional_int((man.get("bundle") or {}).get("frames_available")) or 0
-        ) <= 0:
-            self._send_err(404, "play cache missing or not contiguous from frame 0")
-            return
+        # 不读清单、不列 OSS：段文件名是固定的，没生成的段也能先签，
+        # 浏览器取到 404 就当还没好。只按 Redis 里的总帧数截掉越界的起点。
+        try:
+            from sview.jobs.job_status import get_job_fields
 
-        from sview.cache.oss_cache_gc import filter_playable_segment_starts
-
-        avail = _optional_int((man.get("bundle") or {}).get("frames_available"))
-        kept, skipped = filter_playable_segment_starts(
-            starts,
-            frames_available=avail,
-            segment_frames=_segment_frames(),
-            available_ranges=(man.get("bundle") or {}).get("available_ranges")
-            if (man.get("publish_mode") or "").lower() == "sparse"
-            else None,
+            fields = get_job_fields(_get_redis(), job_id)
+        except Exception as e:
+            self._send_retry(503, f"redis unavailable: {e}", retry_after=1)
+            return
+        if not fields:
+            self._send_err(404, "job not found")
+            return
+        frame_count = _optional_frame_count(
+            fields.get("frame_count"), fields.get("frames_total")
         )
+        seg_n = _segment_frames()
+        kept: list[int] = []
+        skipped: list[int] = []
+        for s in starts:
+            if s % seg_n != 0 or (frame_count is not None and frame_count > 0 and s >= frame_count):
+                skipped.append(s)
+            elif s not in kept:
+                kept.append(s)
+
+        max_expires = int(os.environ.get("OSS_SIGN_EXPIRES", "7200"))
+        expires = max_expires
+        if qs.get("expires"):
+            try:
+                expires = max(60, min(max_expires, int(qs["expires"][0])))
+            except ValueError:
+                self._send_err(400, "invalid expires")
+                return
         if not kept:
             self._send_json(
                 200,
                 {
                     "job_id": job_id,
                     "kind": kind,
-                    "expires_in": int(os.environ.get("OSS_SIGN_EXPIRES", "7200")),
+                    "expires_in": expires,
                     "items": [],
                     "skipped": skipped,
                 },
             )
             return
 
-        expires = int(os.environ.get("OSS_SIGN_EXPIRES", "7200"))
         try:
-            from sview.jobs.job_status import touch_job
             from sview.worker.cpu import oss_cache_key, sign_oss_url
-
-            try:
-                touch_job(_get_redis(), job_id)
-            except Exception:
-                pass
 
             items = []
             for s in kept:
@@ -2466,6 +2535,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             return False
         self.send_response(302)
         self.send_header("Location", url)
+        # HTTP/1.1 长连接：不写长度，网关会一直等正文直到超时（504）。
+        self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
         self.send_header("Access-Control-Expose-Headers", "Location")
         self._cors()

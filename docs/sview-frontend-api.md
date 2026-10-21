@@ -60,7 +60,7 @@ Frontend ──API / SSE / touch──► Master :8080
 | **推荐：签名直连 OSS** | `GET .../signed-media` 拿短时签名 URL，浏览器直拉公网 OSS（短 RTT）；Bucket 需 CORS |
 | `play_base` | 状态/SSE 可能返回公网前缀；私有桶勿匿名用；本仓库前端用 signed-media |
 | `?proxy=1` | 签名/CORS 失败时的兜底：Master 流式代理 |
-| 播放中 touch | SSE / `GET job` / signed-media 会 touch；长播建议周期性 `POST .../touch` |
+| 播放中 touch | SSE / `GET job` 会 touch（signed-media 不再 touch）；长播需周期性 `POST .../touch` |
 | cancel / force / GC | 会 purge OSS `player-bin/{job_id}/` 并清进度；manifest 按从 0 连续 segment 对齐，避免虚高 `frames_available` |
 | manifest | **始终由 Master 返回 JSON 正文**（避免跨域 302 导致解析失败） |
 
@@ -317,10 +317,11 @@ OSS 播放缓存只有打包段，没有逐帧 `frames/*.bin`。`kind=frames` �
 | 参数 | 说明 |
 |------|------|
 | `starts` | 逗号分隔段起始索引，如 `0,30,60`（优先） |
-| `start` / `count` / `step` | 区间形式；`step` 默认 `SEGMENT_FRAMES`；单次最多 32 条 |
+| `start` / `count` / `step` | 区间形式；`step` 默认 `SEGMENT_FRAMES`；单次最多 `OSS_SIGN_BATCH_MAX` 条（默认 600，约 10 分钟视频） |
+| `expires` | 可选，签名有效秒数；最小 60，最大不超过服务端 `OSS_SIGN_EXPIRES`（默认 7200） |
 | `kind` | 仅 `segments`（默认）。`frames` 非法 |
 
-超过 `frames_available`、未按 30 对齐的 `starts` **不会签发**，出现在响应 `skipped` 里（例如 `frames_available=330` 时 `330` 为 `not_ready`，最后一段是 `000300.bin`）。OSS list 失败时 **425**，请重试或走 Master `?proxy=1`。
+Master **不读清单、不列 OSS**，只从 Redis 读 `frame_count`，按段文件名直接签名。还没生成的段也会签出地址，浏览器 `fetch` 拿到 `404` 就当还没生成，稍后重试；是否该去取某段仍以 `manifest.json` 的 `available_ranges` 为准。超出 `frame_count` 或不在段边界（30 的整数倍）上的起点**不会签发**，出现在响应 `skipped` 里。任务在 Redis 里不存在返回 **404** `job not found`；Redis 不可用返回 **503**（带 `Retry-After`）。签名本身不访问 OSS，不会再因为读清单失败返回 404 或 425。
 
 **返回：** `200`
 
@@ -339,7 +340,7 @@ OSS 播放缓存只有打包段，没有逐帧 `frames/*.bin`。`kind=frames` �
 }
 ```
 
-**前端策略（本仓库默认）：** 批量签名 → `fetch(url)` 直连 OSS；CORS/403/内网签名失败则禁用并回退 Master `?proxy=1`。  
+**前端策略（推荐）：** 打开、Seek 到已签范围外、播到已签范围末尾前约 2 分钟、或签名快过期时，用 `start=当前段&count=600&expires=1800` 一次签一批并缓存；其余时间不再请求签名。`fetch(url)` 直连 OSS：`404` 当作还没生成，`403` 先清掉这一批重签一次，连续失败再回退 Master `?proxy=1`。  
 调试：`?media=proxy` / `?media=signed`。
 
 **Bucket CORS：** 需允许前端 Origin 的 `GET`/`HEAD`（含 `Authorization` 非必须；签名在 query）。本地 Vite 源为 `http://127.0.0.1:5173`。

@@ -99,6 +99,13 @@ export type JobStatus = {
   manifest_revision?: number;
 };
 
+export type JobStatsSession = {
+  client_id: string;
+  pod_ip?: string;
+  worker_id?: string;
+  segment?: number;
+};
+
 export type JobStatsItem = {
   job_id: string;
   status: string;
@@ -106,6 +113,9 @@ export type JobStatsItem = {
   source?: string;
   playable?: boolean;
   frames_done?: number;
+  /** 同一个文件上同时在编的窗口。两个人各看各的位置时这里有两条。 */
+  clients?: string[];
+  sessions?: JobStatsSession[];
 };
 
 export type JobStats = {

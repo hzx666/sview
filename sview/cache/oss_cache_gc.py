@@ -296,8 +296,13 @@ def purge_job_play_cache(
                 {
                     "frames_done": 0,
                     "playable": 0,
+                    "available_ranges": "[]",
+                    "segments_ready_count": 0,
                 }
             )
+            # 稀疏任务留着 ready 的话，下次打开会被当成已编完、不再开编码线程。
+            if (fields.get("publish_mode") or "").lower() == "sparse":
+                patch.update({"status": "queued", "encode_status": "queued"})
         try:
             set_job_fields(r, job_id, **patch)
         except Exception:

@@ -98,7 +98,7 @@ POST /api/jobs  { source: "oss://.../*.mcap" }
 
 媒体 URL：
 
-1. `GET /api/jobs/{id}/signed-media?starts=0,30,60,...` → `fetch(url)` 直连公网 OSS  
+1. `GET /api/jobs/{id}/signed-media?start={当前段}&count=600&expires=1800` 一次签约 10 分钟的段并缓存 → `fetch(url)` 直连公网 OSS（`404` 当作还没生成）  
 2. CORS / 403 / 内网签名失败 → `{Base}/api/jobs/{id}/segments/{start:06d}.bin?proxy=1`
 
 调试：`?media=proxy` 强制走 Master；`?media=signed` 强制签名 OSS。
@@ -122,7 +122,7 @@ POST /api/jobs  { source: "oss://.../*.mcap" }
 3. 播放头距前沿 &lt; 90 帧 →「加载中…」，**不要显示播放结束**
 4. 暂停后等到领先 ≥ 150 帧再恢复，避免抖动
 5. 进度条 max 始终用 `frame_count`；当前进度用播放头索引
-6. 长播每分钟 `POST .../touch`（查状态 / SSE / signed-media 也会 touch）
+6. 长播每分钟 `POST .../touch`（查状态 / SSE 也会 touch；signed-media 不再 touch）
 
 `status=done` 且 `frames_available === frame_count` 后停刷 manifest；播到最后一帧再结束。
 

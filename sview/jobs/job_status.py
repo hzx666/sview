@@ -404,6 +404,23 @@ def collect_job_stats(r) -> dict:
             by_job[job_id] = item
         if live:
             item["status"] = "processing"
+            # 同一个文件可以有多条编码线（每人一条）。按窗口和所在机器列出来，
+            # 不要收成一个 job 后看不出来。
+            session = {
+                "client_id": client_id,
+                "pod_ip": (worker.get("pod_ip") or ""),
+                "worker_id": (worker.get("worker_id") or ""),
+            }
+            if segment is not None:
+                session["segment"] = int(segment)
+            sessions = item.setdefault("sessions", [])
+            if not any(
+                s.get("client_id") == session["client_id"]
+                and s.get("pod_ip") == session["pod_ip"]
+                and s.get("segment") == session.get("segment")
+                for s in sessions
+            ):
+                sessions.append(session)
         if segment is not None:
             item.setdefault("active_segments", []).append(int(segment))
         if client_id:
@@ -542,6 +559,7 @@ def _clear_job_runtime_keys(r, job_id: str) -> None:
         job_active_key(job_id),
         f"sview:frame-index:lock:{job_id}",
         f"sview:manifest:lock:{job_id}",
+        f"sview:segment:end:{job_id}",
     ]
     patterns = [
         f"{SEGMENT_PENDING_PREFIX}{job_id}:*",
@@ -1214,23 +1232,131 @@ def claim_segment_slot(
     """认领某个片段唯一的 worker 槽。
 
     同一窗口可以给自己的认领续期。别的窗口必须等
-    片段发布，不能再占第二条在途线程。
+    片段发布，不能再占第二条在途线程。占着槽的窗口
+    编码线程已经不在（没在跑也没在排队）时，直接接手，
+    不用等槽过期。
     """
     client_id = (client_id or "anonymous")[:128]
     key = segment_slot_key(job_id, start)
     ttl = max(30, int(ttl))
     if r.set(key, client_id, nx=True, ex=ttl):
         return True
-    current = r.get(key)
-    if isinstance(current, bytes):
-        current = current.decode("utf-8", errors="replace")
+    current = _decode(r.get(key))
     if current == client_id:
         try:
             r.expire(key, ttl)
         except Exception:
             r.set(key, client_id, ex=ttl)
         return True
+    if current and not slot_holder_live(r, job_id, current):
+        r.set(key, client_id, ex=ttl)
+        return _decode(r.get(key)) == client_id
     return False
+
+
+def _decode(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
+
+
+def slot_holder_live(r, job_id: str, holder: str) -> bool:
+    """占槽窗口的编码线程还在跑，或者已经排进队列。"""
+    if not holder:
+        return False
+    return bool(
+        r.get(session_alive_key(job_id, holder))
+        or r.get(session_pending_key(job_id, holder))
+    )
+
+
+def live_run_at(r, job_id: str, start: int, client_id: str, segment_frames: int = 30) -> bool:
+    """别的窗口有活着的编码线程正停在 ``start`` 这一段，或刚发布完它前一段。
+
+    线程编完一段、去认领下一段之前，槽还挂在刚发布的那段上。
+    两处都看，才不会把正在往后推进的线程误判成已经停下。
+    """
+    seg_n = max(1, int(segment_frames or 30))
+    for seg in (int(start), int(start) - seg_n):
+        if seg < 0:
+            continue
+        holder = _decode(r.get(segment_slot_key(job_id, seg)))
+        if holder and holder != client_id and slot_holder_live(r, job_id, holder):
+            return True
+    return False
+
+
+def segment_end_key(job_id: str) -> str:
+    return f"sview:segment:end:{job_id}"
+
+
+def mark_decode_end(r, job_id: str, start: int) -> None:
+    """记下从 ``start`` 起已经没有可解码的消息，别再给这里排编码线程。"""
+    key = segment_end_key(job_id)
+    try:
+        current = int(_decode(r.get(key)) or 0)
+    except (TypeError, ValueError):
+        current = 0
+    value = int(start) if current <= 0 else min(current, int(start))
+    r.set(key, str(value), ex=ENCODE_REQUEST_TTL_SEC)
+
+
+def decode_end(r, job_id: str) -> Optional[int]:
+    try:
+        raw = _decode(r.get(segment_end_key(job_id)))
+        return int(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
+
+
+# 交接只替最近这么多秒内请求过的窗口排线程，早就关掉的窗口不再白编。
+HANDOFF_RECENT_SEC = max(10, int(os.environ.get("SVIEW_HANDOFF_RECENT_SEC", "120") or "120"))
+
+
+def hand_off_waiting_windows(
+    r,
+    job_id: str,
+    source: str,
+    *,
+    exclude: str = "",
+    segment_frames: int = 30,
+) -> list[str]:
+    """一条编码线程退出时，替还在等缺段、又没人在编的窗口排线程。
+
+    只管请求的那一段确实还缺的窗口（正卡在这里等）。前沿那段已经好了的
+    窗口在播缓存，或者早就切去别的文件，播到缺口时它自己会再请求。
+    """
+    from sview.cache.oss_cache_gc import frame_range_ready
+
+    seg_n = max(1, int(segment_frames or 30))
+    fields = get_job_fields(r, job_id)
+    try:
+        total = int(fields.get("frame_count") or fields.get("frames_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        ranges = json.loads(fields.get("available_ranges") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        ranges = []
+    started: list[str] = []
+    prefix = session_frontier_key(job_id, "")[: -len("anonymous")]
+    for key in _scan_keys(r, f"{prefix}*"):
+        client = key[len(prefix):]
+        if not client or client == exclude:
+            continue
+        try:
+            remaining = int(r.ttl(key))
+        except Exception:
+            remaining = ENCODE_REQUEST_TTL_SEC
+        if remaining >= 0 and ENCODE_REQUEST_TTL_SEC - remaining > HANDOFF_RECENT_SEC:
+            continue
+        want = read_client_frontier(r, job_id, client)
+        want_end = min(total, want + seg_n) if total > 0 else want + seg_n
+        if want_end > want and frame_range_ready(ranges, want, want_end):
+            continue
+        if ensure_sparse_session(r, job_id, source, client, segment_frames=segment_frames):
+            started.append(client)
+    return started
 
 
 def release_segment_slot(r, job_id: str, start: int, client_id: str) -> None:
@@ -1267,14 +1393,76 @@ def first_unencoded_segment(
         ranges = json.loads(fields.get("available_ranges") or "[]")
     except (TypeError, ValueError, json.JSONDecodeError):
         ranges = []
+    end_at = decode_end(r, job_id)
     guard = 0
     while guard < 10000 and (total <= 0 or seg < total):
+        if end_at is not None and seg >= end_at:
+            return None
         end = min(total, seg + seg_n) if total > 0 else seg + seg_n
         if total <= 0 or end <= seg or not frame_range_ready(ranges, seg, end):
             return seg
         seg += seg_n
         guard += 1
     return None
+
+
+def sync_sparse_ranges_from_oss(
+    r,
+    job_id: str,
+    oss_ranges: Any,
+    *,
+    frame_count: Optional[int] = None,
+    expect_revision: Optional[str] = None,
+    segment_frames: int = 30,
+) -> bool:
+    """Redis 声称的区间里有 OSS 上已经没有的段时，改成 OSS 的实际区间。
+
+    worker 先 PUT 分段再写 Redis，正常情况下 OSS 只会比 Redis 多。
+    Redis 多出来的段只可能是被删了（生命周期 / GC）。不改的话
+    ``first_unencoded_segment`` 会以为全编完，不再开编码线程。
+    ``expect_revision``：读 OSS 之前看到的 manifest_revision；列举期间
+    有新段发布就放弃这次同步，避免拿旧列表盖掉刚发布的段。
+    """
+    from sview.cache.oss_cache_gc import (
+        contiguous_prefix_from_ranges,
+        frame_range_ready,
+        merge_available_ranges,
+    )
+
+    fields = get_job_fields(r, job_id)
+    if expect_revision is not None and str(fields.get("manifest_revision") or "") != str(
+        expect_revision or ""
+    ):
+        return False
+    try:
+        claimed = json.loads(fields.get("available_ranges") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        claimed = []
+    actual = merge_available_ranges(oss_ranges or [])
+    stale = any(
+        int(b) > int(a) and not frame_range_ready(actual, int(a), int(b))
+        for a, b in merge_available_ranges(claimed)
+    )
+    if not stale:
+        return False
+    try:
+        total = int(frame_count or fields.get("frame_count") or fields.get("frames_total") or 0)
+    except (TypeError, ValueError):
+        total = 0
+    seg_n = max(1, int(segment_frames or 30))
+    prefix = contiguous_prefix_from_ranges(actual)
+    set_job_fields(
+        r,
+        job_id,
+        status="ready" if total > 0 and prefix >= total else "processing",
+        available_ranges=json.dumps(actual, separators=(",", ":")),
+        frames_done=prefix,
+        segments_ready_count=sum(
+            max(0, (int(b) - int(a) + seg_n - 1) // seg_n) for a, b in actual
+        ),
+        playable=1 if actual else 0,
+    )
+    return True
 
 
 def ensure_sparse_session(

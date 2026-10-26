@@ -4406,6 +4406,33 @@ def _load_sparse_manifest(job_id: str) -> dict | None:
     return None
 
 
+def _published_sparse_ranges(r, job_id: str, bundle: dict, frame_count: int) -> list:
+    """合并新段之前，已经发布的区间以 OSS 上实际存在的段文件为准。
+
+    清单原文里的区间可能过期：段被生命周期或 GC 删掉后，清单每次发布都会
+    被重写而留下来。照着它合并会把 Redis 写成整片都有，编码线以为编完了就退出。
+    """
+    if not OSS_CACHE:
+        return list(bundle.get("available_ranges") or [])
+    from sview.cache.oss_cache_gc import (
+        available_ranges_from_starts,
+        list_oss_segment_starts,
+    )
+
+    starts = list_oss_segment_starts(job_id)
+    if starts is not None:
+        return available_ranges_from_starts(
+            starts, segment_frames=SEGMENT_FRAMES, frame_count=frame_count
+        )
+    # 列举失败：退回 Redis（Master 提交、/encode 时按 OSS 校正过），不用清单原文。
+    try:
+        from sview.jobs.job_status import get_job_fields
+
+        return json.loads(get_job_fields(r, job_id).get("available_ranges") or "[]")
+    except Exception:
+        return []
+
+
 def _publish_sparse_segment(
     r,
     *,
@@ -4475,7 +4502,7 @@ def _publish_sparse_segment(
         bundle.update(current.get("bundle") or {})
         frame_count = int(frame_index_data["frame_count"])
         ranges = merge_available_ranges(
-            [*(bundle.get("available_ranges") or []), [start, end]],
+            [*_published_sparse_ranges(r, job_id, bundle, frame_count), [start, end]],
             frame_count=frame_count,
         )
         bundle["frame_count"] = frame_count

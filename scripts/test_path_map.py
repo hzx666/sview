@@ -50,7 +50,50 @@ def test_unitree_never_head_cam():
     ) == "teleop"
 
 
+ASTRIBOT_HDF5 = (
+    "oss://ss-oss-data-platform/original_data/teleoperation/Astribot/260903/"
+    "S1_002_device/Astribot_S1_002_20260903_InsertWire_DAgger_242.hdf5"
+)
+ASTRIBOT_MCAP = (
+    "oss://ss-oss-data-platform/hdf5_to_mcap/teleoperation/Astribot/260903/"
+    "S1_002_device/Astribot_S1_002_20260903_InsertWire_DAgger_242.mcap"
+)
+
+
+def test_astribot_hdf5_maps_to_converted_mcap():
+    import tempfile
+
+    import sview.path_map as pm
+
+    assert pm.converted_mcap_source(ASTRIBOT_HDF5) == ASTRIBOT_MCAP
+    assert pm.converted_mcap_source(UNITREE_OSS) is None
+    assert pm.converted_mcap_source(ASTRIBOT_MCAP) is None
+
+    kind, _mount, rel = pm.classify_source(ASTRIBOT_MCAP)
+    assert kind == "converted"
+    assert rel == "Astribot/260903/S1_002_device/Astribot_S1_002_20260903_InsertWire_DAgger_242.mcap"
+    assert pm.ingest_family(ASTRIBOT_MCAP) == "teleop"
+    assert pm.teleop_robot(ASTRIBOT_MCAP) == "Astribot"
+    # 去掉 bucket 的写法也不能被当成原始遥操数据。
+    assert pm.classify_source(ASTRIBOT_MCAP.split("/", 3)[3])[0] == "converted"
+
+    saved = pm.HDF5_MCAP_MOUNT
+    with tempfile.TemporaryDirectory() as tmp:
+        pm.HDF5_MCAP_MOUNT = Path(tmp)
+        try:
+            assert pm.prefer_converted_source(ASTRIBOT_HDF5) == ASTRIBOT_HDF5
+            target = Path(tmp) / rel
+            target.parent.mkdir(parents=True)
+            target.write_bytes(b"\x89MCAP0\r\n")
+            assert pm.source_to_local(ASTRIBOT_MCAP) == target
+            assert pm.prefer_converted_source(ASTRIBOT_HDF5) == ASTRIBOT_MCAP
+            assert pm.prefer_converted_source(UNITREE_OSS) == UNITREE_OSS
+        finally:
+            pm.HDF5_MCAP_MOUNT = saved
+
+
 if __name__ == "__main__":
     test_ingest_family()
     test_unitree_never_head_cam()
+    test_astribot_hdf5_maps_to_converted_mcap()
     print("ok")

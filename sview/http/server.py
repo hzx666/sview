@@ -721,6 +721,12 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
         if not source:
             self._send_json(400, {"error": "missing source (oss://...mcap)"})
             return
+        from sview.path_map import prefer_converted_source
+
+        played = prefer_converted_source(source)
+        if played != source:
+            log.info("submit %s -> converted mcap %s", source, played)
+            source = played
         if not source.lower().endswith(".mcap") and ".mcap" not in source.lower():
             # 不严格校验也放行；明显不对时在消息里警告
             pass

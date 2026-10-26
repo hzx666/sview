@@ -73,7 +73,7 @@ COPY sview/ ./sview/
 COPY sview_worker.py sview_http.py sview_work_gpu.py ./
 
 # Data / cache mount points (K8s binds OSS PVCs here)
-RUN mkdir -p /head-data /teleoperation /orin-data /cache /tmp/sview_worker
+RUN mkdir -p /head-data /teleoperation /hdf5-mcap /orin-data /cache /tmp/sview_worker
 
 EXPOSE 8080
 

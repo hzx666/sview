@@ -579,6 +579,9 @@ def test_queue_stats_show_session_and_waiting_job():
         def llen(self, key):
             return len(self.lists.get(key, []))
 
+        def lrange(self, key, start, end):
+            return list(self.lists.get(key, []))
+
         def get(self, key):
             return self.values.get(key)
 
@@ -610,6 +613,16 @@ def test_queue_stats_show_session_and_waiting_job():
         "source": "oss://bucket/waiting.mcap",
         "frames_done": "0",
     }
+    redis.lists[REDIS_QUEUE_KEY].append(
+        _json.dumps({"v": 2, "kind": "sparse_session", "source": "oss://bucket/waiting.mcap",
+                     "job_id": waiting, "client_id": "tab-w"})
+    )
+    # 已排编码线、Worker 还没接走：有 pending 标记。
+    pending_job = "SSIEGO_pending"
+    redis.hashes[f"{JOB_KEY_PREFIX}{pending_job}"] = {"status": "processing"}
+    redis.values[f"sview:session:pending:{pending_job}:tab-p"] = "1"
+    # GC 清理后停在 queued、但没有任何队列项或 pending：不算排队。
+    redis.hashes[f"{JOB_KEY_PREFIX}SSIEGO_purged"] = {"status": "queued", "frames_done": "0"}
     redis.values[f"{WORKER_KEY_PREFIX}pod-1"] = _json.dumps(
         {
             "worker_id": "pod-1",
@@ -628,13 +641,15 @@ def test_queue_stats_show_session_and_waiting_job():
     )
     stats = collect_job_stats(redis)
     by_id = {item["job_id"]: item for item in stats["jobs"]}
-    assert stats["queued"] == 1
+    assert stats["queued"] == 2
     assert stats["processing"] == 2
     assert by_id[running]["status"] == "processing"
     assert by_id[running]["clients"] == ["window-a", "window-b"]
     assert [s["pod_ip"] for s in by_id[running]["sessions"]] == ["10.0.0.8", "10.0.0.9"]
-    assert len(stats["jobs"]) == 2
     assert by_id[waiting]["status"] == "queued"
+    assert by_id[pending_job]["status"] == "queued"
+    assert "SSIEGO_purged" not in by_id
+    assert len(stats["jobs"]) == 3
 
 
 def test_forward_run_reuses_only_the_next_frame():
@@ -1362,7 +1377,76 @@ def test_oss_manifest_read_error_is_retry_not_missing():
         cpu_mod.get_oss_bucket, srv._oss_cache_on = saved
 
 
+def test_publish_ignores_stale_manifest_ranges():
+    import json
+
+    import sview.cache.oss_cache_gc as gc
+    import sview.worker.cpu as cpu_mod
+    from sview.jobs.job_status import first_unencoded_segment, get_job_fields, job_redis_key
+
+    job = "stale_manifest"
+    redis = _KvStore()
+    redis.hashes[job_redis_key(job)] = {
+        "publish_mode": "sparse",
+        "frame_count": "4378",
+        "available_ranges": "[[0,30],[3150,3180]]",
+        "status": "processing",
+    }
+    # 清单原文还记着整片都有，OSS 上实际只剩 0 和 3150，再加刚上传的 30。
+    stale = {
+        "job_id": job,
+        "publish_mode": "sparse",
+        "bundle": {"frame_count": 4378, "available_ranges": [[0, 4378]]},
+    }
+    saved = (
+        cpu_mod.OSS_CACHE,
+        cpu_mod.upload_bytes_to_oss,
+        cpu_mod._load_sparse_manifest,
+        cpu_mod._oss_cache_upload_manifest,
+        cpu_mod._publish_manifest,
+        gc.list_oss_segment_starts,
+    )
+    cpu_mod.OSS_CACHE = True
+    cpu_mod.upload_bytes_to_oss = lambda *a, **kw: None
+    cpu_mod._load_sparse_manifest = lambda job_id: stale
+    cpu_mod._oss_cache_upload_manifest = lambda *a, **kw: None
+    cpu_mod._publish_manifest = lambda *a, **kw: None
+    gc.list_oss_segment_starts = lambda job_id: {0, 30, 3150}
+    redis.hincrby = lambda key, field, amount=1: 1
+    idr = b"\x00\x00\x00\x01\x65" + b"\x11" * 8
+    blob = cpu_mod._build_bundle_frame(
+        30, {ch: idr for ch in ("RR", "FR", "RL", "FL")}, 0, [0, 1], True, {}, {}
+    )
+    try:
+        cpu_mod._publish_sparse_segment(
+            redis,
+            job_id=job,
+            source="oss://b/x.mcap",
+            start=30,
+            end=60,
+            frame_blobs=[blob] * 30,
+            base_manifest={"bundle": {}},
+            frame_index_data={"frame_count": 4378, "timestamps_ns": []},
+            epoch=0,
+            upload_index=False,
+        )
+    finally:
+        (
+            cpu_mod.OSS_CACHE,
+            cpu_mod.upload_bytes_to_oss,
+            cpu_mod._load_sparse_manifest,
+            cpu_mod._oss_cache_upload_manifest,
+            cpu_mod._publish_manifest,
+            gc.list_oss_segment_starts,
+        ) = saved
+    fields = get_job_fields(redis, job)
+    assert json.loads(fields["available_ranges"]) == [[0, 60], [3150, 3180]]
+    assert fields["status"] == "processing"
+    assert first_unencoded_segment(redis, job, "tab", 30) == 60
+
+
 if __name__ == "__main__":
+    test_publish_ignores_stale_manifest_ranges()
     test_signed_media_signs_a_window_without_reading_oss()
     test_oss_manifest_read_error_is_retry_not_missing()
     test_oss_redirect_does_not_hang_keepalive()

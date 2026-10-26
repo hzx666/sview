@@ -1,0 +1,58 @@
+# HDF5 转写后的 mcap（hdf5_to_mcap 工具输出）：目录结构与 original_data/teleoperation 相同，扩展名为 .mcap。
+#
+# 提交原始 Astribot .hdf5 时，Master 发现这里有同名 .mcap 就改用它播放。
+# Master 和 Worker 都要挂这个卷：Master 提交时检查文件是否存在，Worker 读 mcap 转码。
+#
+# Pod mount: /hdf5-mcap  (HDF5_MCAP_MOUNT)
+# OSS: oss://ss-oss-data-platform/hdf5_to_mcap/teleoperation/{Astribot,...}/
+#
+# 在 Master / Worker Deployment 里加：
+#   volumeMounts:
+#     - mountPath: /hdf5-mcap
+#       name: hdf5-mcap
+#   volumes:
+#     - name: hdf5-mcap
+#       persistentVolumeClaim:
+#         claimName: mcap-input-hdf5-mcap-oss-pvc
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mcap-input-hdf5-mcap-oss-pv
+  labels:
+    alicloud-pvname: mcap-input-hdf5-mcap-oss-pv
+spec:
+  accessModes:
+    - ReadOnlyMany
+  capacity:
+    storage: 10Gi
+  persistentVolumeReclaimPolicy: Retain
+  volumeMode: Filesystem
+  csi:
+    driver: ossplugin.csi.alibabacloud.com
+    volumeHandle: mcap-input-hdf5-mcap-oss-pv
+    nodePublishSecretRef:
+      name: oss-credentials
+      namespace: mcap-extract
+    volumeAttributes:
+      bucket: ss-oss-data-platform
+      fuseType: ossfs2
+      otherOpts: "-o allow_other"
+      path: /hdf5_to_mcap/teleoperation
+      url: oss-cn-shanghai-internal.aliyuncs.com
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mcap-input-hdf5-mcap-oss-pvc
+  namespace: mcap-extract
+spec:
+  accessModes:
+    - ReadOnlyMany
+  resources:
+    requests:
+      storage: 10Gi
+  volumeMode: Filesystem
+  selector:
+    matchLabels:
+      alicloud-pvname: mcap-input-hdf5-mcap-oss-pv

@@ -16,6 +16,11 @@ K8s 应挂载：
 
   oss://ss-oss-data-platform/original_data/teleoperation/Agilex/260825/COBOT_001_device/xxx.mcap
     -> /teleoperation/Agilex/260825/COBOT_001_device/xxx.mcap
+
+HDF5 转写出来的 mcap（hdf5_to_mcap 工具，目录结构与原始数据相同，扩展名换成 .mcap）：
+  hdf5_to_mcap/teleoperation/  ->  HDF5_MCAP_MOUNT （默认 /hdf5-mcap）
+  oss://ss-oss-data-platform/hdf5_to_mcap/teleoperation/Astribot/260903/S1_002_device/xxx.mcap
+    -> /hdf5-mcap/Astribot/260903/S1_002_device/xxx.mcap
 """
 
 import os
@@ -31,6 +36,10 @@ ORIN_MOUNT = Path(
     or "/teleoperation"
 )
 _LEGACY_ORIN_MOUNT = Path("/orin-data")
+HDF5_MCAP_MOUNT = Path(os.environ.get("HDF5_MCAP_MOUNT") or "/hdf5-mcap")
+_CONVERTED_KEY_PREFIX = "hdf5_to_mcap/teleoperation/"
+_HDF5_SUFFIXES = (".hdf5", ".h5", ".hdf")
+_DEFAULT_BUCKET = os.environ.get("OSS_BUCKET") or "ss-oss-data-platform"
 
 # 可选 "oss://{bucket}/" 之后的 key 前缀
 _HEAD_CAM_KEY_PREFIXES = (
@@ -96,7 +105,7 @@ def ingest_family(raw_path: str) -> str:
     kind, _mount, _rel = classify_source(raw_path)
     if kind in ("head_cam", "legacy"):
         return "head_cam"
-    if kind == "orin":
+    if kind in ("orin", "converted"):
         return "teleop"
     key = _strip_oss_scheme(raw_path.strip().replace("\\", "/"))
     if _relative_after_prefix(key, _HEAD_CAM_KEY_PREFIXES) is not None:
@@ -114,7 +123,7 @@ def ingest_family(raw_path: str) -> str:
 def teleop_robot(raw_path: str) -> Optional[str]:
     """Orin / Agilex / Astribot / Franka / Unitree，否则 None。"""
     kind, _mount, rel = classify_source(raw_path)
-    if kind == "orin" and rel:
+    if kind in ("orin", "converted") and rel:
         name = rel.split("/")[0]
         if name in _TELEOP_ROBOTS:
             return name
@@ -125,8 +134,9 @@ def teleop_robot(raw_path: str) -> Optional[str]:
 def classify_source(raw_path: str) -> Tuple[str, Path, str]:
     """
     返回 (kind, mount_root, relative)。
-    kind：'head_cam' | 'orin' | 'legacy' | 'raw'
+    kind：'head_cam' | 'orin' | 'converted' | 'legacy' | 'raw'
     遥操的 relative 保留机体目录：``Orin/260701/...``、``Agilex/260825/...``。
+    'converted' 是 hdf5_to_mcap 转出的 mcap，挂在 HDF5_MCAP_MOUNT。
     """
     s = raw_path.strip().replace("\\", "/")
 
@@ -134,12 +144,21 @@ def classify_source(raw_path: str) -> Tuple[str, Path, str]:
     if _norm_mount(ORIN_MOUNT) != _norm_mount(_LEGACY_ORIN_MOUNT):
         teleop_mounts.append(("orin", _LEGACY_ORIN_MOUNT))
 
-    for kind, mount in (("head_cam", HEAD_CAM_MOUNT), *teleop_mounts):
+    for kind, mount in (
+        ("head_cam", HEAD_CAM_MOUNT),
+        ("converted", HDF5_MCAP_MOUNT),
+        *teleop_mounts,
+    ):
         mount_s = _norm_mount(mount)
         if s == mount_s or s.startswith(mount_s + "/"):
             return kind, mount, s[len(mount_s) :].lstrip("/")
 
     key = _strip_oss_scheme(s)
+
+    # 必须先于遥操匹配：去掉 bucket 后 "teleoperation/Astribot/" 也会命中原始数据前缀。
+    rel = _relative_after_prefix(key, (_CONVERTED_KEY_PREFIX,))
+    if rel is not None:
+        return "converted", HDF5_MCAP_MOUNT, rel
 
     rel = _relative_after_prefix(key, _HEAD_CAM_KEY_PREFIXES)
     if rel is not None:
@@ -186,6 +205,37 @@ def source_to_local(raw_path: str) -> Path:
 def redis_path_to_local(redis_path: str) -> Path:
     """给现有 worker 调用点用的别名。"""
     return source_to_local(redis_path)
+
+
+def converted_mcap_source(raw_path: str) -> Optional[str]:
+    """原始遥操 HDF5 对应的 hdf5_to_mcap 地址；不是遥操 HDF5 时返回 None。
+
+    转写工具保留 ``{机体}/{日期}/{设备}/`` 目录，只把扩展名换成 ``.mcap``：
+      oss://b/original_data/teleoperation/Astribot/260903/S1_002_device/x.hdf5
+        -> oss://b/hdf5_to_mcap/teleoperation/Astribot/260903/S1_002_device/x.mcap
+    """
+    kind, _mount, rel = classify_source(raw_path)
+    if kind != "orin" or not rel:
+        return None
+    if not rel.lower().endswith(_HDF5_SUFFIXES):
+        return None
+    robot, _sep, rest = rel.partition("/")
+    if robot not in _TELEOP_ROBOTS or not rest:
+        return None
+    stem = rel.rsplit(".", 1)[0]
+    s = raw_path.strip().replace("\\", "/")
+    bucket = _DEFAULT_BUCKET
+    if s.startswith("oss://"):
+        bucket = s[len("oss://") :].split("/", 1)[0] or bucket
+    return f"oss://{bucket}/{_CONVERTED_KEY_PREFIX}{stem}.mcap"
+
+
+def prefer_converted_source(raw_path: str) -> str:
+    """遥操 HDF5 已经转写成 mcap 时，播放用转写后的 mcap；否则原样返回。"""
+    converted = converted_mcap_source(raw_path)
+    if converted and source_to_local(converted).is_file():
+        return converted
+    return raw_path
 
 
 if __name__ == "__main__":

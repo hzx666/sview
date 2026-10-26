@@ -447,27 +447,34 @@ def collect_job_stats(r) -> dict:
             elif text:
                 active_ids.add(text)
                 _attach(text, worker=worker, live=True)
-    waiting = 0
-    cursor = 0
-    job_pattern = f"{JOB_KEY_PREFIX}*"
-    while True:
-        cursor, keys = r.scan(cursor=cursor, match=job_pattern, count=100)
-        for key in keys or []:
-            if isinstance(key, bytes):
-                key = key.decode("utf-8", errors="replace")
-            if not str(key).startswith(JOB_KEY_PREFIX):
-                continue
-            job_id = str(key)[len(JOB_KEY_PREFIX) :]
-            if not job_id or job_id in active_ids or job_id in by_job:
-                continue
-            fields = get_job_fields(r, job_id)
-            if (fields.get("status") or "").lower() != "queued":
-                continue
-            waiting += 1
-            _attach(job_id, worker={})
-            by_job[job_id]["status"] = "queued"
-        if cursor == 0:
-            break
+    # 排队只认真正在等 Worker 的：队列里的条目，或已排了编码线还没被接走的
+    # pending 标记（带 TTL）。任务 hash 里 status=queued 不算，GC 清理后的
+    # 稀疏任务和从没开始过的提交都会停在 queued。
+    waiting_ids: list[str] = []
+    seen_waiting: set[str] = set()
+
+    def _mark_waiting(job_id: str) -> None:
+        if not job_id or job_id in active_ids or job_id in by_job or job_id in seen_waiting:
+            return
+        seen_waiting.add(job_id)
+        waiting_ids.append(job_id)
+
+    try:
+        raw_items = r.lrange(REDIS_QUEUE_KEY, 0, -1) or []
+    except Exception:
+        raw_items = []
+    for raw in raw_items:
+        try:
+            _mark_waiting(str(parse_queue_item(raw).get("job_id") or ""))
+        except Exception:
+            continue
+    for prefix in ("sview:session:pending:", SEGMENT_PENDING_PREFIX):
+        for key in _scan_keys(r, f"{prefix}*"):
+            _mark_waiting(key[len(prefix):].rsplit(":", 1)[0])
+    for job_id in waiting_ids:
+        _attach(job_id, worker={})
+        by_job[job_id]["status"] = "queued"
+    waiting = len(waiting_ids)
     jobs.sort(key=lambda j: j.get("job_id") or "")
     processing = max(
         sum(1 for item in jobs if (item.get("status") or "") != "queued"),

@@ -199,6 +199,88 @@ def _is_orin_jpeg_topic(topic: str) -> bool:
     return _looks_like_orin_topic(t)
 
 
+class _Ros1Reader:
+    """按 ROS1 小端序列化格式顺序读字段。"""
+
+    def __init__(self, data: bytes):
+        self.data = memoryview(data)
+        self.pos = 0
+
+    def u32(self) -> int:
+        import struct
+
+        if self.pos + 4 > len(self.data):
+            raise ValueError("truncated ros1 message")
+        value = struct.unpack_from("<I", self.data, self.pos)[0]
+        self.pos += 4
+        return value
+
+    def u8(self) -> int:
+        if self.pos + 1 > len(self.data):
+            raise ValueError("truncated ros1 message")
+        value = self.data[self.pos]
+        self.pos += 1
+        return value
+
+    def raw(self) -> bytes:
+        n = self.u32()
+        if self.pos + n > len(self.data):
+            raise ValueError("truncated ros1 message")
+        value = bytes(self.data[self.pos : self.pos + n])
+        self.pos += n
+        return value
+
+    def text(self) -> str:
+        return self.raw().decode("utf-8", errors="replace")
+
+    def header(self):
+        from types import SimpleNamespace
+
+        seq = self.u32()
+        sec = self.u32()
+        nsec = self.u32()
+        stamp = SimpleNamespace(sec=sec, nanosec=nsec, secs=sec, nsecs=nsec)
+        return SimpleNamespace(seq=seq, stamp=stamp, frame_id=self.text())
+
+
+def _ros1_decoder_for(schema_name: str):
+    """ROS1 只解相机消息（CompressedImage / Image），其他类型返回 None。
+
+    hdf5_to_mcap 转出的 Astribot mcap 是 ROS1 profile。
+    """
+    from types import SimpleNamespace
+
+    name = _norm_schema_name(schema_name)
+    if name.endswith("compressedimage"):
+        def decode(data: bytes):
+            rd = _Ros1Reader(data)
+            header = rd.header()
+            return SimpleNamespace(header=header, format=rd.text(), data=rd.raw())
+
+        return decode
+    if _schema_is_raw_image(schema_name):
+        def decode(data: bytes):
+            rd = _Ros1Reader(data)
+            header = rd.header()
+            height = rd.u32()
+            width = rd.u32()
+            encoding = rd.text()
+            is_bigendian = rd.u8()
+            step = rd.u32()
+            return SimpleNamespace(
+                header=header,
+                height=height,
+                width=width,
+                encoding=encoding,
+                is_bigendian=is_bigendian,
+                step=step,
+                data=rd.raw(),
+            )
+
+        return decode
+    return None
+
+
 def _iter_ros2_messages_tolerant(
     path: str,
     topic_ok=None,
@@ -208,6 +290,7 @@ def _iter_ros2_messages_tolerant(
 ):
     """产出 ROS2 消息；跳过 protobuf 和其他编码，不要整包中断。
 
+    ROS1 的相机消息（CompressedImage / Image）也会解出来，字段名和 ROS2 一致。
     ``topic_ok``：可选 ``topic -> bool``。
     ``channel_ok``：可选 ``(topic, schema_name) -> bool``。设置后
     替代 ``topic_ok``，schema 是 Image / CompressedImage 的未知相机 topic 也能留。
@@ -238,7 +321,10 @@ def _iter_ros2_messages_tolerant(
             elif topic_ok is not None and not topic_ok(topic):
                 continue
             enc = getattr(channel, "message_encoding", "") or ""
-            decoder = factory.decoder_for(enc, schema)
+            if enc.lower() == "ros1":
+                decoder = _ros1_decoder_for(schema_name)
+            else:
+                decoder = factory.decoder_for(enc, schema)
             if decoder is None or schema is None or channel is None:
                 continue
             try:

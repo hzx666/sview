@@ -2,7 +2,7 @@
   "openapi": "3.0.1",
   "info": {
     "title": "player-bin Master API",
-    "description": "SView Master（`sview_http.py` :8080）对外 HTTP 合同，可直接导入 Apifox。\n\n系统两条链路共用同一套任务模型（`sview:job:{id}`）与 OSS `player-bin/{job_id}/` 播放缓存：\n- **SView**：`oss://…/*.mcap` → CPU Worker 转码拆帧 → 四路 WebCodecs。源可以是头显 protobuf，或 **Orin** ROS2 CompressedImage（JPEG 或 `format=h264` Annex-B），合同相同。\n- **HandVis**：`kind=handvis` → HandVis Worker MANO/mesh → 3D 手模\n\n前端 Base URL 只指向 Master，不要打 Worker。媒体优先 `signed-media` 直连公网 OSS，失败再用 `?proxy=1`。\n\n约定：\n- CORS：`Access-Control-Allow-Origin: *`；任意路径 `OPTIONS` → 204；所有 GET 同时支持 `HEAD`。\n- `job_id` 正则 `^[A-Za-z0-9._-]{1,200}$`。\n- 多数路径参数错误 / 媒体 404 / 425 是 **text/plain**（`_send_err` / `_send_retry`）；提交任务、查状态、运维 JSON 接口的业务错误才是 `{\"error\":...}`。\n- 集群 `SVIEW_CLUSTER=1` 时，媒体请求可能反向代理到持锁 Pod（`X-Sview-Proxy`）。\n\n可选 HandVis 独立 FastAPI（`:8000` 的 `/api/ep-assets`、`/api/playback/build-chunks`、`/api/oss-file-info`）不在本文件范围内；ACS 推荐全部走 Master `/api/jobs`。\n",
+    "description": "SView Master（`sview_http.py` :8080）对外 HTTP 合同，可直接导入 Apifox。\n\n系统两条链路共用同一套任务模型（`sview:job:{id}`）与 OSS `player-bin/{job_id}/` 播放缓存：\n- **SView**：`oss://…/*.mcap` → CPU Worker 转码拆帧 → 四路 WebCodecs。源可以是头显 protobuf，或 **Orin** ROS2 CompressedImage（JPEG 或 `format=h264` Annex-B），合同相同。\n- **HandVis**：`kind=handvis` → HandVis Worker MANO/mesh → 3D 手模\n\n前端 Base URL 只指向 Master，不要打 Worker。媒体优先 `signed-media` 直连公网 OSS，失败再用 `?proxy=1`。\n\n约定：\n- CORS：`Access-Control-Allow-Origin: *`；任意路径 `OPTIONS` → 204；所有 GET 同时支持 `HEAD`。\n- `job_id` 正则 `^[A-Za-z0-9._-]{1,200}$`。\n- Master 错误响应为 JSON，error 返回中文提示，error-en 保留英文原文；覆盖任务、嵌套统计及 SSE 事件。媒体 404/425 的状态码和 Retry-After 保持不变。\n- 集群 `SVIEW_CLUSTER=1` 时，媒体请求可能反向代理到持锁 Pod（`X-Sview-Proxy`）。\n\n可选 HandVis 独立 FastAPI（`:8000` 的 `/api/ep-assets`、`/api/playback/build-chunks`、`/api/oss-file-info`）不在本文件范围内；ACS 推荐全部走 Master `/api/jobs`。\n",
     "version": "1.2.0"
   },
   "servers": [
@@ -162,7 +162,7 @@
           "ops"
         ],
         "deprecated": false,
-        "description": "Prometheus text exposition（`Content-Type: text/plain; version=0.0.4`）。含 `sview_queue_depth`、`sview_jobs_processing`、`sview_jobs_inflight`、`sview_workers_alive`、`sview_cache_bytes`。别名互指 `/metrics` 与 `/api/metrics`。",
+        "description": "Prometheus text exposition（`Content-Type: application/json; version=0.0.4`）。含 `sview_queue_depth`、`sview_jobs_processing`、`sview_jobs_inflight`、`sview_workers_alive`、`sview_cache_bytes`。别名互指 `/metrics` 与 `/api/metrics`。",
         "responses": {
           "200": {
             "description": "Prometheus 文本",
@@ -178,9 +178,9 @@
           "503": {
             "description": "Redis 不可用",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -197,7 +197,7 @@
           "ops"
         ],
         "deprecated": false,
-        "description": "Prometheus text exposition（`Content-Type: text/plain; version=0.0.4`）。含 `sview_queue_depth`、`sview_jobs_processing`、`sview_jobs_inflight`、`sview_workers_alive`、`sview_cache_bytes`。别名互指 `/metrics` 与 `/api/metrics`。",
+        "description": "Prometheus text exposition（`Content-Type: application/json; version=0.0.4`）。含 `sview_queue_depth`、`sview_jobs_processing`、`sview_jobs_inflight`、`sview_workers_alive`、`sview_cache_bytes`。别名互指 `/metrics` 与 `/api/metrics`。",
         "responses": {
           "200": {
             "description": "Prometheus 文本",
@@ -213,9 +213,9 @@
           "503": {
             "description": "Redis 不可用",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -306,7 +306,8 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "中文错误提示。"
                     },
                     "source": {
                       "type": "string"
@@ -316,6 +317,10 @@
                     },
                     "hint": {
                       "type": "string"
+                    },
+                    "error-en": {
+                      "type": "string",
+                      "description": "原始英文错误详情；无错误时与 error 同为空或 null。"
                     }
                   }
                 }
@@ -379,7 +384,7 @@
           "jobs"
         ],
         "deprecated": false,
-        "description": "查 SView / HandVis 任务进度。成功时会 touch（刷新 `last_access_at` / pin，减缓 GC）。\n\n`playable=true` 约在 `frames_done ≥ 30` 时亮；SView 播放页建议等到约 150 帧再起播。\n\n不存在时 **404 JSON**：`{\"job_id\",\"status\":\"not_found\"}`（不是 `error` 字段）。\n`kind` / `video_url` 在 HandVis **提交**与 **SSE** 中返回；本 GET 当前主要透出进度字段（`_public_job_payload` 白名单含这两项，但本 handler 未从 Redis 拷贝）。\n非法 `job_id` 为 400 text/plain。\n",
+        "description": "查 SView / HandVis 任务进度。成功时会 touch（刷新 `last_access_at` / pin，减缓 GC）。\n\n`playable=true` 约在 `frames_done ≥ 30` 时亮；SView 播放页建议等到约 150 帧再起播。\n\n不存在时 **404 JSON**：`{\"job_id\",\"status\":\"not_found\"}`（不是 `error` 字段）。\n`kind` / `video_url` 在 HandVis **提交**与 **SSE** 中返回；本 GET 当前主要透出进度字段（`_public_job_payload` 白名单含这两项，但本 handler 未从 Redis 拷贝）。\n非法 `job_id` 为 400 application/json。\n",
         "parameters": [
           {
             "name": "job_id",
@@ -405,12 +410,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -463,12 +467,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -505,7 +508,7 @@
           "jobs"
         ],
         "deprecated": false,
-        "description": "Master 读 Redis 推事件，连接期间会 touch。单次最长约 300s，未完成应重连。\n\n`Content-Type: text/event-stream`。事件名：\n- `progress`：字段变化时\n- `done`：`status` 为 ready/failed/cancelled 后结束流\n- `error`：流内错误（如 Redis），`data` 为 `{\"error\": \"...\"}`\n\n`data` 为 JSON，见 `JobEvent`（含 `video_url`，HandVis 视频地址）。\n非法 job_id / Redis 不可用为 400/503 **text/plain**。\n",
+        "description": "Master 读 Redis 推事件，连接期间会 touch。单次最长约 300s，未完成应重连。\n\n`Content-Type: text/event-stream`。事件名：\n- `progress`：字段变化时\n- `done`：`status` 为 ready/failed/cancelled 后结束流\n- `error`：流内错误（如 Redis），`data` 为 `{\"error\": \"...\"}`\n\n`data` 为 JSON，见 `JobEvent`（含 `video_url`，HandVis 视频地址）。\n非法 job_id / Redis 不可用为 400/503 **application/json**。\n",
         "parameters": [
           {
             "name": "job_id",
@@ -537,12 +540,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -550,9 +552,9 @@
           "503": {
             "description": "Redis 不可用",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -595,12 +597,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -767,7 +768,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "批量为 `player-bin/{job_id}/segments/*.bin` 签发公网 GET URL。OSS 无逐帧 frames。单次最多 32 条。会 touch。progressive 模式超出 frames_available、sparse 模式不在 available_ranges，或未按段对齐的 starts 不签发并放入 skipped。OSS list 失败为 425 text/plain。kind=frames 为 400 text/plain。参数非法为 400 text/plain；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
+        "description": "批量为 `player-bin/{job_id}/segments/*.bin` 签发公网 GET URL。OSS 无逐帧 frames。单次最多 32 条。会 touch。progressive 模式超出 frames_available、sparse 模式不在 available_ranges，或未按段对齐的 starts 不签发并放入 skipped。OSS list 失败为 425 application/json。kind=frames 为 400 application/json。参数非法为 400 application/json；签名落到内网 host 为 500 JSON（含 `sample`）；`OSS_CACHE` 关闭或签名失败为 503 JSON。",
         "parameters": [
           {
             "name": "job_id",
@@ -846,12 +847,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -864,11 +864,16 @@
                   "type": "object",
                   "properties": {
                     "error": {
-                      "type": "string"
+                      "type": "string",
+                      "description": "中文错误提示。"
                     },
                     "sample": {
                       "type": "string",
                       "description": "去掉 query 的签名 URL 前缀"
+                    },
+                    "error-en": {
+                      "type": "string",
+                      "description": "原始英文错误详情；无错误时与 error 同为空或 null。"
                     }
                   }
                 }
@@ -897,7 +902,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "SView 四路播放清单。Master 直接返回 JSON（OSS_CACHE 时优先 OSS manifest，再按从 0 连续 segment 对齐，避免本地虚高）。\n`status=partial` 仍在写帧；`done` 且 `frames_available === frame_count` 后可停刷。\n`format` 当前 Worker 固定写 `head_cam`（头显与 Orin 相同）。\nOSS 对齐后可能带 `cache_aligned`；从 0 起无连续段时 404 text/plain。OSS list 失败为 425 text/plain。\n非法 job_id / 清单不存在为 400/404 **text/plain**。",
+        "description": "SView 四路播放清单。Master 直接返回 JSON（OSS_CACHE 时优先 OSS manifest，再按从 0 连续 segment 对齐，避免本地虚高）。\n`status=partial` 仍在写帧；`done` 且 `frames_available === frame_count` 后可停刷。\n`format` 当前 Worker 固定写 `head_cam`（头显与 Orin 相同）。\nOSS 对齐后可能带 `cache_aligned`；从 0 起无连续段时 404 application/json。OSS list 失败为 425 application/json。\n非法 job_id / 清单不存在为 400/404 **application/json**。",
         "parameters": [
           {
             "name": "job_id",
@@ -923,12 +928,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -936,9 +940,9 @@
           "404": {
             "description": "清单不存在，或对齐后无从 0 连续的可播段",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -956,7 +960,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "HandVis 播放目录（与 segments 同一 job_id）。含 `still_building` / `ready_chunks` / `presets.balanced`。边构建边播时定期刷新。Master 对 JSON 不 302（本地或内网 OSS 回源后仍返回 JSON）。错误为 text/plain；资产未就绪 425。",
+        "description": "HandVis 播放目录（与 segments 同一 job_id）。含 `still_building` / `ready_chunks` / `presets.balanced`。边构建边播时定期刷新。Master 对 JSON 不 302（本地或内网 OSS 回源后仍返回 JSON）。错误为 application/json；资产未就绪 425。",
         "parameters": [
           {
             "name": "job_id",
@@ -982,29 +986,27 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1014,10 +1016,9 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1035,7 +1036,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "uint32 面片二进制。未带 proxy=1 且开启媒体重定向时可 302 公网签名 URL。错误为 text/plain。",
+        "description": "uint32 面片二进制。未带 proxy=1 且开启媒体重定向时可 302 公网签名 URL。错误为 application/json。",
         "parameters": [
           {
             "name": "job_id",
@@ -1086,18 +1087,17 @@
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1107,21 +1107,19 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1139,7 +1137,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "投影矩阵/内参二进制侧车（magic `VP01`）；内参摘要在 index.json 的 `video_projection`。布局：magic(4)+version(u32 LE)+frame_count(u32 LE)+positions(N×3 f32)+quaternions(N×4 f32)+valid_mask(N u8)。支持 `?proxy=1`。错误为 text/plain。",
+        "description": "投影矩阵/内参二进制侧车（magic `VP01`）；内参摘要在 index.json 的 `video_projection`。布局：magic(4)+version(u32 LE)+frame_count(u32 LE)+positions(N×3 f32)+quaternions(N×4 f32)+valid_mask(N u8)。支持 `?proxy=1`。错误为 application/json。",
         "parameters": [
           {
             "name": "job_id",
@@ -1190,18 +1188,17 @@
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1211,21 +1208,19 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1242,7 +1237,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "SView：约 `SEGMENT_FRAMES`（默认 30）帧打包段。整段齐了才返回；任务完成后最后一段可不足 30 帧。\nHandVis：同路径拉 mesh segment。\n\n二进制：`header_len(uint32 LE) + header_json + payload_len(uint32 LE) + payload`；`packet_schema=playertrans.bundle_segment.v1`。\n成功时可含响应头 `X-Sview-Segment-Start` / `X-Sview-Segment-Count`。\n\n未带 `proxy=1` 且 `OSS_MEDIA_REDIRECT=1` 时，本地未命中可 **302** 公网签名 URL（`OSS_MEDIA_LOCAL_FIRST=1` 时优先组本地段）。\n参数/缺失为 400/404 **text/plain**；段未凑满 425 text/plain。\n",
+        "description": "SView：约 `SEGMENT_FRAMES`（默认 30）帧打包段。整段齐了才返回；任务完成后最后一段可不足 30 帧。\nHandVis：同路径拉 mesh segment。\n\n二进制：`header_len(uint32 LE) + header_json + payload_len(uint32 LE) + payload`；`packet_schema=playertrans.bundle_segment.v1`。\n成功时可含响应头 `X-Sview-Segment-Start` / `X-Sview-Segment-Count`。\n\n未带 `proxy=1` 且 `OSS_MEDIA_REDIRECT=1` 时，本地未命中可 **302** 公网签名 URL（`OSS_MEDIA_LOCAL_FIRST=1` 时优先组本地段）。\n参数/缺失为 400/404 **application/json**；段未凑满 425 application/json。\n",
         "parameters": [
           {
             "name": "job_id",
@@ -1319,29 +1314,27 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1351,10 +1344,9 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1371,7 +1363,7 @@
           "media"
         ],
         "deprecated": false,
-        "description": "四路 H.264 + IMU 单帧。新播放器用 segments。`packet_schema=playertrans.bundle_frame.v1`。\n\n与 segments 不同：**当前只读 Master 本地** `frames/{name}`，不做 OSS 302 / `?proxy=1` 回源。本地没有时处理中 425、否则 404（皆 text/plain）。\n",
+        "description": "四路 H.264 + IMU 单帧。新播放器用 segments。`packet_schema=playertrans.bundle_frame.v1`。\n\n与 segments 不同：**当前只读 Master 本地** `frames/{name}`，不做 OSS 302 / `?proxy=1` 回源。本地没有时处理中 425、否则 404（皆 application/json）。\n",
         "parameters": [
           {
             "name": "job_id",
@@ -1423,29 +1415,27 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1455,10 +1445,9 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1501,23 +1490,21 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1572,29 +1559,27 @@
             "description": "Location 为公网签名 URL"
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1604,10 +1589,9 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1659,29 +1643,27 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
           },
           "425": {
-            "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+            "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
             "headers": {
               "Retry-After": {
                 "schema": {
@@ -1691,10 +1673,9 @@
               }
             },
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "segment not ready yet\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -1960,12 +1941,11 @@
             }
           },
           "400": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -2097,12 +2077,11 @@
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -2142,12 +2121,11 @@
             }
           },
           "404": {
-            "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+            "description": "JSON 双语错误（error 中文、error-en 英文）",
             "content": {
-              "text/plain": {
+              "application/json": {
                 "schema": {
-                  "type": "string",
-                  "example": "invalid job_id\n"
+                  "$ref": "#/components/schemas/Error"
                 }
               }
             }
@@ -2163,7 +2141,8 @@
         "type": "object",
         "properties": {
           "error": {
-            "type": "string"
+            "type": "string",
+            "description": "中文错误提示。"
           },
           "job_id": {
             "type": "string"
@@ -2184,6 +2163,10 @@
           "type": {
             "type": "integer",
             "description": "压测任务 type（404 源文件时可能带）"
+          },
+          "error-en": {
+            "type": "string",
+            "description": "原始英文错误详情；无错误时与 error 同为空或 null。"
           }
         }
       },
@@ -2281,7 +2264,8 @@
           },
           "error": {
             "type": "string",
-            "nullable": true
+            "nullable": true,
+            "description": "中文错误提示。"
           },
           "frames_done": {
             "type": "number",
@@ -2398,6 +2382,11 @@
             "type": "integer",
             "nullable": true,
             "description": "目标 segment 已编码帧数"
+          },
+          "error-en": {
+            "type": "string",
+            "nullable": true,
+            "description": "原始英文错误详情；无错误时与 error 同为空或 null。"
           }
         },
         "description": "公开任务字段（`_public_job_payload` 白名单）。空字符串会被丢掉。`kind`/`video_url`：HandVis 提交响应与 SSE 会带；GET /api/jobs/{id} 当前可能省略。"
@@ -3036,7 +3025,13 @@
           },
           "error": {
             "type": "string",
-            "nullable": true
+            "nullable": true,
+            "description": "中文错误提示。"
+          },
+          "error-en": {
+            "type": "string",
+            "nullable": true,
+            "description": "原始英文错误详情；无错误时与 error 同为空或 null。"
           }
         }
       },
@@ -3168,18 +3163,17 @@
     },
     "responses": {
       "PlainError": {
-        "description": "text/plain（Master `_send_err` / `_send_retry`，不是 JSON）",
+        "description": "JSON 双语错误（error 中文、error-en 英文）",
         "content": {
-          "text/plain": {
+          "application/json": {
             "schema": {
-              "type": "string",
-              "example": "invalid job_id\n"
+              "$ref": "#/components/schemas/Error"
             }
           }
         }
       },
       "RetryLater": {
-        "description": "资产/段/帧未就绪（边转边播前沿）。正文 text/plain，看 Retry-After。",
+        "description": "资产/段/帧未就绪（边转边播前沿）。正文 application/json，看 Retry-After。",
         "headers": {
           "Retry-After": {
             "schema": {
@@ -3189,10 +3183,9 @@
           }
         },
         "content": {
-          "text/plain": {
+          "application/json": {
             "schema": {
-              "type": "string",
-              "example": "segment not ready yet\n"
+              "$ref": "#/components/schemas/Error"
             }
           }
         }

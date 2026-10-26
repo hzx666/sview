@@ -3,6 +3,27 @@
 适用架构：**Master（HTTP/API）+ Worker（转码）+ OSS `player-bin/` 播放缓存**。  
 前端 **Base URL 只指向 Master**（Service / LB / Ingress），不要指向 Worker。
 
+### 双语错误返回
+
+Master 的 JSON 响应和 SSE 事件中，`error` 返回中文，新增 `error-en` 保留原始英文诊断。
+统计接口内嵌的任务也遵循此约定。前端使用 `data["error-en"]` 读取英文。
+
+```json
+{"status": "failed", "error": "数据文件不存在。", "error-en": "source not found on local mount"}
+```
+
+| 错误依据 | `error` |
+| --- | --- |
+| `Head-cam MCAP has no aligned video frames: …`、其他未识别异常 | 数据加载失败。 |
+| `source not found on local mount`、`Invalid remote MCAP URL` | 数据文件不存在。 |
+| 缺少 ChunkIndex、没有受支持/带索引的视频流、`probe failed:`、编码失败 | 数据文件已损坏。 |
+| `PAGE_TIMEOUT` | 数据源打开耗时较长，尚未完成加载，请稍后重试。 |
+
+无错误时保留 `null` 或空字符串，`error-en` 与之相同。原本没有 `error` 的对象不新增错误字段。
+原纯文本的参数错误和媒体 404/425 改为 JSON 双语响应，状态码及 `Retry-After` 保持不变。
+Redis 与 Worker 日志仍保留原文；本次不新增超时或文件截断检测，`opening` 或日志记录不会自动产生错误。
+适用范围包括经 Master 提交的 HandVis 任务；独立 HandVis FastAPI 的 `detail` 响应不属于 Master 接口。
+
 | 环境 | Base URL 示例 |
 |------|----------------|
 | ACS 对外 | `http(s)://<master-host>:8080` |
@@ -139,7 +160,8 @@ ChunkIndex/MessageIndex；
 | `duration_sec` | number | 时长（秒），有则返回 |
 | `play_base` | string \| null | OSS 播放前缀（见 §0） |
 | `local_path` | string | 本地映射路径（可选） |
-| `error` | string \| null | 错误信息 |
+| `error` | string \| null | 中文错误提示 |
+| `error-en` | string \| null | 原始英文错误详情 |
 
 ---
 
@@ -175,7 +197,8 @@ Redis 不可用时 `503`。
 | `job_id` | string | 任务 ID |
 | `status` | string | `queued` / `processing` / `ready` / `failed` / `cancelled`；不存在时 `not_found` |
 | `source` | string | 源路径 |
-| `error` | string \| null | 失败原因 |
+| `error` | string \| null | 中文失败原因 |
+| `error-en` | string \| null | 原始英文失败原因 |
 | `frames_done` | number \| null | 已写出、可拉取的帧数 |
 | `frame_count` | number \| null | 全片总帧数 |
 | `percent` | number \| null | 0–100 |

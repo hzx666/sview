@@ -54,6 +54,7 @@ from typing import Any, Optional, Union
 from urllib.parse import parse_qs, unquote
 
 from sview.logging_setup import setup_logging
+from sview.http.errors import localize_errors
 
 log = setup_logging("sview_http")
 
@@ -685,15 +686,18 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             return {}
         return json.loads(raw.decode("utf-8"))
 
-    def _send_json(self, code: int, obj: dict):
-        payload = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+    def _send_json(self, code: int, obj: dict, retry_after: Optional[int] = None):
+        payload = (json.dumps(localize_errors(obj), ensure_ascii=False) + "\n").encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        if retry_after is not None:
+            self.send_header("Retry-After", str(retry_after))
         self._cors()
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(payload)
+        if self.command != "HEAD":
+            self.wfile.write(payload)
 
     def _handle_create_job(self):
         from sview.jobs.job_status import (
@@ -1767,7 +1771,8 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                     touch_job(r, job_id)
                     fields = get_job_fields(r, job_id)
                 except Exception as e:
-                    msg = f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                    payload = json.dumps(localize_errors({"error": str(e)}), ensure_ascii=False)
+                    msg = f"event: error\ndata: {payload}\n\n"
                     self.wfile.write(msg.encode("utf-8"))
                     self.wfile.flush()
                     break
@@ -1808,7 +1813,7 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
                         event[key] = json.loads(fields.get(key) or "null")
                     except (TypeError, ValueError, json.JSONDecodeError):
                         event[key] = [] if key == "available_ranges" else None
-                payload = json.dumps(event, ensure_ascii=False)
+                payload = json.dumps(localize_errors(event), ensure_ascii=False)
                 if payload != last_payload:
                     last_payload = payload
                     last_ping = time.time()
@@ -2929,25 +2934,10 @@ class SviewCacheHandler(BaseHTTPRequestHandler):
             body=body,
         )
     def _send_err(self, code: int, msg: str):
-        payload = (msg + "\n").encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self._cors()
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(payload)
+        self._send_json(code, {"error": msg})
 
     def _send_retry(self, code: int, msg: str, retry_after: int = 1):
-        payload = (msg + "\n").encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Retry-After", str(retry_after))
-        self._cors()
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(payload)
+        self._send_json(code, {"error": msg}, retry_after=retry_after)
 
     def _send_file(
         self,

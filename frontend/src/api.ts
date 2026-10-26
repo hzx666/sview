@@ -71,6 +71,7 @@ export type JobStatus = {
   status: string;
   source?: string;
   error?: string | null;
+  "error-en"?: string | null;
   frame_count?: number | null;
   frames_done?: number | null;
   playable?: boolean | null;
